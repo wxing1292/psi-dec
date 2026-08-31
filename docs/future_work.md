@@ -6,20 +6,25 @@ current documents.
 Move resolved repository-wide rules into `engineering_conventions.md`. Move resolved component findings into the
 document that owns the component.
 
-## Tool APIs
+## Agent Integration
 
-- Implement the Pi custom-provider session wire and persistent conversation store.
-  Define the session ID, event envelope, append ordering, concurrent append behavior, and storage owner.
-  Map appended events into the existing `ToolEvent` and `ToolState` domain.
-
-  Recommendation: Register common tools once.
-  Later, append only additions, removals, calls, responses, and cancellations.
-  Do not retransmit complete tool definitions on every turn.
-  Do not model conversation history as an evictable cache.
-  Do not add a registry resynchronization protocol.
+- Add HTTP session affinity for repeated agent turns only after resident-session eviction and recovery are available.
+  Keep conversation history in the caller. Require each HTTP request to contain the complete message history and use
+  the existing `QwenCodec` to produce checkpoint-authoritative tokens.
+  Let the Pi `openai-completions` provider send its stable `x-session-affinity` value. Use this value only to select an
+  ephemeral continuation in the existing `DecodeSessions` owner. Do not add a Pi custom provider, conversation store,
+  tool-event wire, or persistent session.
+  Permit at most one active turn for each affinity value.
+  Reuse a continuation only when its retained tokens are an exact prefix of the new input.
+  Treat a missing, evicted, or mismatched continuation as a cache miss and use the stateless trie and prefill path.
+  Keep `x-request-id` as request correlation. Do not use `x-client-request-id` as a continuation key.
 
 ## Runtime Lifecycle
 
+- Add idle-session eviction and per-request model-state recovery at the `DecodeSessions::continue_session` boundary.
+  Preserve the request ID, request slot, token metadata, trie-block ownership, and cache-lane page identity for a
+  partially evicted request. Restore KV and GDN state before the request returns to the scheduler. Return `Unavailable`
+  for a fully evicted request. The caller must retry with the complete input.
 - Revisit cross-request resource sharing after the complete multimodal path is stable.
   Adapt the existing runtime pin-cache ownership model instead of adding a second ad hoc resource cache.
   The shared object must be immutable while it has readers.

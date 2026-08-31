@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use async_channel::Sender as AsyncSender;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Select;
 use crossbeam_channel::Sender;
@@ -21,6 +22,7 @@ use crate::compute::ReplayableModelExecutorResponse;
 use crate::config::ExecutorHibernationMode;
 use crate::log_err_internal;
 use crate::memory::U32IDAllocator;
+use crate::runtime::CompletionReason;
 use crate::runtime::RequestSlot;
 use crate::runtime::RequestSlotAllocationResult;
 use crate::runtime::RequestSlotAllocator;
@@ -31,8 +33,10 @@ use crate::runtime::tasks::AsyncTaskResp;
 
 const SCHEDULER_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
-pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
-    user_req_rx: Receiver<QueuedReq>,
+pub struct EventLoop<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
+    new_req_rx: Receiver<NewReq>,
+    ready_req_rx: Receiver<ReadyReq>,
+    completed_turn_tx: AsyncSender<(ReadyReq, CompletionReason)>,
     async_task_resp_rx: Receiver<Box<dyn AsyncTaskResp>>,
     model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
     model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
@@ -51,7 +55,7 @@ pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, 
 
     shutdown: Shutdown,
 
-    phantom_data_user_req: PhantomData<UserReq>,
+    phantom_data_ready_req: PhantomData<ReadyReq>,
     phantom_data_device_req: PhantomData<DeviceReq>,
     phantom_data_device_resp: PhantomData<DeviceResp>,
 }
@@ -62,19 +66,21 @@ enum ModelExecutorState {
     Stopped(ExecutorHibernationPlan),
 }
 
-impl<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
-    EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
+impl<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
+    EventLoop<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
 where
-    UserReq: From<(QueuedReq, RequestSlot)> + UserRequest<DeviceReq, DeviceResp>,
+    ReadyReq: From<(NewReq, RequestSlot)> + UserRequest<DeviceReq, DeviceResp>,
     DeviceReq: DevReq,
     DeviceResp: DevResp,
     BatchDeviceReq: BatchDevReq<DeviceReq>,
     BatchDeviceResp: BatchDevResp<DeviceResp>,
-    S: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
+    S: Scheduler<ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        user_req_rx: Receiver<QueuedReq>,
+        new_req_rx: Receiver<NewReq>,
+        ready_req_rx: Receiver<ReadyReq>,
+        completed_turn_tx: AsyncSender<(ReadyReq, CompletionReason)>,
         async_task_resp_rx: Receiver<Box<dyn AsyncTaskResp>>,
         model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
         model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
@@ -90,7 +96,9 @@ where
             "runtime executor hibernation timeout must be positive"
         );
         Self {
-            user_req_rx,
+            new_req_rx,
+            ready_req_rx,
+            completed_turn_tx,
             async_task_resp_rx,
             model_executor_req_tx,
             model_executor_resp_rx,
@@ -108,7 +116,7 @@ where
 
             shutdown,
 
-            phantom_data_user_req: PhantomData,
+            phantom_data_ready_req: PhantomData,
             phantom_data_device_req: PhantomData,
             phantom_data_device_resp: PhantomData,
         }
@@ -119,13 +127,15 @@ where
         tracing::info!("started");
 
         let shutdown_rx = self.shutdown.sync_rx().clone();
+        let mut result = Ok(());
         'event_loop: while !self.shutdown.is_shutdown() {
             let mut select = Select::new();
-            let op_recv_req = if self.request_slot_allocator.free() > 0 {
-                Some(select.recv(&self.user_req_rx))
+            let op_recv_new_req = if self.request_slot_allocator.free() > 0 {
+                Some(select.recv(&self.new_req_rx))
             } else {
                 None
             };
+            let op_recv_ready_req = select.recv(&self.ready_req_rx);
             let op_recv_async_task_resp = select.recv(&self.async_task_resp_rx);
             let op_recv_model_executor_resp = select.recv(&self.model_executor_resp_rx);
             let op_scheduler_stats_timer = select.recv(&self.scheduler_stats_timer);
@@ -137,33 +147,51 @@ where
             let op = select.select();
             let op_index = op.index();
             match op_index {
-                _ if Some(op_index) == op_recv_req => {
-                    let queued_req = op
-                        .recv(&self.user_req_rx)
-                        .map_err(|error| log_err_internal!("user request channel closed, stopping: {error}"))?;
+                _ if Some(op_index) == op_recv_new_req => {
+                    let Ok(new_req) = op.recv(&self.new_req_rx) else {
+                        result = Err(log_err_internal!("new-request channel closed, stopping"));
+                        break 'event_loop;
+                    };
                     let request_slot = match self.request_slot_allocator.allocate() {
                         RequestSlotAllocationResult::Ok { request_slot } => request_slot,
                         RequestSlotAllocationResult::ResourceLimitExceeded => {
                             panic!("available request-slot capacity must allow allocation")
                         },
                     };
-                    let user_req = UserReq::from((queued_req, request_slot));
-                    user_req.store_running();
-                    self.scheduler.enqueue(user_req);
+                    let ready_req = ReadyReq::from((new_req, request_slot));
+                    if ready_req.store_running() {
+                        self.scheduler.enqueue(ready_req);
+                    }
+                },
+                _ if op_index == op_recv_ready_req => {
+                    let Ok(ready_req) = op.recv(&self.ready_req_rx) else {
+                        result = Err(log_err_internal!("ready-request channel closed, stopping"));
+                        break 'event_loop;
+                    };
+                    if !ready_req.is_terminal() {
+                        self.scheduler.enqueue(ready_req);
+                    }
                 },
                 _ if op_index == op_recv_async_task_resp => {
-                    let resp = op
-                        .recv(&self.async_task_resp_rx)
-                        .map_err(|error| log_err_internal!("async task response channel closed, stopping: {error}"))?;
+                    let Ok(resp) = op.recv(&self.async_task_resp_rx) else {
+                        result = Err(log_err_internal!("async task response channel closed, stopping"));
+                        break 'event_loop;
+                    };
                     self.scheduler.handle_async_task_resp(resp);
                 },
                 _ if op_index == op_recv_model_executor_resp => {
-                    let model_executor_resp = op.recv(&self.model_executor_resp_rx).map_err(|error| {
-                        log_err_internal!("model executor response channel closed, stopping: {error}")
-                    })?;
+                    let Ok(model_executor_resp) = op.recv(&self.model_executor_resp_rx) else {
+                        result = Err(log_err_internal!("model executor response channel closed, stopping"));
+                        break 'event_loop;
+                    };
                     match model_executor_resp {
                         ReplayableModelExecutorResponse::Batch(batch_dev_resp) => {
-                            self.scheduler.commit(batch_dev_resp);
+                            for completed_turn in self.scheduler.commit(batch_dev_resp) {
+                                let Ok(()) = self.completed_turn_tx.try_send(completed_turn) else {
+                                    result = Err(log_err_internal!("completed-turn channel send failed, stopping"));
+                                    break 'event_loop;
+                                };
+                            }
                             self.idle_heartbeat = Instant::now();
                         },
                         ReplayableModelExecutorResponse::Started | ReplayableModelExecutorResponse::Stopped => {},
@@ -182,7 +210,10 @@ where
                         .expect("selected executor hibernation timer must fire");
                     let idle_duration = self.idle_heartbeat.elapsed();
                     if idle_duration >= self.executor_hibernation_timeout {
-                        self.stop_model_executor()?;
+                        if let Err(error) = self.stop_model_executor() {
+                            result = Err(error);
+                            break 'event_loop;
+                        }
                     } else {
                         self.executor_hibernation_timer = after(self.executor_hibernation_timeout - idle_duration);
                     }
@@ -193,13 +224,16 @@ where
                 },
                 _ => unreachable!(),
             }
-            self.do_flush()?;
+            if let Err(error) = self.do_flush() {
+                result = Err(error);
+                break 'event_loop;
+            }
         }
 
         self.shutdown.shutdown();
         self.scheduler.print_lifetime();
         tracing::info!("stopped");
-        Ok(())
+        result
     }
 
     fn do_flush(&mut self) -> Result<()> {

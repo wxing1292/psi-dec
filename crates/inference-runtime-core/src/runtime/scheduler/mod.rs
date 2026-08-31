@@ -5,6 +5,7 @@ use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::runtime::CompletionReason;
 use crate::runtime::RawRequestID;
 use crate::runtime::tasks::AsyncTaskReq;
 use crate::runtime::tasks::AsyncTaskResp;
@@ -51,7 +52,7 @@ where
 
     fn prepare(&mut self) -> BatchDeviceReq;
     fn cancel(&mut self, batch_dev_req: BatchDeviceReq);
-    fn commit(&mut self, batch_dev_resp: BatchDeviceResp);
+    fn commit(&mut self, batch_dev_resp: BatchDeviceResp) -> Vec<(UserReq, CompletionReason)>;
 }
 
 #[mockall::automock]
@@ -74,7 +75,7 @@ where
         &mut self,
         schedule_queue: &mut ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
         dev_resps: Vec<DeviceResp>,
-    );
+    ) -> Vec<(UserReq, CompletionReason)>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +106,7 @@ pub enum PrepareResult<DeviceReq> {
 pub enum CommitResult {
     Continue,
     Pending,
+    TurnCompleted(CompletionReason),
     Terminal,
 }
 

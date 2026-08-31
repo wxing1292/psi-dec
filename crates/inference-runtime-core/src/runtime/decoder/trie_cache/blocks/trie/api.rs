@@ -603,6 +603,49 @@ impl<const N: usize, const P: usize, const L: usize, BC> TrieDecoderBlocks<N, P,
 where
     BC: MultiLaneBlockCache<P, L>,
 {
+    pub fn start_turn(&mut self, prompt_tokens: Vec<Token>) {
+        assert!(!prompt_tokens.is_empty(), "a new turn must include prompt tokens");
+        assert_eq!(
+            self.num_prompt_tokens(),
+            0,
+            "a new turn requires completed prompt metadata"
+        );
+        assert_eq!(
+            self.num_sampled_tokens(),
+            0,
+            "a new turn requires completed sampled-token metadata"
+        );
+        assert!(
+            self.spec_tokens.is_empty(),
+            "a new turn cannot retain speculative tokens"
+        );
+        assert!(
+            self.spec_probs.is_empty(),
+            "a new turn cannot retain speculative probabilities"
+        );
+        assert!(
+            self.spec_confidences.is_empty(),
+            "a new turn cannot retain speculative confidences"
+        );
+        self.num_prompt_tokens = prompt_tokens.len();
+        self.queued_tokens.extend(prompt_tokens);
+        self.try_mark_ready();
+    }
+
+    pub fn finish_turn(&mut self) {
+        assert_eq!(
+            self.num_scheduled_tokens(),
+            0,
+            "a turn cannot finish while tokens are scheduled"
+        );
+        self.spec_tokens.clear();
+        self.spec_probs.clear();
+        self.spec_confidences.clear();
+        self.num_history_tokens = self.num_total_tokens();
+        self.num_prompt_tokens = 0;
+        debug_assert_eq!(self.num_sampled_tokens(), 0);
+    }
+
     fn try_mark_ready(&mut self) {
         let mut num_cachable_tokens = self.num_queued_tokens().saturating_sub(L - 1);
 

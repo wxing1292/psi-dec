@@ -6,6 +6,7 @@ use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::runtime::CompletionReason;
 use crate::runtime::RawComputeSlotSeq;
 use crate::runtime::RawRequestID;
 use crate::runtime::scheduler::BatchBudget;
@@ -182,7 +183,7 @@ where
         self.schedule_queue.handle_ready_waits();
     }
 
-    fn commit(&mut self, batch_dev_resp: BatchDeviceResp) {
+    fn commit(&mut self, batch_dev_resp: BatchDeviceResp) -> Vec<(UserReq, CompletionReason)> {
         let mut compute_slot = self
             .used_compute_slots
             .pop_front()
@@ -204,8 +205,9 @@ where
         compute_slot.reset();
         self.free_compute_slots.push_back(compute_slot);
 
-        self.batcher.commit(&mut self.schedule_queue, dev_resps);
+        let completed_turns = self.batcher.commit(&mut self.schedule_queue, dev_resps);
         self.schedule_queue.handle_ready_waits();
+        completed_turns
     }
 }
 
@@ -350,7 +352,7 @@ mod tests {
     fn test_prepare_commit() {
         let mut batcher = TestBatcher::new();
         batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
-        batcher.expect_commit().times(3).returning(|_, _| {});
+        batcher.expect_commit().times(3).returning(|_, _| Vec::new());
 
         let (async_task_req_tx, _async_task_req_rx) = bounded(1);
         let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 1, 8, 4, 3);

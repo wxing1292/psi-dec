@@ -11,6 +11,7 @@ use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
 use crate::compute::SpecStats;
+use crate::runtime::CompletionReason;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 use crate::runtime::tasks::AsyncTaskResp;
@@ -239,7 +240,7 @@ where
         let _ = self.lifetime.api.hist_cancel.record(latency);
     }
 
-    fn commit(&mut self, batch_dev_resp: BatchDeviceResp) {
+    fn commit(&mut self, batch_dev_resp: BatchDeviceResp) -> Vec<(UserReq, CompletionReason)> {
         let num_spec_tokens = self.lifetime.spec.len();
         if num_spec_tokens != 0 {
             let delta = batch_dev_resp.spec_stats(num_spec_tokens);
@@ -248,11 +249,12 @@ where
         }
 
         let instant = Instant::now();
-        self.scheduler.commit(batch_dev_resp);
+        let completed_turns = self.scheduler.commit(batch_dev_resp);
         let latency = instant.elapsed().as_micros() as u64;
         let latency = max(1, latency);
         let _ = self.periodical.api.hist_commit.record(latency);
         let _ = self.lifetime.api.hist_commit.record(latency);
+        completed_turns
     }
 }
 
@@ -326,7 +328,10 @@ mod tests {
         inner.expect_can_flush().once().return_const(true);
         inner.expect_prepare().once().return_once(TestBatchDeviceReq::new);
         inner.expect_cancel().once().return_once(drop);
-        inner.expect_commit().once().return_once(drop);
+        inner.expect_commit().once().return_once(|response| {
+            drop(response);
+            Vec::new()
+        });
 
         let mut scheduler = InstrumentedScheduler::new(inner, 0);
         scheduler.enqueue(TestUserReq::new());

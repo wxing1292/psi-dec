@@ -134,8 +134,8 @@ where
                 self.in_flight_computes.push_back(compute_phase);
                 let decoder_sync_blocks = self.decoder_blocks.prepare_blocks();
                 let resource_placements = self.decoder_blocks.device_resource_placements(&decoder_query_tokens);
-                let input_positions = self
-                    .input_positions
+                let token_positions = self
+                    .token_positions
                     .as_ref()
                     .map(|positions| positions.query(&decoder_query_tokens));
                 let dev_req = DeviceRequest::new(
@@ -143,7 +143,7 @@ where
                     self.req_slot(),
                     decoder_query_tokens,
                     decoder_sync_blocks,
-                    input_positions,
+                    token_positions,
                     resource_placements,
                     self.sampling_config().clone(),
                 );
@@ -254,12 +254,30 @@ where
         {
             self.send_token_probs(token_probs);
         }
-        if stop_match.matched() {
-            self.store_completed(CompletionReason::StopSequence);
+        let turn_completion = if stop_match.matched() {
+            Some(CompletionReason::StopSequence)
         } else if self.decoder_blocks.num_sampled_tokens() >= self.sampling_config().max_sampled_tokens {
-            self.store_completed(CompletionReason::LengthLimit);
-        } else if self.decoder_blocks.num_total_tokens() >= self.context_window {
-            self.store_completed(CompletionReason::ContextLimit);
+            Some(CompletionReason::LengthLimit)
+        } else {
+            None
+        };
+        if self.decoder_blocks.num_total_tokens() >= self.context_window {
+            self.store_completed(turn_completion.unwrap_or(CompletionReason::ContextLimit));
+        } else if let Some(reason) = turn_completion {
+            assert!(
+                self.in_flight_computes.is_empty(),
+                "turn completion requires all scheduled computes to be committed"
+            );
+            assert_eq!(
+                self.num_in_flight_blocking_async_tasks, 0,
+                "turn completion cannot retain a blocking async task"
+            );
+            assert_eq!(
+                self.num_in_flight_nonblocking_async_tasks, 0,
+                "turn completion cannot retain a nonblocking async task"
+            );
+            self.finish_turn();
+            return CommitResult::TurnCompleted(reason);
         }
 
         if self.status().is_terminal() {

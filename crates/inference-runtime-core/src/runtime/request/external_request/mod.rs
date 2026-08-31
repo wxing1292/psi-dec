@@ -1,22 +1,31 @@
 use async_channel::Receiver;
+use async_channel::Sender;
+use async_channel::TrySendError;
 
 use crate::runtime::RawRequestID;
 use crate::runtime::request::AtomicRequestStatus;
+use crate::runtime::request::RequestEvent;
 use crate::runtime::request::RequestStatus;
-use crate::runtime::request::TokenProbs;
 
 pub struct ExternalRequest {
     req_id: RawRequestID,
     req_status: AtomicRequestStatus,
-    token_prob_rx: Receiver<TokenProbs>,
+    event_rx: Receiver<RequestEvent>,
+    cancel_tx: Sender<RawRequestID>,
 }
 
 impl ExternalRequest {
-    pub fn new(req_id: RawRequestID, req_status: AtomicRequestStatus, token_prob_rx: Receiver<TokenProbs>) -> Self {
+    pub fn new(
+        req_id: RawRequestID,
+        req_status: AtomicRequestStatus,
+        event_rx: Receiver<RequestEvent>,
+        cancel_tx: Sender<RawRequestID>,
+    ) -> Self {
         Self {
             req_id,
             req_status,
-            token_prob_rx,
+            event_rx,
+            cancel_tx,
         }
     }
 
@@ -28,8 +37,8 @@ impl ExternalRequest {
         self.req_status.load()
     }
 
-    pub fn token_prob_rx(&self) -> &Receiver<TokenProbs> {
-        &self.token_prob_rx
+    pub fn event_rx(&self) -> &Receiver<RequestEvent> {
+        &self.event_rx
     }
 
     delegate::delegate! {
@@ -48,6 +57,12 @@ impl Drop for ExternalRequest {
                 request_id = self.req_id,
                 "request cancelled"
             );
+            match self.cancel_tx.try_send(self.req_id) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {},
+                Err(TrySendError::Full(_)) => {
+                    unreachable!("unbounded request cancellation channel cannot be full")
+                },
+            }
         }
     }
 }

@@ -115,14 +115,22 @@ then use that block as a non-terminal prefix.
                                │ InternalRequest::commit              │
                                │ commit decoder tokens/cache state    │
                                │ emit visible output + stop handling  │
-                               └──────────────┬───────────────┬───────┘
-                                              │ Continue      │ Terminal
-                                              v               v
-                                       ┌─────────────┐  ┌──────────────┐
-                                       │ run_queue   │  │ drop request │
-                                       │ push front  │  │ release slot │
-                                       └─────────────┘  │ and pages    │
-                                                        └──────────────┘
+                               └──────┬──────────────┬───────────────┘
+                                      │ Continue     │ TurnCompleted       │ Terminal
+                                      v              v                     v
+                               ┌─────────────┐ ┌──────────────────┐ ┌──────────────┐
+                               │ run_queue   │ │ completed channel│ │ drop request │
+                               │ push front  │ │ -> DecodeSessions│ │ release slot │
+                               └─────────────┘ │ -> pending       │ │ and pages    │
+                                               │ -> publish event │ └──────────────┘
+                                               └────────┬─────────┘
+                                                        │ start turn with new tokens
+                                                        │ ready-request channel
+                                                        v
+                                               ┌──────────────────┐
+                                               │ event-loop enqueue│
+                                               │ same request/slot │
+                                               └──────────────────┘
 ```
 
 `PrepareResult::Pending` deliberately leaves the request in the ID map. It does not put the request on `run_queue`.
@@ -147,8 +155,8 @@ request-ID-to-token-budget map. `FIFOBatcher` consumes this map before it uses t
 budgets for the normal FIFO queue.
 
 Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
-user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and the async-task request
-and response channels.
+new-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain, the ready-request channel,
+and the async-task request and response channels.
 
 `SchedulerConfig::max_requests`, `max_tokens`, and `max_tokens_per_request` remain per-batch limits.
 `max_tokens_per_request` must not exceed `max_tokens`.
@@ -164,14 +172,35 @@ too short.
 `history.len() + prompt.len() + sampled.len() < context_window` before it constructs Trie blocks. It also requires the
 initial sampled-token count to be less than `max_sampled_tokens`.
 
-A queued request owns no request slot. The synchronous event loop registers the user-request receiver only when the
+A queued request owns no request slot. The synchronous event loop registers the new-request receiver only when the
 request-slot allocator reports free capacity.
 
 After the event loop receives a request, it allocates one slot. It then constructs the `InternalRequest` that the
 scheduler consumes.
 
-The same slot follows the request until request drop. It passes through run queues, device-pending work, and the
-scheduler-owned reservation-wait collection.
+The same slot follows the request until request drop. It passes through run queues, device-pending work, the
+scheduler-owned reservation-wait collection, and service-owned pending session storage.
+
+`CommitResult::TurnCompleted(reason)` transfers the complete `InternalRequest` and completion reason out of the
+scheduler. The event loop sends both values through the completed-turn channel. The service session manager stores
+the request before it publishes `RequestEvent::TurnCompleted` to the caller. Ownership location represents the wait
+between turns. The request does not need a separate waiting state.
+
+The completed-turn channel transfers request ownership to `DecodeSessions`. The request-event channel sends token
+probabilities and turn completion to the caller. These channels have different receivers and ownership contracts.
+`InternalRequest` stores only the request-event sender. It does not store turn-completion state.
+
+Turn completion makes all current tokens history. It resets current-turn prompt and sampled-token metadata and clears
+unused speculative proposals. The next turn adds prompt tokens to the retained `TrieDecoderBlocks` and makes the new
+suffix ready for scheduling. The service returns the same `InternalRequest` through the ready-request channel.
+Event-loop admission enqueues this request without allocating a new slot and without changing its `Running` status.
+
+The retained blocks preserve committed KV and state progress. Scheduling starts at the retained cursor. It includes
+the prior turn's last sampled token and the new prompt because these tokens have no committed model state yet. It does
+not include earlier committed tokens.
+
+Context exhaustion is terminal. A stop sequence or the per-turn sampled-token limit completes only the current turn
+when the context still has capacity.
 
 Request-slot allocator usage is therefore the single admission count. No separate running-request counter exists.
 

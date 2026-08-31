@@ -6,8 +6,8 @@ pub use status::RequestStatus;
 mod queued_request;
 pub use queued_request::QueuedRequest;
 
-mod input_positions;
-pub use input_positions::RequestInputPositions;
+mod token_positions;
+pub use token_positions::RequestTokenPositions;
 
 mod internal_request;
 pub use internal_request::InternalRequest;
@@ -22,3 +22,6 @@ pub use request_slot::RequestSlotAllocator;
 
 mod token_prob;
 pub use token_prob::TokenProbs;
+
+mod request_event;
+pub use request_event::RequestEvent;

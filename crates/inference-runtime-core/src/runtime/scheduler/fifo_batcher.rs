@@ -5,6 +5,7 @@ use ahash::AHashMap;
 
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::runtime::CompletionReason;
 use crate::runtime::RawRequestID;
 use crate::runtime::scheduler::Batcher;
 use crate::runtime::scheduler::CancelResult;
@@ -191,8 +192,9 @@ where
         &mut self,
         schedule_queue: &mut ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
         dev_resps: Vec<DeviceResp>,
-    ) {
+    ) -> Vec<(UserReq, CompletionReason)> {
         debug_assert!(self.running_reqs.is_empty(), "fifo batcher scratch must be empty");
+        let mut completed_turns = Vec::new();
         for dev_resp in dev_resps {
             let req_id = dev_resp.id();
             let mut user_req = schedule_queue
@@ -201,9 +203,11 @@ where
             match user_req.commit(dev_resp) {
                 CommitResult::Continue => schedule_queue.push_front(user_req),
                 CommitResult::Pending => schedule_queue.insert(user_req),
+                CommitResult::TurnCompleted(reason) => completed_turns.push((user_req, reason)),
                 CommitResult::Terminal => { /* noop */ },
             }
         }
+        completed_turns
     }
 }
 
@@ -687,8 +691,9 @@ mod tests {
     fn test_prepare_commit_req_state() {
         let continue_req_id = 1;
         let pending_req_id = 2;
-        let terminal_req_id = 3;
-        let skip_req_id = 4;
+        let completed_turn_req_id = 3;
+        let terminal_req_id = 4;
+        let skip_req_id = 5;
         let token_budget_per_req = 8;
         let mut seq = Sequence::new();
 
@@ -764,6 +769,30 @@ mod tests {
                 }
             });
 
+        let mut completed_turn_req = mock_user_req(completed_turn_req_id);
+        completed_turn_req
+            .expect_token_estimate()
+            .in_sequence(&mut seq)
+            .returning(move || ReqTokenInventory::new::<1>(completed_turn_req_id, token_budget_per_req, 0, 0, &[]));
+        completed_turn_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(completed_turn_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    compute_phase: ComputePhase::Decode {
+                        epoch: 0,
+                        token_index: 0,
+                    },
+                }
+            });
+
         let mut skip_req = mock_user_req(skip_req_id);
         skip_req
             .expect_token_estimate()
@@ -791,25 +820,32 @@ mod tests {
             .once()
             .in_sequence(&mut seq)
             .return_once(|_| CommitResult::Terminal);
+        completed_turn_req
+            .expect_commit()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CommitResult::TurnCompleted(CompletionReason::LengthLimit));
 
         let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
         let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(continue_req);
         schedule_queue.push_back(pending_req);
         schedule_queue.push_back(terminal_req);
+        schedule_queue.push_back(completed_turn_req);
         schedule_queue.push_back(skip_req);
 
         let mut batcher = FIFOBatcher::new();
         let dev_reqs = batcher.prepare(
-            4,
-            4 * token_budget_per_req,
+            5,
+            5 * token_budget_per_req,
             token_budget_per_req,
             AHashMap::new(),
             &mut schedule_queue,
         );
-        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![1, 2, 4, 3]);
         assert!(schedule_queue.get_ref(&continue_req_id).is_some());
         assert!(schedule_queue.get_ref(&pending_req_id).is_some());
+        assert!(schedule_queue.get_ref(&completed_turn_req_id).is_some());
         assert!(schedule_queue.get_ref(&terminal_req_id).is_some());
         assert!(schedule_queue.get_ref(&skip_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 1);
@@ -818,17 +854,22 @@ mod tests {
         assert!(schedule_queue.pop_front().is_none());
         schedule_queue.push_back(continue_req);
 
-        batcher.commit(
+        let completed_turns = batcher.commit(
             &mut schedule_queue,
             vec![
                 mock_dev_resp(continue_req_id),
                 mock_dev_resp(pending_req_id),
                 mock_dev_resp(terminal_req_id),
+                mock_dev_resp(completed_turn_req_id),
             ],
         );
 
+        assert_eq!(completed_turns.len(), 1);
+        assert_eq!(completed_turns[0].0.id(), completed_turn_req_id);
+        assert_eq!(completed_turns[0].1, CompletionReason::LengthLimit);
         assert!(schedule_queue.get_ref(&continue_req_id).is_some());
         assert!(schedule_queue.get_ref(&pending_req_id).is_some());
+        assert!(schedule_queue.get_ref(&completed_turn_req_id).is_none());
         assert!(schedule_queue.get_ref(&terminal_req_id).is_none());
         assert!(schedule_queue.get_ref(&skip_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 1);

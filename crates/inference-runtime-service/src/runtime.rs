@@ -5,13 +5,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use async_channel::bounded as async_bounded;
-use async_channel::unbounded as async_unbounded;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
-use crossbeam_channel::TrySendError;
 use crossbeam_channel::bounded as sync_bounded;
 use inference_executor_core::model::ReplayableDecoderModel;
-use inference_runtime_core::Error;
 use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
@@ -26,14 +23,13 @@ use inference_runtime_core::config::SchedulerConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::memory::U32IDAllocator;
-use inference_runtime_core::runtime::AtomicRequestStatus;
 use inference_runtime_core::runtime::ExternalRequest;
 use inference_runtime_core::runtime::InternalRequest;
 use inference_runtime_core::runtime::QueuedRequest;
 use inference_runtime_core::runtime::RawRequestID;
 use inference_runtime_core::runtime::RawRequestSlot;
-use inference_runtime_core::runtime::RequestInputPositions;
 use inference_runtime_core::runtime::RequestSlotAllocator;
+use inference_runtime_core::runtime::RequestTokenPositions;
 use inference_runtime_core::runtime::Resource;
 use inference_runtime_core::runtime::ResourcePlacement;
 use inference_runtime_core::runtime::Token;
@@ -41,7 +37,6 @@ use inference_runtime_core::runtime::decoder::TPKVBlockAllocator;
 use inference_runtime_core::runtime::decoder::TPStateBlockAllocator;
 use inference_runtime_core::runtime::decoder::trie_cache::MultiLaneTrieBlockCache;
 use inference_runtime_core::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
-use inference_runtime_core::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 use inference_runtime_core::runtime::scheduler::EventLoop;
 use inference_runtime_core::runtime::scheduler::FIFOBatcher;
@@ -50,7 +45,6 @@ use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
 use inference_runtime_core::runtime::tasks::AsyncTaskResp;
-use inference_runtime_core::runtime::validate_resources;
 
 use crate::api::Inference;
 use crate::consts::NUM_TRIE_PARTITION;
@@ -59,6 +53,9 @@ use crate::executor::ReplayableModelExecutors;
 use crate::rpc;
 use crate::rpc::HTTPService;
 
+mod decode_sessions;
+use decode_sessions::DecodeSessions;
+
 type RuntimeBlockCache<const P: usize, const L: usize> =
     MultiLaneTrieBlockCache<P, L, TPKVBlockAllocator, TPStateBlockAllocator>;
 type RuntimeQueuedRequest<const N: usize, const P: usize, const L: usize> =
@@ -66,14 +63,12 @@ type RuntimeQueuedRequest<const N: usize, const P: usize, const L: usize> =
 type RuntimeRequest<const N: usize, const P: usize, const L: usize> = InternalRequest<N, P, L, RuntimeBlockCache<P, L>>;
 
 pub struct InferenceRuntime<const N: usize, const L: usize, const P: usize> {
+    #[cfg(test)]
     model_runtime_config: RuntimeConfig,
-    scheduler_config: SchedulerConfig,
 
     shutdown: Shutdown,
-    block_cache: Arc<RuntimeBlockCache<P, L>>,
-    resource_processors: Arc<ResourceProcessors>,
 
-    user_req_tx: Sender<RuntimeQueuedRequest<N, P, L>>,
+    decode_sessions: DecodeSessions<N, L, P>,
     model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
     model_executor_resp_tx: Sender<ReplayableModelExecutorResponse>,
     request_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
@@ -166,7 +161,9 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             Arc::new(MultiLaneTrieBlockCache::new(block_cache_vec))
         };
 
-        let (user_req_tx, user_req_rx) = sync_bounded(model_runtime_config.max_queued_requests);
+        let (new_req_tx, new_req_rx) = sync_bounded(model_runtime_config.max_queued_requests);
+        let (ready_req_tx, ready_req_rx) = sync_bounded(model_runtime_config.max_running_requests);
+        let (completed_turn_tx, completed_turn_rx) = async_bounded(model_runtime_config.max_running_requests);
         let model_executor_channel_capacity = scheduler_config
             .max_compute_slots
             .checked_add(1)
@@ -176,6 +173,16 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         let (async_task_req_tx, async_task_req_rx) = async_bounded(model_runtime_config.max_running_requests);
         let (async_task_resp_tx, async_task_resp_rx) =
             sync_bounded::<Box<dyn AsyncTaskResp>>(model_runtime_config.max_running_requests);
+        let decode_sessions = DecodeSessions::new(
+            model_runtime_config.clone(),
+            block_cache.clone(),
+            resource_processors.clone(),
+            new_req_tx,
+            ready_req_tx,
+            completed_turn_rx,
+            shutdown.clone(),
+            async_task_handle,
+        );
 
         {
             let schedule_queue: ScheduleQueue<RuntimeRequest<N, P, L>, DeviceRequest, DeviceResponse> =
@@ -193,7 +200,9 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                 num_spec_tokens,
             );
             let event_loop = EventLoop::new(
-                user_req_rx,
+                new_req_rx,
+                ready_req_rx,
+                completed_turn_tx,
                 async_task_resp_rx,
                 model_executor_req_tx,
                 model_executor_resp_rx,
@@ -230,14 +239,12 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         };
 
         Self {
+            #[cfg(test)]
             model_runtime_config,
-            scheduler_config,
 
             shutdown,
-            block_cache,
-            resource_processors,
 
-            user_req_tx,
+            decode_sessions,
             model_executor_req_rx,
             model_executor_resp_tx,
             request_slot_reset_notifier,
@@ -246,110 +253,63 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn initialize_req(
+    #[cfg(test)]
+    fn initialize_req(
         &self,
         request_id: RawRequestID,
         history_tokens: Vec<Token>,
         prompt_tokens: Vec<Token>,
         sampled_tokens: Vec<Token>,
-        input_positions: Option<RequestInputPositions>,
+        token_positions: Option<RequestTokenPositions>,
         resource_entries: Vec<(Resource, ResourcePlacement)>,
         sampling_config: SamplingConfig,
     ) -> Result<(RuntimeQueuedRequest<N, P, L>, ExternalRequest)> {
-        let (resources, resource_placements): (Vec<_>, Vec<_>) = resource_entries.into_iter().unzip();
-        let num_initial_tokens = history_tokens.len() + prompt_tokens.len() + sampled_tokens.len();
-        assert!(
-            input_positions
-                .as_ref()
-                .is_none_or(|positions| positions.initial().len() == num_initial_tokens),
-            "explicit request input positions must match the initial token count"
-        );
-        let min_initial_tokens = usize::max(1, L - 1);
-        if num_initial_tokens < min_initial_tokens {
-            return Err(Error::invalid_argument(format!(
-                "decode request minimum initial token count is {min_initial_tokens} for {L} cache lanes, got {}",
-                num_initial_tokens
-            )));
-        }
-        if num_initial_tokens >= self.model_runtime_config.context_window {
-            return Err(Error::invalid_argument(format!(
-                "decode request initial token count={num_initial_tokens} must be less than context window={}",
-                self.model_runtime_config.context_window
-            )));
-        }
-        if let Some(input_positions) = &input_positions {
-            let max_continuation_index = self.model_runtime_config.context_window - 1 - num_initial_tokens;
-            assert!(
-                input_positions
-                    .continuation_start()
-                    .iter()
-                    .all(|&position| max_continuation_index <= u32::MAX as usize - position as usize),
-                "explicit request continuation positions must fit u32 through the context window"
-            );
-        }
-        if sampled_tokens.len() >= sampling_config.max_sampled_tokens {
-            return Err(Error::invalid_argument(format!(
-                "decode request initial sampled token count={} must be less than max_sampled_tokens={}",
-                sampled_tokens.len(),
-                sampling_config.max_sampled_tokens
-            )));
-        }
-        validate_resources(&resources, &resource_placements, num_initial_tokens)?;
-        let req_status = AtomicRequestStatus::new();
-        let decoder_kv_blocks = TrieDecoderBlocks::new(
-            self.block_cache.clone(),
-            resources,
-            resource_placements,
+        self.decode_sessions.initialize_session(
+            request_id,
             history_tokens,
             prompt_tokens,
             sampled_tokens,
-        );
-        let (token_prob_tx, token_prob_rx) = async_unbounded();
-        let queued_request = QueuedRequest::new(
-            request_id,
-            req_status.clone(),
-            decoder_kv_blocks,
-            input_positions,
-            self.resource_processors.clone(),
-            token_prob_tx,
+            token_positions,
+            resource_entries,
             sampling_config,
-            self.model_runtime_config.context_window,
-        );
-        let external_request = ExternalRequest::new(request_id, req_status, token_prob_rx);
-        Ok((queued_request, external_request))
+        )
     }
 
-    pub fn submit_req(&self, queued_request: RuntimeQueuedRequest<N, P, L>) -> Result<()> {
-        let request_id = queued_request.req_id();
-        match self.user_req_tx.try_send(queued_request) {
-            Ok(()) => {
-                tracing::debug!(
-                    target: "inference-runtime-service::runtime",
-                    phase = "request.queued",
-                    request_id,
-                    "decode request queued"
-                );
-                Ok(())
-            },
-            Err(TrySendError::Full(_)) => {
-                tracing::debug!(
-                    target: "inference-runtime-service::runtime",
-                    phase = "request.queue_full",
-                    request_id,
-                    "request queue is full"
-                );
-                Err(Error::resource_exhausted("decode queue is full"))
-            },
-            Err(TrySendError::Disconnected(_)) => {
-                tracing::debug!(
-                    target: "inference-runtime-service::runtime",
-                    phase = "request.runtime_stopped",
-                    request_id,
-                    "runtime is stopped"
-                );
-                Err(Error::unavailable("runtime is stopped"))
-            },
-        }
+    #[cfg(test)]
+    fn submit_req(&self, queued_request: RuntimeQueuedRequest<N, P, L>) -> Result<()> {
+        self.decode_sessions.submit_new(queued_request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session(
+        &self,
+        request_id: RawRequestID,
+        history_tokens: Vec<Token>,
+        prompt_tokens: Vec<Token>,
+        sampled_tokens: Vec<Token>,
+        token_positions: Option<RequestTokenPositions>,
+        resource_entries: Vec<(Resource, ResourcePlacement)>,
+        sampling_config: SamplingConfig,
+    ) -> Result<ExternalRequest> {
+        self.decode_sessions.create_session(
+            request_id,
+            history_tokens,
+            prompt_tokens,
+            sampled_tokens,
+            token_positions,
+            resource_entries,
+            sampling_config,
+        )
+    }
+
+    pub fn continue_session(
+        &self,
+        external_request: &ExternalRequest,
+        prompt_tokens: Vec<Token>,
+        sampling_config: SamplingConfig,
+    ) -> Result<()> {
+        self.decode_sessions
+            .continue_session(external_request, prompt_tokens, sampling_config)
     }
 
     pub fn model_executor_request_rx(&self) -> Receiver<ReplayableModelExecutorRequest> {
@@ -467,6 +427,7 @@ mod tests {
     use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::config::SchedulerConfig;
     use inference_runtime_core::runtime::CompletionReason;
+    use inference_runtime_core::runtime::RequestEvent;
     use inference_runtime_core::runtime::RequestSlotAllocationResult;
     use inference_runtime_core::runtime::RequestSlotAllocator;
     use inference_runtime_core::runtime::RequestStatus;
@@ -649,7 +610,9 @@ mod tests {
             request.commit(decode_response(1, first_query, &[], 3, &[4, 5, 6])),
             CommitResult::Continue
         ));
-        let first_visible = external_request.token_prob_rx().try_recv().unwrap();
+        let RequestEvent::TokenProbs(first_visible) = external_request.event_rx().try_recv().unwrap() else {
+            panic!("test request should produce token probabilities")
+        };
 
         let second_query = prepare_decode(&mut request, 2);
         let QueryTokens::Decode { spec_tokens, .. } = &second_query else {
@@ -660,7 +623,9 @@ mod tests {
             request.commit(decode_response(1, second_query, &[4], 5, &[6, 7, 8])),
             CommitResult::Terminal
         ));
-        let second_visible = external_request.token_prob_rx().try_recv().unwrap();
+        let RequestEvent::TokenProbs(second_visible) = external_request.event_rx().try_recv().unwrap() else {
+            panic!("test request should produce token probabilities")
+        };
         assert_eq!(
             [first_visible.tokens, second_visible.tokens].concat(),
             vec![Token::new(3), Token::new(4)]

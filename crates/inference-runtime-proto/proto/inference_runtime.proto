@@ -4,6 +4,7 @@ package psi_dec.inference.v1;
 
 service InferenceRuntime {
   rpc Decode(DecodeRequest) returns (stream DecodeResponse);
+  rpc DecodeStream(stream DecodeRequest) returns (stream DecodeResponse);
 }
 
 message DecodeRequest {

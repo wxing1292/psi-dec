@@ -1,20 +1,20 @@
 use crate::compute::QueryTokens;
 
-/// Model-owned positions for one initial request and its sequential continuation.
+/// Model-owned token positions for one initial request and its sequential continuation.
 ///
 /// Runtime core stores and slices this data. It does not interpret an axis or
-/// calculate model-specific positions.
+/// calculate model-specific token positions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequestInputPositions {
+pub struct RequestTokenPositions {
     initial: Vec<[u32; 3]>,
     continuation_start: [u32; 3],
 }
 
-impl RequestInputPositions {
+impl RequestTokenPositions {
     pub fn new(initial: Vec<[u32; 3]>, continuation_start: [u32; 3]) -> Self {
         assert!(
             !initial.is_empty(),
-            "explicit request input positions require initial tokens"
+            "explicit request token positions require initial tokens"
         );
         Self {
             initial,
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn test_query_initial_and_continuation() {
-        let positions = RequestInputPositions::new(vec![[0, 0, 0], [1, 2, 3]], [4, 5, 6]);
+        let positions = RequestTokenPositions::new(vec![[0, 0, 0], [1, 2, 3]], [4, 5, 6]);
         let query = QueryTokens::Prefill {
             epoch: 0,
             token_index: 1,

@@ -63,9 +63,14 @@ content.
 
 Each response stream keeps its incremental detokenization and Qwen response-grammar state private.
 
-The runtime token and probability channel is intentionally `async_channel::unbounded`. It preserves committed output
-without blocking synchronous runtime commit. Dropping a `DecodeResponse` drops its `ExternalRequest`. This action
-cancels only that request. A slow transport consumer does not terminate the request.
+The runtime request-event channel is intentionally `async_channel::unbounded`. It preserves committed token
+probabilities and turn-completion events without blocking synchronous runtime commit. Dropping a `DecodeResponse`
+drops its `ExternalRequest`. This action cancels only that request. A slow transport consumer does not terminate the
+request.
+
+The cancellation channel is also unbounded. It connects `ExternalRequest` to the existing `DecodeSessions` async
+event loop. The same event loop receives completed turns. Cancellation does not create another async task and does not
+cross the scheduler boundary.
 
 ## Tool state
 
@@ -503,10 +508,67 @@ See [`qwen3_asr.md`](qwen3_asr.md) for the resource and executor contract.
 
 ## gRPC decode
 
-`DecodeRequest` contains model-ready tokens and sampling fields. It does not contain a caller request ID or client-side
-default stop tokens.
+`DecodeRequest` contains model-ready tokens and sampling fields. The internal service API can also contain explicit
+token positions for model-specific inputs such as M-RoPE. The gRPC request currently derives normal sequential token
+positions and does not expose this field. `DecodeRequest` does not contain a caller request ID or client-side default
+stop tokens.
 
-The server assigns a nonzero ID. Each `DecodeResponse` envelope contains this ID.
+`Decode` accepts one request and returns one response stream. `DecodeStream` accepts an ordered stream of the same
+requests and returns one response stream. The server processes each input request to completion before it reads the
+next input request. Thus, response events from different requests cannot interleave.
+
+`DecodeStream` requires a first request. An empty input stream returns `InvalidArgument` before the server creates the
+response stream.
+
+The first `DecodeStream` request contains the initial model input. Each later request contains only the new prompt
+tokens for that turn. Each request also supplies the sampling configuration for its turn. The RPC does not store
+messages, tool events, or other conversation objects.
+
+One `DecodeStream` owns one runtime session:
+
+```text
+client                         service DecodeSessions                 scheduler / executor
+  |                                      |                                      |
+  | first DecodeRequest                 |                                      |
+  |------------------------------------>| create InternalRequest                |
+  |                                      | allocate one request slot ---------->|
+  |                                      |                                      | prefill / decode
+  |<------------------------------------------------------------------ chunks |
+  |                                      |<----------- completed InternalRequest|
+  |                                      | store pending request                |
+  |<------------- turn completion -------| then publish completion              |
+  |                                      |                                      |
+  | next DecodeRequest (new tokens only) |                                      |
+  |------------------------------------>| take pending request                  |
+  |                                      | start turn with new prompt tokens     |
+  |                                      | enqueue same request and slot -------->|
+  |                                      |                                      | continue from old cursor
+  |<------------------------------------------------------------------ chunks |
+  |                                      |<----------- completed InternalRequest|
+  |                                      | store, then publish                  |
+  |<------------- turn completion -------|                                      |
+  |                                      |                                      |
+  | half-close / cancel / stream error   |                                      |
+  |------------------------------------>| drop session -> cancel request ------>|
+```
+
+The manager stores the completed internal request before it publishes the turn-completion event. Thus, the next input
+can take the pending request without a completion-to-resume race. A new turn does not allocate a new request slot. It
+retains the request's trie blocks, KV pages, GDN state pages, token history, and cursor. The executor still processes
+the last sampled token and the newly appended prompt because those tokens do not yet have committed model state. It
+does not process previously committed history again.
+
+An idle stream between turns retains one request slot and its resident model state. The current implementation does
+not evict or offload an idle session. A later implementation can restore partially evicted or SSD-offloaded state at
+the resume boundary. A fully evicted session must return `Unavailable`. The caller must start a new stream with the
+complete model input.
+
+A request validation error, runtime error, or input stream error ends the RPC. A client input half-close prevents more
+input. It does not cancel the active turn. The server finishes that turn, observes the half-close, and releases the
+pending session. RPC cancellation drops the session and cancels its runtime request.
+
+The server assigns one nonzero ID to the session. Each `DecodeResponse` envelope for all turns contains this ID.
+Unary `Decode` uses the same lifecycle for one turn. It releases the session after its completion event.
 
 Each response has one of these forms:
 
@@ -711,6 +773,42 @@ The Pi `openai-completions` provider can use this endpoint directly. The wire ad
 - Non-persistent `store:false`
 - Non-constrained `strict:false` tool definitions
 - A leading `developer` message
+
+Use this provider shape in `~/.pi/agent/models.json`. Set the model ID and limits to the loaded checkpoint:
+
+```json
+{
+  "providers": {
+    "psi-dec": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "unused",
+      "compat": {
+        "supportsStore": false,
+        "supportsDeveloperRole": true,
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_completion_tokens",
+        "thinkingFormat": "qwen",
+        "supportsStrictMode": false,
+        "supportsLongCacheRetention": false
+      },
+      "models": [{
+        "id": "qwen3.6-27b",
+        "name": "psi-dec Qwen3.6 27B",
+        "reasoning": true,
+        "thinkingLevelMap": {"xhigh": "xhigh", "max": "xhigh"},
+        "input": ["text"],
+        "contextWindow": 262144,
+        "maxTokens": 32768
+      }]
+    }
+  }
+}
+```
+
+Pi must send the complete message history on each turn. The service does not retain a conversation or model
+continuation between HTTP requests.
 
 A supplied `reasoning_effort` enables Qwen thinking. Streaming reasoning returns in `delta.reasoning_content`.
 Later history can supply the reasoning as assistant `reasoning_content`.

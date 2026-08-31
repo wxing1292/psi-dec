@@ -19,43 +19,99 @@ use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tonic::Streaming;
 
+use crate::api::Inference;
 use crate::api::decode::DecodeEvent;
 use crate::api::decode::DecodeRequest;
 use crate::rpc::grpc::GRPCServer;
 use crate::rpc::grpc::map_error;
 
+type ProtoDecodeResponseStream = Pin<Box<dyn Stream<Item = Result<ProtoDecodeResponse, Status>> + Send>>;
+
 #[async_trait::async_trait]
 impl<const N: usize, const L: usize, const P: usize> InferenceRuntime for GRPCServer<N, L, P> {
-    type DecodeStream = Pin<Box<dyn Stream<Item = Result<ProtoDecodeResponse, Status>> + Send>>;
+    type DecodeStream = ProtoDecodeResponseStream;
+    type DecodeStreamStream = ProtoDecodeResponseStream;
 
     async fn decode(&self, request: Request<ProtoDecodeRequest>) -> Result<Response<Self::DecodeStream>, Status> {
-        let request = request.into_inner();
-        let sampling = SamplingConfig {
-            max_sampled_tokens: usize::try_from(request.max_sampled_tokens)
-                .map_err(|_| Status::invalid_argument("max_sampled_tokens does not fit usize"))?,
-            temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
-            top_k: request.top_k.unwrap_or(DEFAULT_SAMPLING_TOP_K as u32) as usize,
-            top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
-            seed: request.seed,
-            stop_sequences: request
-                .stop_sequences
-                .into_iter()
-                .map(|sequence| sequence.tokens.into_iter().map(Token::new).collect())
-                .collect(),
-        };
-        let request = DecodeRequest::new(
-            request.tokens.into_iter().map(Token::new).collect(),
-            None,
-            vec![],
-            sampling,
-        )
-        .map_err(map_error)?;
-        let response = self.inference.decode(request).map_err(map_error)?;
-        let request_id = response.request_id() as u64;
-        let response = response.map(move |event| map_response(request_id, event));
-        Ok(Response::new(Box::pin(response)))
+        let response = start_decode(&self.inference, request.into_inner())?;
+        Ok(Response::new(response))
     }
+
+    async fn decode_stream(
+        &self,
+        request: Request<Streaming<ProtoDecodeRequest>>,
+    ) -> Result<Response<Self::DecodeStreamStream>, Status> {
+        let inference = self.inference.clone();
+        let mut requests = request.into_inner();
+        let first_request = requests
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("decode stream requires at least one request"))?;
+        let mut session = inference
+            .create_session(map_request(first_request)?)
+            .map_err(map_error)?;
+        let responses = async_stream::try_stream! {
+            while {
+                loop {
+                    let event = session
+                        .next_event()
+                        .await
+                        .ok_or_else(|| Status::internal("decode session ended without a turn completion"))?;
+                    let turn_completed = matches!(event, Ok(DecodeEvent::Completed { .. }));
+                    yield map_response(session.request_id() as u64, event)?;
+                    if turn_completed {
+                        break;
+                    }
+                }
+
+                match requests.message().await? {
+                    Some(request) => {
+                        inference
+                        .continue_session(&session, map_request(request)?)
+                        .map_err(map_error)?;
+                        true
+                    },
+                    None => false,
+                }
+            } {}
+        };
+        Ok(Response::new(Box::pin(responses)))
+    }
+}
+
+fn start_decode<const N: usize, const L: usize, const P: usize>(
+    inference: &Inference<N, L, P>,
+    request: ProtoDecodeRequest,
+) -> Result<ProtoDecodeResponseStream, Status> {
+    let request = map_request(request)?;
+    let response = inference.decode(request).map_err(map_error)?;
+    let request_id = response.request_id() as u64;
+    Ok(Box::pin(response.map(move |event| map_response(request_id, event))))
+}
+
+fn map_request(request: ProtoDecodeRequest) -> Result<DecodeRequest, Status> {
+    let sampling = SamplingConfig {
+        max_sampled_tokens: usize::try_from(request.max_sampled_tokens)
+            .map_err(|_| Status::invalid_argument("max_sampled_tokens does not fit usize"))?,
+        temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
+        top_k: request.top_k.unwrap_or(DEFAULT_SAMPLING_TOP_K as u32) as usize,
+        top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
+        seed: request.seed,
+        stop_sequences: request
+            .stop_sequences
+            .into_iter()
+            .map(|sequence| sequence.tokens.into_iter().map(Token::new).collect())
+            .collect(),
+    };
+    DecodeRequest::new(
+        request.tokens.into_iter().map(Token::new).collect(),
+        None,
+        vec![],
+        sampling,
+    )
+    .map_err(map_error)
 }
 
 fn map_response(request_id: u64, event: RuntimeResult<DecodeEvent>) -> Result<ProtoDecodeResponse, Status> {
@@ -86,3 +142,7 @@ fn map_response(request_id: u64, event: RuntimeResult<DecodeEvent>) -> Result<Pr
         event: Some(event),
     })
 }
+
+#[cfg(test)]
+#[path = "./decode_test.rs"]
+mod decode_test;

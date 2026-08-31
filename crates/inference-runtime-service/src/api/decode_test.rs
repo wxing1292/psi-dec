@@ -57,16 +57,19 @@ fn test_stop_sequences_merge_and_deduplicate() {
 
 #[tokio::test]
 async fn test_response_preserves_token_chunks() {
-    let (response, sender, status) = fixture_request(RequestStatus::Completed(CompletionReason::StopSequence));
+    let (response, sender, status) = fixture_request(RequestStatus::Running);
     let mut response = Box::pin(response);
     sender
-        .send(TokenProbs {
+        .send(RequestEvent::TokenProbs(TokenProbs {
             tokens: vec![fixture_token(1), fixture_token(2)],
             probs: vec![NotNan::new(0.1).unwrap(), NotNan::new(0.2).unwrap()],
-        })
+        }))
         .await
         .unwrap();
-    drop(sender);
+    sender
+        .send(RequestEvent::TurnCompleted(CompletionReason::StopSequence))
+        .await
+        .unwrap();
     match response.next().await.unwrap().unwrap() {
         DecodeEvent::TokenProbs(chunk) => assert_eq!(chunk.tokens.len(), 2),
         _ => panic!("expected token chunk"),
@@ -122,9 +125,20 @@ fn test_response_drop_cancels_request() {
 }
 
 async fn assert_completion_reason(expected: CompletionReason) {
-    let (response, sender, _) = fixture_request(RequestStatus::Completed(expected));
+    if expected == CompletionReason::ContextLimit {
+        let (response, sender, _) = fixture_request(RequestStatus::Completed(expected));
+        let mut response = Box::pin(response);
+        drop(sender);
+        match response.next().await.unwrap().unwrap() {
+            DecodeEvent::Completed { reason, .. } => assert_eq!(reason, expected),
+            DecodeEvent::TokenProbs(_) => panic!("expected completion"),
+        }
+        return;
+    }
+
+    let (response, sender, _) = fixture_request(RequestStatus::Running);
     let mut response = Box::pin(response);
-    drop(sender);
+    sender.send(RequestEvent::TurnCompleted(expected)).await.unwrap();
     match response.next().await.unwrap().unwrap() {
         DecodeEvent::Completed { reason, .. } => assert_eq!(reason, expected),
         DecodeEvent::TokenProbs(_) => panic!("expected completion"),
@@ -146,8 +160,11 @@ fn fixture_sampling(max_sampled_tokens: usize) -> SamplingConfig {
     }
 }
 
-fn fixture_request(status: RequestStatus) -> (DecodeResponse, async_channel::Sender<TokenProbs>, AtomicRequestStatus) {
+fn fixture_request(
+    status: RequestStatus,
+) -> (DecodeResponse, async_channel::Sender<RequestEvent>, AtomicRequestStatus) {
     let (sender, receiver) = async_channel::unbounded();
+    let (cancel_tx, _cancel_rx) = async_channel::unbounded();
     let request_status = AtomicRequestStatus::new();
     match status {
         RequestStatus::Cancelled => {
@@ -167,6 +184,10 @@ fn fixture_request(status: RequestStatus) -> (DecodeResponse, async_channel::Sen
             request_status.store_running();
         },
     }
-    let request = ExternalRequest::new(42, request_status.clone(), receiver);
-    (DecodeResponse::new(request), sender, request_status)
+    let request = ExternalRequest::new(42, request_status.clone(), receiver, cancel_tx);
+    (
+        DecodeResponse::new(DecodeSession::<1, 1, 1>::new(request)),
+        sender,
+        request_status,
+    )
 }
