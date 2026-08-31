@@ -505,8 +505,8 @@ slot.
 
 Runtime core owns token-ID stop and EOS completion at the request commit boundary. The executor reports sampled tokens.
 
-Core checks the configured stop token sequences. It commits decoder and cache state. It truncates user-visible output
-after the first matched stop sequence. Core then marks the request completed.
+Core checks the configured stop token sequences. It commits the exact sampled prefix through the first completion
+boundary. Core then completes the turn or terminates the request.
 
 A one-token stop sequence represents EOS.
 
@@ -516,15 +516,15 @@ The successful status records one of these completion reasons:
 - `LengthLimit` when caller-visible output reaches its limit
 - `ContextLimit` when caller-visible output reaches the effective context window
 
-A stop match wins when multiple completion conditions occur on the same commit. `LengthLimit` wins a tie with
-`ContextLimit`. Service layers map the recorded reason. They must not infer it from the emitted token count.
+`ContextLimit` wins any tie because context exhaustion terminates the request. `StopSequence` wins a tie with
+`LengthLimit`. Service layers map the recorded reason. They must not infer it from the emitted token count.
 
 Model executors may provide model-specific default stop sequences, such as Qwen
 EOS token IDs. The service merges caller-provided token sequences with model
 defaults and de-duplicates them before submitting the request to core.
 
 Per-request token and probability delivery must not silently drop committed output. The current runtime uses an
-unbounded internal channel between request commit and the transport-neutral `DecodeResponse`. This channel keeps
+unbounded internal channel between request commit and the transport-neutral `ExternalRequest`. This channel keeps
 synchronous request commit non-blocking and preserves every committed output. `max_running_requests` bounds the number
 of admitted request channels. `max_sampled_tokens` and `context_window` bound the caller-visible output of each request.
 The runtime does not terminate a request only because its transport consumer is slow.
@@ -535,17 +535,22 @@ Dropping that response causes three actions:
 - It closes the receiver.
 - It cancels the request lifecycle.
 
-`max_sampled_tokens` and `context_window` are caller-visible output limits. A speculative step can commit more sampled
-tokens to decoder state than the caller's remaining budget.
+`max_sampled_tokens` and `context_window` bound the committed output. Core reserves one token of remaining
+sampled-token and context capacity for the next decode response. It limits each new speculative proposal to the
+capacity before that reserved token. Core also finds the earliest stop sequence that the proposal can complete. It
+retains only the proper stop-sequence prefix. The final stop token remains available for the next sampled token.
 
-Core truncates only the `TokenProbs` sent to the caller. It leaves the sampled-token commit unchanged and marks the
-request completed. Tokens that entered cache were valid model inputs inside `context_window`. The final sampled token
-can remain in a terminal request's queued-token state beyond the caller-visible context boundary. It does not enter
-cache or another model input. Request drop then releases its decoder and cache ownership.
+The executor validates a prefix of the submitted speculative tokens. Its committed KV/GDN state ends after that
+validated prefix. Each decode response also returns one final sampled token. That token is not materialized in
+KV/GDN state.
 
-If the request continues, commit truncates the next speculative token, probability, and confidence vectors to the
-remaining model-input extent. `InternalRequest::prepare` asserts that the resulting model-input extent does not exceed
-`context_window`.
+Core commits every validated token and the final sampled token. A completion boundary must end at the final sampled
+token. It must not end inside the validated prefix. Core applies this contract when it limits the preceding speculative
+proposal. Core must not shorten the validated prefix or remove the final sampled token after executor commit.
+
+`SampledTokens::Decode::sampled_token` and `sampled_prob` are required values. `DecoderBlocks::commit` receives the
+validated prefix and the final sampled token without a completion-specific branch. It does not receive separate
+completion-boundary metadata. `TokenProbs` contains the same committed tokens.
 
 Request-slot drop adds its slot to a deduplicated reset set. It does this before it returns the slot to the allocator.
 

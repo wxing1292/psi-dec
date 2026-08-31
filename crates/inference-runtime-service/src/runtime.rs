@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_trims_spec_input_and_context_visible_output() {
+    fn test_commit_reserves_sampled_token_at_context_limit() {
         let (runtime, shutdown, _async_runtime) = test_runtime_with_context::<1>(4);
         let sampling = SamplingConfig {
             max_sampled_tokens: 8,
@@ -614,13 +614,13 @@ mod tests {
             panic!("test request should produce token probabilities")
         };
 
-        let second_query = prepare_decode(&mut request, 2);
+        let second_query = prepare_decode(&mut request, 1);
         let QueryTokens::Decode { spec_tokens, .. } = &second_query else {
             panic!("test request should prepare Decode")
         };
-        assert_eq!(spec_tokens, &[Token::new(4)]);
+        assert!(spec_tokens.is_empty());
         assert!(matches!(
-            request.commit(decode_response(1, second_query, &[4], 5, &[6, 7, 8])),
+            request.commit(decode_response(1, second_query, &[], 4, &[5, 6, 7])),
             CommitResult::Terminal
         ));
         let RequestEvent::TokenProbs(second_visible) = external_request.event_rx().try_recv().unwrap() else {
@@ -638,12 +638,12 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_completion_priority_for_tied_limits() {
+    fn test_commit_context_limit_precedes_tied_turn_limits() {
         assert_eq!(
             single_decode_completion(1, vec![vec![Token::new(4)]]),
-            CompletionReason::StopSequence
+            CompletionReason::ContextLimit
         );
-        assert_eq!(single_decode_completion(1, vec![]), CompletionReason::LengthLimit);
+        assert_eq!(single_decode_completion(1, vec![]), CompletionReason::ContextLimit);
     }
 
     #[test]

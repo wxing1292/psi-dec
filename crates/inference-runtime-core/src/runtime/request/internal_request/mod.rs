@@ -20,10 +20,9 @@ use crate::runtime::request::TokenProbs;
 use crate::runtime::resource::processor::ResourceProcessors;
 use crate::runtime::scheduler::ComputePhase;
 
+mod commit_output;
 mod req_resp;
-
 mod stop_sequence;
-pub use stop_sequence::StopSequenceMatch;
 
 pub struct InternalRequest<const N: usize, const P: usize, const L: usize, DBC>
 where
@@ -37,6 +36,8 @@ where
     resource_processors: Arc<ResourceProcessors>,
     in_flight_computes: VecDeque<ComputePhase>,
     num_in_flight_blocking_async_tasks: usize,
+    // TODO(nonblocking-async-task): Implement this counter's lifecycle before InternalRequest can create a
+    // nonblocking async task.
     num_in_flight_nonblocking_async_tasks: usize,
     event_tx: Sender<RequestEvent>,
 
@@ -155,7 +156,19 @@ where
         self.sampling_config = sampling_config;
     }
 
-    pub fn finish_turn(&mut self) {
+    fn finish_turn(&mut self) {
+        assert!(
+            self.in_flight_computes.is_empty(),
+            "turn completion requires all scheduled computes to be committed"
+        );
+        assert_eq!(
+            self.num_in_flight_blocking_async_tasks, 0,
+            "turn completion cannot retain a blocking async task"
+        );
+        assert_eq!(
+            self.num_in_flight_nonblocking_async_tasks, 0,
+            "turn completion cannot retain a nonblocking async task"
+        );
         self.decoder_blocks.finish_turn();
     }
 

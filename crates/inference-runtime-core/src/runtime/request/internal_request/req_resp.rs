@@ -1,17 +1,13 @@
-use std::cmp::min;
-
 use crate::compute::DeviceRequest;
 use crate::compute::DeviceResponse;
 use crate::compute::QueryTokens;
-use crate::compute::SampledTokens;
 use crate::runtime::RawRequestID;
 use crate::runtime::decoder::trie_cache::DecoderBlocks;
 use crate::runtime::decoder::trie_cache::InitBlockOnceResult;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::InternalRequest;
-use crate::runtime::request::internal_request::StopSequenceMatch;
-use crate::runtime::request::internal_request::stop_sequence::StopSequences;
+use crate::runtime::request::internal_request::commit_output::prepare_commit_output;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
 use crate::runtime::scheduler::ComputePhase;
@@ -221,63 +217,26 @@ where
         let remaining_sampled_tokens =
             self.sampling_config().max_sampled_tokens - self.decoder_blocks.num_sampled_tokens();
         let remaining_context_tokens = self.context_window - self.decoder_blocks.num_total_tokens();
-        let remaining_visible_tokens = min(remaining_sampled_tokens, remaining_context_tokens);
-        let stop_match = self.match_stop_sequence(&sampled_tokens);
-        let mut token_probs = stop_match.visible_token_probs(&sampled_tokens);
-        if let Some(token_probs) = &mut token_probs {
-            token_probs.tokens.truncate(remaining_visible_tokens);
-            token_probs.probs.truncate(remaining_visible_tokens);
-        }
-        let num_validated_sampled_tokens = sampled_tokens.num_validated_sampled_tokens();
-        if let SampledTokens::Decode {
-            validated_tokens,
-            spec_tokens,
-            spec_probs,
-            spec_confidences,
-            ..
-        } = &mut sampled_tokens
-        {
-            debug_assert_eq!(
-                num_validated_sampled_tokens,
-                validated_tokens.len() + 1,
-                "decode responses must contain one final sampled token"
-            );
-            let num_total_tokens = self.decoder_blocks.num_total_tokens() + num_validated_sampled_tokens;
-            let max_spec_tokens = self.context_window - min(self.context_window, num_total_tokens);
-            spec_tokens.truncate(max_spec_tokens);
-            spec_probs.truncate(max_spec_tokens);
-            spec_confidences.truncate(max_spec_tokens);
-        }
+        let (token_probs, completion) = prepare_commit_output(
+            self.sampling_config.stop_sequences.as_slice(),
+            remaining_sampled_tokens,
+            remaining_context_tokens,
+            self.decoder_blocks.sampled_tokens_rev(),
+            &mut sampled_tokens,
+        );
         self.decoder_blocks.commit(query_tokens, sampled_tokens);
-        if let Some(token_probs) = token_probs
-            && !token_probs.tokens.is_empty()
-        {
+        if !token_probs.is_empty() {
             self.send_token_probs(token_probs);
         }
-        let turn_completion = if stop_match.matched() {
-            Some(CompletionReason::StopSequence)
-        } else if self.decoder_blocks.num_sampled_tokens() >= self.sampling_config().max_sampled_tokens {
-            Some(CompletionReason::LengthLimit)
-        } else {
-            None
-        };
-        if self.decoder_blocks.num_total_tokens() >= self.context_window {
-            self.store_completed(turn_completion.unwrap_or(CompletionReason::ContextLimit));
-        } else if let Some(reason) = turn_completion {
-            assert!(
-                self.in_flight_computes.is_empty(),
-                "turn completion requires all scheduled computes to be committed"
-            );
-            assert_eq!(
-                self.num_in_flight_blocking_async_tasks, 0,
-                "turn completion cannot retain a blocking async task"
-            );
-            assert_eq!(
-                self.num_in_flight_nonblocking_async_tasks, 0,
-                "turn completion cannot retain a nonblocking async task"
-            );
-            self.finish_turn();
-            return CommitResult::TurnCompleted(reason);
+        match completion {
+            Some(CompletionReason::ContextLimit) => {
+                self.store_completed(CompletionReason::ContextLimit);
+            },
+            Some(reason @ (CompletionReason::StopSequence | CompletionReason::LengthLimit)) => {
+                self.finish_turn();
+                return CommitResult::TurnCompleted(reason);
+            },
+            None => {},
         }
 
         if self.status().is_terminal() {
@@ -337,16 +296,5 @@ fn compute_phase(query_tokens: &QueryTokens) -> ComputePhase {
                 token_index: *token_index,
             }
         },
-    }
-}
-
-impl<const N: usize, const P: usize, const L: usize, DBC> InternalRequest<N, P, L, DBC>
-where
-    DBC: MultiLaneBlockCache<P, L>,
-{
-    fn match_stop_sequence(&self, sampled_tokens: &SampledTokens) -> StopSequenceMatch {
-        let stop_sequences = self.sampling_config().stop_sequences.as_slice();
-        let stop_sequences = StopSequences::new(stop_sequences);
-        stop_sequences.match_decode(self.decoder_blocks.sampled_tokens_rev(), sampled_tokens)
     }
 }
