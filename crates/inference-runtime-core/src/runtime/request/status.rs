@@ -76,14 +76,22 @@ impl AtomicRequestStatus {
     pub fn store_cancelled(&self) -> bool {
         self.store_terminal(RequestStatus::Cancelled)
     }
+
     #[inline]
     pub fn store_timed_out(&self) -> bool {
         self.store_terminal(RequestStatus::TimedOut)
     }
+
     #[inline]
     pub fn store_aborted(&self) -> bool {
         self.store_terminal(RequestStatus::Aborted)
     }
+
+    #[inline]
+    pub fn store_evicted(&self) -> bool {
+        self.store_terminal(RequestStatus::Evicted)
+    }
+
     #[inline]
     pub fn store_completed(&self, completion: CompletionReason) -> bool {
         self.store_terminal(RequestStatus::Completed(completion))
@@ -126,6 +134,7 @@ pub enum RequestStatus {
     Cancelled,
     TimedOut,
     Aborted,
+    Evicted,
     Completed(CompletionReason),
 }
 
@@ -149,7 +158,7 @@ impl RequestStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Cancelled | Self::TimedOut | Self::Aborted | Self::Completed(_)
+            Self::Cancelled | Self::TimedOut | Self::Aborted | Self::Evicted | Self::Completed(_)
         )
     }
 
@@ -165,6 +174,7 @@ impl RequestStatus {
             Self::Completed(CompletionReason::StopSequence) => 6,
             Self::Completed(CompletionReason::LengthLimit) => 7,
             Self::Completed(CompletionReason::ContextLimit) => 8,
+            Self::Evicted => 9,
         }
     }
 
@@ -180,6 +190,7 @@ impl RequestStatus {
             6 => RequestStatus::Completed(CompletionReason::StopSequence),
             7 => RequestStatus::Completed(CompletionReason::LengthLimit),
             8 => RequestStatus::Completed(CompletionReason::ContextLimit),
+            9 => RequestStatus::Evicted,
             _ => unreachable!(),
         }
     }

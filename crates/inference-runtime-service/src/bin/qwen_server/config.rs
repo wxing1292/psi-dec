@@ -19,8 +19,6 @@ use crate::telemetry::ProfileMode;
 use crate::telemetry::ProfilingConfig;
 use crate::telemetry::TelemetryConfig;
 
-const MAX_QUEUED_REQUESTS: usize = 32;
-
 #[derive(Debug)]
 struct SpecCheckpoint {
     model_dir: PathBuf,
@@ -43,7 +41,6 @@ pub struct Qwen3Config {
     executor_hibernation_timeout: Duration,
     executor_hibernation_mode: ExecutorHibernationMode,
     num_cache_pages: usize,
-    max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
 }
 
@@ -93,7 +90,6 @@ impl Qwen3Config {
             executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
             executor_hibernation_mode: args.executor_hibernation_mode,
             num_cache_pages: args.num_cache_pages.get(),
-            max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
                 max_tokens: args.max_tokens.get(),
@@ -135,10 +131,6 @@ impl Qwen3Config {
         self.num_cache_pages
     }
 
-    pub fn max_queued_requests(&self) -> usize {
-        self.max_queued_requests
-    }
-
     pub fn max_running_requests(&self) -> usize {
         self.scheduler_config.max_requests
     }
@@ -157,7 +149,6 @@ pub struct Qwen3ASRConfig {
     executor_hibernation_timeout: Duration,
     executor_hibernation_mode: ExecutorHibernationMode,
     num_cache_pages: usize,
-    max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
 }
 
@@ -195,7 +186,6 @@ impl Qwen3ASRConfig {
             executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
             executor_hibernation_mode: args.executor_hibernation_mode,
             num_cache_pages: args.num_cache_pages.get(),
-            max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
                 max_tokens: args.max_tokens.get(),
@@ -231,10 +221,6 @@ impl Qwen3ASRConfig {
 
     pub fn num_cache_pages(&self) -> usize {
         self.num_cache_pages
-    }
-
-    pub fn max_queued_requests(&self) -> usize {
-        self.max_queued_requests
     }
 
     pub fn max_running_requests(&self) -> usize {
@@ -286,7 +272,6 @@ pub struct Qwen35Config {
     executor_hibernation_timeout: Duration,
     executor_hibernation_mode: ExecutorHibernationMode,
     num_cache_pages: usize,
-    max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
 }
 
@@ -360,7 +345,6 @@ impl Qwen35Config {
             executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
             executor_hibernation_mode: args.executor_hibernation_mode,
             num_cache_pages: args.num_cache_pages.get(),
-            max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
                 max_tokens: args.max_tokens.get(),
@@ -404,10 +388,6 @@ impl Qwen35Config {
 
     pub fn num_cache_pages(&self) -> usize {
         self.num_cache_pages
-    }
-
-    pub fn max_queued_requests(&self) -> usize {
-        self.max_queued_requests
     }
 
     pub fn max_running_requests(&self) -> usize {

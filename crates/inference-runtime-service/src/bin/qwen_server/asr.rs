@@ -39,7 +39,6 @@ fn run_inner() -> Result<()> {
 
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
-    let max_queued_requests = config.max_queued_requests();
     let max_running_requests = config.max_running_requests();
     tracing::info!("initializing model executor");
     let loaded = init_qwen3_asr_model(
@@ -78,7 +77,6 @@ fn run_inner() -> Result<()> {
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
         num_kv_pages_per_block = cache_lane.num_pages_per_kv_block,
         block_cache_capacity = cache_lane.block_cache_capacity,
-        max_queued_requests,
         max_running_requests,
         context_window = runtime_config.context_window,
         max_batch_requests = scheduler_config.max_requests,
@@ -106,7 +104,6 @@ fn build_runtime_config(service_config: &Qwen3ASRConfig, model: &Qwen3Executor) 
     let text = &model.asr_model_config().text;
     let num_pages_per_kv_block = model.num_kv_page_ids_per_block();
     Ok(RuntimeConfig {
-        max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),
         executor_hibernation_timeout: service_config.executor_hibernation_timeout(),
         executor_hibernation_mode: service_config.executor_hibernation_mode(),

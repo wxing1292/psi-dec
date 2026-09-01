@@ -3,9 +3,6 @@ pub use status::AtomicRequestStatus;
 pub use status::CompletionReason;
 pub use status::RequestStatus;
 
-mod queued_request;
-pub use queued_request::QueuedRequest;
-
 mod token_positions;
 pub use token_positions::RequestTokenPositions;
 

@@ -36,7 +36,6 @@ pub struct CacheLaneRuntimeConfig {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    pub max_queued_requests: usize,
     pub max_running_requests: usize,
     pub executor_hibernation_timeout: Duration,
     pub executor_hibernation_mode: ExecutorHibernationMode,

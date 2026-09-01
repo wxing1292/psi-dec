@@ -95,6 +95,7 @@ where
             pub fn store_swapped(&self) -> bool;
             pub fn store_timed_out(&self) -> bool;
             pub fn store_aborted(&self) -> bool;
+            pub fn store_evicted(&self) -> bool;
             pub fn store_completed(&self, completion: CompletionReason) -> bool;
         }
 

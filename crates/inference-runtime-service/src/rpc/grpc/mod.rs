@@ -57,6 +57,7 @@ fn map_error(error: Error) -> Status {
         Error::Cancelled(message) => Status::cancelled(message),
         Error::DeadlineExceeded(message) => Status::deadline_exceeded(message),
         Error::Aborted(message) => Status::aborted(message),
+        Error::Evicted(message) => Status::aborted(message),
         Error::Unavailable(message) => Status::unavailable(message),
         Error::Internal(message) => Status::internal(message),
     }

@@ -102,6 +102,7 @@ async fn test_response_maps_terminal_errors() {
         RequestStatus::Cancelled,
         RequestStatus::TimedOut,
         RequestStatus::Aborted,
+        RequestStatus::Evicted,
     ] {
         let (response, sender, _) = fixture_request(status);
         let mut response = response;
@@ -112,6 +113,7 @@ async fn test_response_maps_terminal_errors() {
             (RequestStatus::Cancelled, Error::Cancelled(_))
                 | (RequestStatus::TimedOut, Error::DeadlineExceeded(_))
                 | (RequestStatus::Aborted, Error::Aborted(_))
+                | (RequestStatus::Evicted, Error::Evicted(_))
         ));
     }
 }
@@ -178,6 +180,9 @@ fn fixture_request(
         },
         RequestStatus::Aborted => {
             request_status.store_aborted();
+        },
+        RequestStatus::Evicted => {
+            request_status.store_evicted();
         },
         RequestStatus::Completed(completion) => {
             request_status.store_completed(completion);

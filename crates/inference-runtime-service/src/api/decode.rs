@@ -43,10 +43,10 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
         Ok(DecodeSession::new(external_request, num_history_tokens))
     }
 
-    pub fn continue_session(&self, session: &mut DecodeSession<N, L, P>, request: DecodeRequest) -> Result<()> {
+    pub async fn resume_session(&self, session: &mut DecodeSession<N, L, P>, request: DecodeRequest) -> Result<()> {
         assert!(
             session.num_turn_output_tokens.is_none(),
-            "decode session cannot continue before turn completion",
+            "decode session cannot resume before turn completion",
         );
         let DecodeRequest {
             tokens,
@@ -57,16 +57,16 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
         let num_prompt_tokens = tokens.len();
         if token_positions.is_some() {
             return Err(Error::invalid_argument(
-                "decode session continuation does not support explicit token positions",
+                "a resumed decode turn cannot set explicit token positions",
             ));
         }
         if !resource_entries.is_empty() {
             return Err(Error::invalid_argument(
-                "decode session continuation does not support new resource entries",
+                "a resumed decode turn cannot add resource entries",
             ));
         }
         merge_stop_sequences(&mut sampling.stop_sequences, &self.default_stop_sequences);
-        self.runtime.continue_session(&session.request, tokens, sampling)?;
+        self.runtime.resume_session(&session.request, tokens, sampling).await?;
         session.start_turn(num_prompt_tokens);
         Ok(())
     }
@@ -194,9 +194,18 @@ impl<const N: usize, const L: usize, const P: usize> DecodeSession<N, L, P> {
                     RequestStatus::Cancelled => Err(Error::cancelled("request was cancelled")),
                     RequestStatus::TimedOut => Err(Error::deadline_exceeded("request deadline exceeded")),
                     RequestStatus::Aborted => Err(Error::aborted("request was aborted")),
+                    RequestStatus::Evicted => Err(Error::evicted("request was evicted")),
                     status => panic!("request output closed in non-terminal state: {status:?}"),
                 }
             },
+        }
+    }
+
+    /// Waits for an idle session to lose its internal request and returns the terminal error.
+    pub async fn wait_for_session_end(&mut self) -> Error {
+        match self.recv_event().await {
+            Err(error) => error,
+            Ok(_) => panic!("an idle decode session cannot produce a request event"),
         }
     }
 }

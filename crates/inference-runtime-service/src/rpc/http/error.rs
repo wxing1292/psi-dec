@@ -48,6 +48,7 @@ fn classify(error: &Error) -> (StatusCode, &'static str, &'static str) {
         Error::Cancelled(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "server_error"),
         Error::DeadlineExceeded(_) => (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "server_error"),
         Error::Aborted(_) => (StatusCode::CONFLICT, "aborted", "server_error"),
+        Error::Evicted(_) => (StatusCode::CONFLICT, "evicted", "server_error"),
         Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", "server_error"),
         Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "server_error"),
     }
@@ -89,6 +90,7 @@ mod tests {
                 "deadline_exceeded",
             ),
             (Error::aborted("request was aborted"), StatusCode::CONFLICT, "aborted"),
+            (Error::evicted("request was evicted"), StatusCode::CONFLICT, "evicted"),
             (
                 Error::internal("internal failure"),
                 StatusCode::INTERNAL_SERVER_ERROR,

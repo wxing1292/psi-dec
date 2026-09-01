@@ -52,7 +52,7 @@ type TestRuntime = InferenceRuntime<1024, 1, 4>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_tokens_stream_lifecycle() {
-    let runtime = new_runtime();
+    let runtime = new_runtime(4);
     let inference = Arc::new(Inference::new(runtime.clone(), Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
@@ -131,7 +131,7 @@ async fn test_generate_tokens_stream_lifecycle() {
     let Some(TokenEvent::Completion(second_completion)) = second_completion.event else {
         panic!("second turn must end with one completion")
     };
-    assert_eq!(second_completion.reason, ProtoCompletionReason::LengthLimit as i32);
+    assert_eq!(second_completion.reason, ProtoCompletionReason::ContextLimit as i32);
     assert_eq!(second_completion.num_output_tokens, 1);
 
     assert_ne!(first_chunk_id, 0);
@@ -139,9 +139,6 @@ async fn test_generate_tokens_stream_lifecycle() {
     assert_eq!(first_chunk_id, second_chunk_id);
     assert_eq!(second_chunk_id, second_completion_id);
 
-    let status = output.message().await.unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert!(status.message().contains("at least one token"));
     assert!(output.message().await.unwrap().is_none());
 
     driver.await.unwrap();
@@ -154,7 +151,7 @@ async fn test_generate_tokens_stream_lifecycle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_messages_stream_reuses_resident_request() {
-    let runtime = new_runtime();
+    let runtime = new_runtime(5);
     let inference = Arc::new(Inference::new(runtime.clone(), Vec::new()));
     let codec = Arc::new(fixture_message_codec());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -184,9 +181,16 @@ async fn test_generate_messages_stream_reuses_resident_request() {
         drive_turns(driver_runtime, input_closed_rx, vec![Token::new(4), Token::new(2)])
     });
 
-    let (input_tx, mut input_rx) = mpsc::channel(2);
+    let (input_tx, mut input_rx) = mpsc::channel(3);
     input_tx.send(fixture_message_request(false)).await.unwrap();
     input_tx.send(fixture_message_request(true)).await.unwrap();
+    input_tx
+        .send(ProtoGenerateMessagesRequest {
+            messages: Vec::new(),
+            ..fixture_message_request(true)
+        })
+        .await
+        .unwrap();
     drop(input_tx);
     let input = async_stream::stream! {
         while let Some(request) = input_rx.recv().await {
@@ -217,6 +221,7 @@ async fn test_generate_messages_stream_reuses_resident_request() {
         }
     };
     assert_eq!(second_completion.num_input_tokens, 4);
+    assert_eq!(second_completion.reason, ProtoCompletionReason::ContextLimit as i32);
     assert!(output.message().await.unwrap().is_none());
 
     driver.await.unwrap();
@@ -227,16 +232,15 @@ async fn test_generate_messages_stream_reuses_resident_request() {
     runtime.shutdown();
 }
 
-fn new_runtime() -> Arc<TestRuntime> {
+fn new_runtime(context_window: usize) -> Arc<TestRuntime> {
     let shutdown = Shutdown::new();
     let async_task_handle = tokio::runtime::Handle::current();
     Arc::new(TestRuntime::new(
         RuntimeConfig {
-            max_queued_requests: 1,
             max_running_requests: 1,
             executor_hibernation_timeout: DEFAULT_EXECUTOR_HIBERNATION_TIMEOUT,
             executor_hibernation_mode: ExecutorHibernationMode::Selected,
-            context_window: 4096,
+            context_window,
             num_tokens_per_cache_block: 1024,
             num_kv_heads: 1,
             kv_head_dim: 1,

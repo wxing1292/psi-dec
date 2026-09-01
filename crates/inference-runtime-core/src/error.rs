@@ -16,6 +16,9 @@ pub enum Error {
     Aborted(String),
 
     #[error("{0}")]
+    Evicted(String),
+
+    #[error("{0}")]
     Unavailable(String),
 
     #[error("{0}")]
@@ -41,6 +44,10 @@ impl Error {
 
     pub fn aborted(msg: impl Into<String>) -> Self {
         Self::Aborted(msg.into())
+    }
+
+    pub fn evicted(msg: impl Into<String>) -> Self {
+        Self::Evicted(msg.into())
     }
 
     pub fn unavailable(msg: impl Into<String>) -> Self {

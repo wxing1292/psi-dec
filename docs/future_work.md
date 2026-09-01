@@ -8,10 +8,15 @@ document that owns the component.
 
 ## Agent Integration
 
+The resident generation-session baseline is complete. It keeps one runtime request across append-only turns. Keep this
+model-facing protocol small. Put durable agent semantics in an adapter above the generation RPC.
+
 - Distinguish turn interruption from session shutdown. The first Pi provider closes the complete
   `GenerateMessagesStream` when its `AbortSignal` fires.
 - Add a Codex-compatible agent adapter above the generation RPC. Keep durable threads, turns, items, approvals, tool
   execution, and command execution out of the model-generation protocol.
+- Add transport reconnect and event replay only when an agent must survive a broken generation stream. Keep the
+  durable thread identity in the agent adapter. A closed generation stream currently ends its resident runtime session.
 - Add branch support from an existing resident session. Return a new session identity. Share immutable token and cache
   prefixes. Give the child independent mutable GDN state.
 - Investigate rewrite only after the GDN state-copy contract is explicit. A changed token prefix must not reuse GDN
@@ -21,10 +26,15 @@ document that owns the component.
 
 ## Runtime Lifecycle
 
-- Add idle-session eviction and per-request model-state recovery at the `DecodeSessions::continue_session` boundary.
-  Preserve the request ID, request slot, token metadata, trie-block ownership, and cache-lane page identity for a
-  partially evicted request. Restore KV and GDN state before the request returns to the scheduler. Return `Unavailable`
-  for a fully evicted request. The caller must retry with the complete input.
+Direct idle-session eviction is complete. It destroys the resident request and releases its owned resources. The
+remaining work is eviction policy and resumable model-state movement.
+
+- Connect request-slot pressure and page pressure to `Sessions::evict_one_req`. Add a periodic caller for
+  `Sessions::evict_expired`. Keep policy and invocation order outside the session manager.
+- Add per-request model-state recovery at the `Sessions::resume` boundary. Preserve the request ID,
+  request slot, token metadata, trie-block ownership, and cache-lane page identity for a partially evicted request.
+  Restore KV and GDN state before the request returns to the scheduler. Return `Evicted` for a fully evicted request.
+  The caller must retry with the complete input.
 - Revisit cross-request resource sharing after the complete multimodal path is stable.
   Adapt the existing runtime pin-cache ownership model instead of adding a second ad hoc resource cache.
   The shared object must be immutable while it has readers.

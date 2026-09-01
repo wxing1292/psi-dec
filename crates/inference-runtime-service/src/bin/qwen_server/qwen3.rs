@@ -50,7 +50,6 @@ fn run_inner() -> Result<()> {
 
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
-    let max_queued_requests = config.max_queued_requests();
     let max_running_requests = config.max_running_requests();
     tracing::info!("initializing model executor");
     let executor_config = Qwen3ExecutorConfig {
@@ -106,7 +105,6 @@ fn run_inner() -> Result<()> {
         http_listen_addr = %config.http_listen_addr(),
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
-        max_queued_requests,
         max_running_requests,
         context_window = runtime_config.context_window,
         max_batch_requests = scheduler_config.max_requests,
@@ -140,7 +138,6 @@ fn build_runtime_config(service_config: &Qwen3Config, model: &Qwen3Executor) -> 
         Qwen3ModelMode::DSpark { .. } => model.num_spec_tokens(),
     };
     Ok(RuntimeConfig {
-        max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),
         executor_hibernation_timeout: service_config.executor_hibernation_timeout(),
         executor_hibernation_mode: service_config.executor_hibernation_mode(),

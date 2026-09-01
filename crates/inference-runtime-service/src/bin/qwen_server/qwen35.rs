@@ -126,7 +126,6 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
     tracing::info!("Qwen codec loaded");
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
-    let max_queued_requests = config.max_queued_requests();
     let max_running_requests = config.max_running_requests();
 
     tracing::info!("initializing model executor");
@@ -165,7 +164,6 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         http_listen_addr = %config.http_listen_addr(),
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
-        max_queued_requests,
         max_running_requests,
         context_window = runtime_config.context_window,
         max_batch_requests = scheduler_config.max_requests,
@@ -293,7 +291,6 @@ fn build_runtime_config(
         Qwen35ModelMode::Vanilla | Qwen35ModelMode::MTP { .. } => 0,
     };
     let runtime_config = RuntimeConfig {
-        max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),
         executor_hibernation_timeout: service_config.executor_hibernation_timeout(),
         executor_hibernation_mode: service_config.executor_hibernation_mode(),

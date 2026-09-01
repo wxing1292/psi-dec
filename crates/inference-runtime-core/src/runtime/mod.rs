@@ -9,7 +9,6 @@ pub use request::AtomicRequestStatus;
 pub use request::CompletionReason;
 pub use request::ExternalRequest;
 pub use request::InternalRequest;
-pub use request::QueuedRequest;
 pub use request::RequestEvent;
 pub use request::RequestSlot;
 pub use request::RequestSlotAllocationResult;

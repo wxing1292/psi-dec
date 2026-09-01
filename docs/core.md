@@ -63,12 +63,11 @@ then use that block as a non-terminal prefix.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ QueuedRequest                                                              │
-│ request ID + tokens + sampling/lifecycle state; no request slot            │
+│ Sessions::create                                                           │
+│ validate input -> allocate RequestSlot -> create running InternalRequest   │
+│ -> submit through the request channel                                     │
 └───────────────────────────────────┬────────────────────────────────────────┘
-                                    │ event-loop admission when a slot is free
-                                    │ -> allocate RequestSlot
-                                    │ -> convert to InternalRequest
+                                    │ event-loop enqueue
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ ScheduleQueue                                                              │
@@ -120,12 +119,12 @@ then use that block as a non-terminal prefix.
                                       v              v                     v
                                ┌─────────────┐ ┌──────────────────┐ ┌──────────────┐
                                │ run_queue   │ │ completed channel│ │ drop request │
-                               │ push front  │ │ -> DecodeSessions│ │ release slot │
+                               │ push front  │ │ -> Sessions      │ │ release slot │
                                └─────────────┘ │ -> pending       │ │ and pages    │
                                                │ -> publish event │ └──────────────┘
                                                └────────┬─────────┘
                                                         │ start turn with new tokens
-                                                        │ ready-request channel
+                                                        │ request channel
                                                         v
                                                ┌──────────────────┐
                                                │ event-loop enqueue│
@@ -154,9 +153,9 @@ speculative token budgets. The speculative phase uses a request-local causal can
 request-ID-to-token-budget map. `FIFOBatcher` consumes this map before it uses the remaining hard request and token
 budgets for the normal FIFO queue.
 
-Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
-new-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain, the ready-request channel,
-and the async-task request and response channels.
+Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_running_requests` bounds the
+request-slot domain, the request channel, and the async-task request and response channels. Every request-channel
+entry owns one request slot, so this limit is also a strict channel-capacity bound.
 
 `SchedulerConfig::max_requests`, `max_tokens`, and `max_tokens_per_request` remain per-batch limits.
 `max_tokens_per_request` must not exceed `max_tokens`.
@@ -172,11 +171,9 @@ too short.
 `history.len() + prompt.len() + sampled.len() < context_window` before it constructs Trie blocks. It also requires the
 initial sampled-token count to be less than `max_sampled_tokens`.
 
-A queued request owns no request slot. The synchronous event loop registers the new-request receiver only when the
-request-slot allocator reports free capacity.
-
-After the event loop receives a request, it allocates one slot. It then constructs the `InternalRequest` that the
-scheduler consumes.
+Request initialization validates all caller input before it allocates a request slot. It then constructs a running
+`InternalRequest` and submits that request to the synchronous event loop. If no slot is available, initialization
+returns `Unavailable` before it creates the internal or external request.
 
 The same slot follows the request until request drop. It passes through run queues, device-pending work, the
 scheduler-owned reservation-wait collection, and service-owned pending session storage.
@@ -186,23 +183,38 @@ scheduler. The event loop sends both values through the completed-turn channel. 
 the request before it publishes `RequestEvent::TurnCompleted` to the caller. Ownership location represents the wait
 between turns. The request does not need a separate waiting state.
 
-The completed-turn channel transfers request ownership to `DecodeSessions`. The request-event channel sends token
+The completed-turn channel transfers request ownership to `Sessions`. The request-event channel sends token
 probabilities and turn completion to the caller. These channels have different receivers and ownership contracts.
 `InternalRequest` stores only the request-event sender. It does not store turn-completion state.
 
+The `Sessions` task is the only owner of the pending-session map. Resume, single-request eviction, and idle GC
+use an unbounded command channel. Each command includes a oneshot response sender. The session manager does not share
+the pending-session map through a mutex. If eviction precedes resume in the command order, resume observes
+that the resident request is absent and returns `Evicted`.
+
 Turn completion makes all current tokens history. It resets current-turn prompt and sampled-token metadata and clears
 unused speculative proposals. The next turn adds prompt tokens to the retained `TrieDecoderBlocks` and makes the new
-suffix ready for scheduling. The service returns the same `InternalRequest` through the ready-request channel.
-Event-loop admission enqueues this request without allocating a new slot and without changing its `Running` status.
+suffix ready for scheduling. The service returns the same `InternalRequest` through the request channel. Event-loop
+admission enqueues this request without allocating a new slot and without changing its `Running` status.
 
 The retained blocks preserve committed KV and state progress. Scheduling starts at the retained cursor. It includes
 the prior turn's last sampled token and the new prompt because these tokens have no committed model state yet. It does
-not include earlier committed tokens.
+not include earlier committed tokens. Initial and resumed turns use the same request channel.
 
 Context exhaustion is terminal. A stop sequence or the per-turn sampled-token limit completes only the current turn
 when the context still has capacity.
 
 Request-slot allocator usage is therefore the single admission count. No separate running-request counter exists.
+
+`Sessions::evict_one_req` removes the oldest request that waits between turns. `Sessions::evict_expired`
+removes all requests that exceed the specified idle duration. Each API transitions an active request to
+`RequestStatus::Evicted` before it drops the retained request. It preserves an existing terminal status. Request drop
+releases the request slot and removes the request's cache pins. The trie cache can retain reusable blocks until its
+cache policy evicts them. The service returns `Error::Evicted`. A gRPC streaming RPC maps this error to `ABORTED`
+because the caller must restart the complete session.
+
+Both APIs send commands to the session manager, which scans its pending-session map. Resource-pressure and periodic-GC
+callers own the policy and invocation order.
 
 `PrepareResult::Await` transfers the request into the `ScheduleQueue` reservation-wait collection. The collection is a
 `FuturesUnordered<AwaitReservation<...>>`. It does not produce a device request for that request.
@@ -594,10 +606,10 @@ geometry internally. It must not change scheduler policy.
 Request status tracks lifecycle ownership, not scheduler placement:
 
 ```text
-Initialized -> queued request exists but has not entered runtime admission
+Initialized -> transient status during request construction
 Running     -> request owns a request slot in the normal runtime path
 Swapped     -> reserved for a request whose model state is not device-resident
-terminal    -> Cancelled, TimedOut, Aborted, or Completed(CompletionReason)
+terminal    -> Cancelled, TimedOut, Aborted, Evicted, or Completed(CompletionReason)
 ```
 
 Scheduler-internal locations such as new queue, run queue, pending device work,

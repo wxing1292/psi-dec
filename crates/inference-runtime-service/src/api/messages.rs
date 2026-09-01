@@ -62,22 +62,22 @@ impl<const N: usize, const L: usize, const P: usize> MessageGenerator<N, L, P> {
         })
     }
 
-    pub async fn continue_session(&self, session: &mut MessageSession<N, L, P>, request: MessageRequest) -> Result<()> {
+    pub async fn resume_session(&self, session: &mut MessageSession<N, L, P>, request: MessageRequest) -> Result<()> {
         if !request.tools.is_empty() {
             return Err(Error::invalid_argument(
-                "Qwen message continuation does not support tool changes; start a new stream",
+                "a resumed Qwen message session cannot change tools; start a new stream",
             ));
         }
         if request.enable_thinking != session.enable_thinking || request.reasoning_effort != session.reasoning_effort {
             return Err(Error::invalid_argument(
-                "Qwen message continuation does not support generation-mode changes; start a new stream",
+                "a resumed Qwen message session cannot change the generation mode; start a new stream",
             ));
         }
         let previous_turn_closed = {
             let completed_turn = session.completed_turn.lock().unwrap();
             let completed_turn = completed_turn
                 .as_ref()
-                .expect("message continuation requires a completed response stream");
+                .expect("a message session can resume only after its response stream completes");
             validate_continuation(&request.messages, &completed_turn.pending_tool_calls)?;
             completed_turn.closed
         };
@@ -90,7 +90,9 @@ impl<const N: usize, const L: usize, const P: usize> MessageGenerator<N, L, P> {
         let mut decode_session = session.decode_session.lock().await;
         let num_input_tokens = decode_session.num_history_tokens() + prompt_tokens.len();
         let decode_request = DecodeRequest::new(prompt_tokens, None, vec![], request.sampling)?;
-        self.inference.continue_session(&mut decode_session, decode_request)?;
+        self.inference
+            .resume_session(&mut decode_session, decode_request)
+            .await?;
         drop(decode_session);
 
         *session.completed_turn.lock().unwrap() = None;
@@ -279,6 +281,10 @@ impl<const N: usize, const L: usize, const P: usize> MessageSession<N, L, P> {
                 }
             }
         })
+    }
+
+    pub async fn wait_for_session_end(&self) -> Error {
+        self.decode_session.lock().await.wait_for_session_end().await
     }
 }
 

@@ -124,7 +124,6 @@ where
 {
     fn id(&self) -> RawRequestID;
 
-    fn store_running(&self) -> bool;
     fn store_swapped(&self) -> bool;
     fn is_terminal(&self) -> bool;
     fn num_in_flight_computes(&self) -> usize;

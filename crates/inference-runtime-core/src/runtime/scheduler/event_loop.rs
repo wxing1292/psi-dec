@@ -23,8 +23,6 @@ use crate::config::ExecutorHibernationMode;
 use crate::log_err_internal;
 use crate::memory::U32IDAllocator;
 use crate::runtime::CompletionReason;
-use crate::runtime::RequestSlot;
-use crate::runtime::RequestSlotAllocationResult;
 use crate::runtime::RequestSlotAllocator;
 use crate::runtime::scheduler::InstrumentedScheduler;
 use crate::runtime::scheduler::Scheduler;
@@ -33,10 +31,9 @@ use crate::runtime::tasks::AsyncTaskResp;
 
 const SCHEDULER_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
-pub struct EventLoop<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
-    new_req_rx: Receiver<NewReq>,
-    ready_req_rx: Receiver<ReadyReq>,
-    completed_turn_tx: AsyncSender<(ReadyReq, CompletionReason)>,
+pub struct EventLoop<UsrReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
+    new_req_rx: Receiver<UsrReq>,
+    completed_turn_tx: AsyncSender<(UsrReq, CompletionReason)>,
     async_task_resp_rx: Receiver<Box<dyn AsyncTaskResp>>,
     model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
     model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
@@ -55,7 +52,6 @@ pub struct EventLoop<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, Ba
 
     shutdown: Shutdown,
 
-    phantom_data_ready_req: PhantomData<ReadyReq>,
     phantom_data_device_req: PhantomData<DeviceReq>,
     phantom_data_device_resp: PhantomData<DeviceResp>,
 }
@@ -66,21 +62,20 @@ enum ModelExecutorState {
     Stopped(ExecutorHibernationPlan),
 }
 
-impl<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
-    EventLoop<NewReq, ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
+impl<UsrReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
+    EventLoop<UsrReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
 where
-    ReadyReq: From<(NewReq, RequestSlot)> + UserRequest<DeviceReq, DeviceResp>,
+    UsrReq: UserRequest<DeviceReq, DeviceResp>,
     DeviceReq: DevReq,
     DeviceResp: DevResp,
     BatchDeviceReq: BatchDevReq<DeviceReq>,
     BatchDeviceResp: BatchDevResp<DeviceResp>,
-    S: Scheduler<ReadyReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
+    S: Scheduler<UsrReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        new_req_rx: Receiver<NewReq>,
-        ready_req_rx: Receiver<ReadyReq>,
-        completed_turn_tx: AsyncSender<(ReadyReq, CompletionReason)>,
+        new_req_rx: Receiver<UsrReq>,
+        completed_turn_tx: AsyncSender<(UsrReq, CompletionReason)>,
         async_task_resp_rx: Receiver<Box<dyn AsyncTaskResp>>,
         model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
         model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
@@ -97,7 +92,6 @@ where
         );
         Self {
             new_req_rx,
-            ready_req_rx,
             completed_turn_tx,
             async_task_resp_rx,
             model_executor_req_tx,
@@ -116,7 +110,6 @@ where
 
             shutdown,
 
-            phantom_data_ready_req: PhantomData,
             phantom_data_device_req: PhantomData,
             phantom_data_device_resp: PhantomData,
         }
@@ -130,12 +123,7 @@ where
         let mut result = Ok(());
         'event_loop: while !self.shutdown.is_shutdown() {
             let mut select = Select::new();
-            let op_recv_new_req = if self.request_slot_allocator.free() > 0 {
-                Some(select.recv(&self.new_req_rx))
-            } else {
-                None
-            };
-            let op_recv_ready_req = select.recv(&self.ready_req_rx);
+            let op_recv_new_req = select.recv(&self.new_req_rx);
             let op_recv_async_task_resp = select.recv(&self.async_task_resp_rx);
             let op_recv_model_executor_resp = select.recv(&self.model_executor_resp_rx);
             let op_scheduler_stats_timer = select.recv(&self.scheduler_stats_timer);
@@ -147,29 +135,13 @@ where
             let op = select.select();
             let op_index = op.index();
             match op_index {
-                _ if Some(op_index) == op_recv_new_req => {
+                _ if op_index == op_recv_new_req => {
                     let Ok(new_req) = op.recv(&self.new_req_rx) else {
                         result = Err(log_err_internal!("new-request channel closed, stopping"));
                         break 'event_loop;
                     };
-                    let request_slot = match self.request_slot_allocator.allocate() {
-                        RequestSlotAllocationResult::Ok { request_slot } => request_slot,
-                        RequestSlotAllocationResult::ResourceLimitExceeded => {
-                            panic!("available request-slot capacity must allow allocation")
-                        },
-                    };
-                    let ready_req = ReadyReq::from((new_req, request_slot));
-                    if ready_req.store_running() {
-                        self.scheduler.enqueue(ready_req);
-                    }
-                },
-                _ if op_index == op_recv_ready_req => {
-                    let Ok(ready_req) = op.recv(&self.ready_req_rx) else {
-                        result = Err(log_err_internal!("ready-request channel closed, stopping"));
-                        break 'event_loop;
-                    };
-                    if !ready_req.is_terminal() {
-                        self.scheduler.enqueue(ready_req);
+                    if !new_req.is_terminal() {
+                        self.scheduler.enqueue(new_req);
                     }
                 },
                 _ if op_index == op_recv_async_task_resp => {

@@ -88,28 +88,39 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime for GRPCSe
             .create_session(map_token_request(first_request)?)
             .map_err(map_error)?;
         let responses = async_stream::try_stream! {
-            while {
-                loop {
+            loop {
+                let reason = loop {
                     let event = session.recv_event().await;
-                    let turn_completed = matches!(event, Ok(DecodeEvent::Completed { .. }));
+                    let completion_reason = match &event {
+                        Ok(DecodeEvent::Completed { reason, .. }) => Some(*reason),
+                        _ => None,
+                    };
                     yield map_token_response(session.request_id() as u64, num_input_tokens, event)?;
-                    if turn_completed {
-                        break;
+                    if let Some(reason) = completion_reason {
+                        break reason;
                     }
+                };
+                if reason == CompletionReason::ContextLimit {
+                    break;
                 }
 
-                match requests.message().await? {
+                // An idle stream resumes with client input or ends when the resident session terminates.
+                let next_request = tokio::select! {
+                    next_request = requests.message() => next_request,
+                    session_error = session.wait_for_session_end() => Err(map_error(session_error)),
+                }?;
+                match next_request {
                     Some(request) => {
                         let num_history_tokens = session.num_history_tokens();
                         num_input_tokens = num_history_tokens + request.tokens.len();
                         inference
-                            .continue_session(&mut session, map_token_request(request)?)
+                            .resume_session(&mut session, map_token_request(request)?)
+                            .await
                             .map_err(map_error)?;
-                        true
                     },
-                    None => false,
+                    None => break,
                 }
-            } {}
+            }
         };
         Ok(Response::new(Box::pin(responses)))
     }
@@ -145,25 +156,40 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime for GRPCSe
             .create_session(map_message_request(first_request)?)
             .map_err(map_error)?;
         let responses = async_stream::try_stream! {
-            while {
+            loop {
                 let request_id = session.request_id() as u64;
                 let num_input_tokens = session.num_input_tokens();
                 let mut turn = session.response_stream();
-                while let Some(event) = turn.next().await {
+                let reason = loop {
+                    let event = turn.next().await.expect("message response stream must complete each turn");
+                    let completion_reason = match &event {
+                        Ok(MessageEvent::Completed { reason, .. }) => Some(*reason),
+                        _ => None,
+                    };
                     yield map_message_response(request_id, num_input_tokens, event)?;
+                    if let Some(reason) = completion_reason {
+                        break reason;
+                    }
+                };
+                if reason == CompletionReason::ContextLimit {
+                    break;
                 }
 
-                match requests.message().await? {
+                // An idle stream resumes with client input or ends when the resident session terminates.
+                let next_request = tokio::select! {
+                    next_request = requests.message() => next_request,
+                    session_error = session.wait_for_session_end() => Err(map_error(session_error)),
+                }?;
+                match next_request {
                     Some(request) => {
                         generator
-                            .continue_session(&mut session, map_message_request(request)?)
+                            .resume_session(&mut session, map_message_request(request)?)
                             .await
                             .map_err(map_error)?;
-                        true
                     },
-                    None => false,
+                    None => break,
                 }
-            } {}
+            }
         };
         Ok(Response::new(Box::pin(responses)))
     }

@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 crossbeam-channel = { workspace = true }
+delegate = { workspace = true }
 escargot = { workspace = true }
 futures-util = { workspace = true }
 hf-chat-template = { workspace = true }

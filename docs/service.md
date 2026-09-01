@@ -68,9 +68,13 @@ probabilities and turn-completion events without blocking synchronous runtime co
 drops its `ExternalRequest`. This action cancels only that request. A slow transport consumer does not terminate the
 request.
 
-The cancellation channel is also unbounded. It connects `ExternalRequest` to the existing `DecodeSessions` async
+The cancellation channel is also unbounded. It connects `ExternalRequest` to the existing `Sessions` async
 event loop. The same event loop receives completed turns. Cancellation does not create another async task and does not
 cross the scheduler boundary.
+
+The session-command channel is unbounded. A resume, single-request eviction, or idle GC call sends one command
+and waits on its oneshot response. The `Sessions` task owns the pending-session map. Service API tasks do not lock or
+access that map directly.
 
 ## Tool state
 
@@ -409,14 +413,13 @@ The rejection reports this dynamic minimum.
 Recommendation: For performance comparisons, pass `--num-cache-pages` explicitly. This setting controls memory
 pressure.
 
-`Qwen3Config` and `Qwen35Config` resolve the queued-request, running-request, and per-batch capacities.
+`Qwen3Config` and `Qwen35Config` resolve the running-request and per-batch capacities.
 CLI checkpoint arguments remain optional parser inputs.
 Configuration validation converts them to one `Vanilla`, `MTP`, `DSpark`, or `DFlash2` model mode.
 The validated configuration does not store independent speculative-model options.
 `--max-requests` defines both the running request-slot capacity and the per-batch request capacity.
 The model service passes this value to the executor, `RuntimeConfig`, and `SchedulerConfig`.
-The services default to 32 queued requests and 4 running request slots. Queued requests do not consume executor
-request-slot state.
+Every submitted request owns one request slot. The request channel capacity equals the running request-slot capacity.
 
 Admission assigns a slot before a request enters the scheduler.
 GQA page tables, GDN request state, sampling state, and request-indexed workspaces use the same slot domain.
@@ -550,7 +553,7 @@ The server completes one turn before it reads the next request. Events from diff
 bidirectional stream owns one runtime session:
 
 ```text
-client                     message adapter        DecodeSessions          scheduler / executor
+client                     message adapter        Sessions               scheduler / executor
   |                              |                       |                          |
   | first turn ----------------->| render tokens         |                          |
   |                              |---------------------->| create InternalRequest   |
@@ -576,10 +579,19 @@ retains the request's trie blocks, KV pages, GDN state pages, token history, and
 the last sampled token and the newly appended prompt because those tokens do not yet have committed model state. It
 does not process previously committed history again.
 
-An idle stream between turns retains one request slot and its resident model state. The current implementation does
-not evict or offload an idle session. A later implementation can restore partially evicted or SSD-offloaded state at
-the resume boundary. A fully evicted session must return `Unavailable`. The caller must start a new stream with the
-complete model input.
+An idle stream between turns retains one request slot and its resident model state. `evict_one_req` removes the oldest
+idle request. `evict_expired` removes all requests that exceed a supplied idle duration. Both APIs set an active
+request status to `Evicted` before they release its request slot and remove its cache pins. They preserve an existing
+terminal status. The trie cache can retain reusable blocks. The service returns `Evicted` when the caller tries to
+resume an evicted session. While a bidirectional gRPC stream waits for its next input, it also waits for session
+termination. Eviction ends that stream with gRPC `ABORTED`. The caller must start a new stream with the complete model
+input.
+
+The runtime does not invoke these APIs automatically. Request-slot pressure and page pressure require separate caller
+policies. A later implementation can restore partially evicted or SSD-offloaded state at the resume boundary.
+
+`StopSequence` and `LengthLimit` complete one turn. The bidirectional stream then waits for the next request.
+`ContextLimit` terminates the runtime request and closes the bidirectional response stream after its completion event.
 
 A request validation error, runtime error, or input stream error ends the RPC. A client input half-close prevents more
 input. It does not cancel the active turn. The server finishes that turn, observes the half-close, and releases the

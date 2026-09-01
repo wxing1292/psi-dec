@@ -112,12 +112,10 @@ fn test_request_capacity_follows_max_requests() {
     let qwen3 = Qwen3Config::from_args(parse_qwen3(&["--max-requests", "9"])).unwrap();
     assert_eq!(qwen3.scheduler_config().max_requests, 9);
     assert_eq!(qwen3.max_running_requests(), 9);
-    assert_eq!(qwen3.max_queued_requests(), 32);
 
     let qwen3_asr = Qwen3ASRConfig::from_args(parse_qwen3_asr(&["--max-requests", "9"])).unwrap();
     assert_eq!(qwen3_asr.scheduler_config().max_requests, 9);
     assert_eq!(qwen3_asr.max_running_requests(), 9);
-    assert_eq!(qwen3_asr.max_queued_requests(), 32);
 
     let qwen35_configs = [
         Qwen35Config::from_args(parse_qwen35(&["--max-requests", "9"])).unwrap(),
@@ -152,7 +150,6 @@ fn test_request_capacity_follows_max_requests() {
     for config in qwen35_configs {
         assert_eq!(config.scheduler_config().max_requests, 9);
         assert_eq!(config.max_running_requests(), 9);
-        assert_eq!(config.max_queued_requests(), 32);
     }
 }
 

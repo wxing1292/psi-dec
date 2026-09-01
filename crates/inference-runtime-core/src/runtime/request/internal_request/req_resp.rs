@@ -27,10 +27,6 @@ where
         self.req_id
     }
 
-    fn store_running(&self) -> bool {
-        InternalRequest::store_running(self)
-    }
-
     fn store_swapped(&self) -> bool {
         InternalRequest::store_swapped(self)
     }
