@@ -218,6 +218,7 @@ All paths above live under `crates/`.
 ## Documentation
 
 - [Service](docs/service.md): Setup, APIs, operations, and end-to-end checks.
+- [Pi provider](agent-plugins/pi/README.md): Install and configure the resident-session Pi extension.
 - [Runtime core](docs/core.md): Scheduling, request lifecycle, and cache ownership.
 - [Executor](docs/executor.md): Qwen execution and component composition.
 - [Qwen executor](docs/executor_qwen.md): Vanilla, MTP, DSpark, and DFlash2 ownership and replay architecture.

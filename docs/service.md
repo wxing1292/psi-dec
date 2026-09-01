@@ -650,6 +650,9 @@ The client model directory supplies tokenizer and chat-template files. The serve
 Add `--disable-thinking` for the checkpoint-defined non-thinking generation prefix. `--chat-template raw` is an
 explicit diagnostic bypass.
 
+The [Pi provider guide](../agent-plugins/pi/README.md) gives the extension installation, configuration, and usage
+procedure for `GenerateMessagesStream`.
+
 ## HTTP Chat Completions
 
 The HTTP listener runs with gRPC. It provides the OpenAI-compatible `POST /v1/chat/completions` route.
