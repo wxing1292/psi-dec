@@ -12,7 +12,7 @@ use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 
-const STATE_PAGE_FLOATS: usize = 32 * 1024 / size_of::<f32>();
+const STATE_PAGE_BYTES: usize = 32 * 1024;
 const STATE_IO_REQUEST_COUNTS: [u32; 3] = [1, 4, 16];
 const QKV_DIM: usize = 4096;
 const V_HEADS: usize = 16;
@@ -63,7 +63,7 @@ impl StateIOFixture {
         let conv_page_count = num_state_io_requests as usize * conv_pages_per_state;
         let total_pages = recurrent_page_count + conv_page_count;
         let stream = Stream::new(device);
-        let pages = f32_pattern_buffer(device, total_pages * STATE_PAGE_FLOATS, 0.0001);
+        let pages = Buffer::new_zeroed(device, total_pages * STATE_PAGE_BYTES);
         let recurrent_state_arena = Buffer::new_zeroed(device, num_state_io_requests as usize * recurrent_state_bytes);
         let conv_state_arena = Buffer::new_zeroed(device, num_state_io_requests as usize * conv_state_bytes);
         let page_ids = Buffer::from_slice(
@@ -179,19 +179,10 @@ fn state_io_config(num_state_slots: u32) -> state_pages::Config {
     state_pages::Config {
         num_gdn_layers: 1,
         num_state_slots,
-        recurrent_state_bytes: (V_HEADS * V_HEAD_DIM * QK_HEAD_DIM * size_of::<f32>()) as u32,
-        conv_state_bytes: (QKV_DIM * CONV_STATE_LEN * size_of::<f32>()) as u32,
-        page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
+        recurrent_state_bytes: (V_HEADS * V_HEAD_DIM * QK_HEAD_DIM * size_of::<u16>()) as u32,
+        conv_state_bytes: (QKV_DIM * CONV_STATE_LEN * size_of::<u16>()) as u32,
+        page_bytes: STATE_PAGE_BYTES as u32,
     }
-}
-
-fn f32_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {
-    Buffer::from_slice(
-        device,
-        &(0..len)
-            .map(|index| ((index % 257) as f32 - 128.0) * scale)
-            .collect::<Vec<_>>(),
-    )
 }
 
 criterion_group!(benches, bench_gdn_state_io);

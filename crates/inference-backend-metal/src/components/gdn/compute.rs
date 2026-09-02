@@ -464,15 +464,15 @@ impl Registry {
             constants,
             q_scale: config.q_scale,
             norm_eps: config.norm_eps,
-            short_conv: CompiledKernel::new(device, &source, "gdn_compute_short_conv_f32"),
-            candidate_conv_state: CompiledKernel::new(device, &source, "gdn_compute_candidate_conv_state_f32"),
-            final_recurrent_state: CompiledKernel::new(device, &source, "gdn_compute_final_recurrent_state_f32"),
+            short_conv: CompiledKernel::new(device, &source, "gdn_compute_short_conv_bf16"),
+            candidate_conv_state: CompiledKernel::new(device, &source, "gdn_compute_candidate_conv_state_bf16"),
+            final_recurrent_state: CompiledKernel::new(device, &source, "gdn_compute_final_recurrent_state_bf16"),
             candidate_recurrent_state: CompiledKernel::new(
                 device,
                 &source,
-                "gdn_compute_candidate_recurrent_state_f32",
+                "gdn_compute_candidate_recurrent_state_bf16",
             ),
-            output_norm_gate: CompiledKernel::new(device, &source, "gdn_compute_output_norm_gate_f32"),
+            output_norm_gate: CompiledKernel::new(device, &source, "gdn_compute_output_norm_gate_bf16"),
         };
         Self {
             entries: vec![(VariantKey::Recurrent, recurrent)],
@@ -874,32 +874,32 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 
 fn validate_buffers(constants: VariantConstants, shape: Shape, buffers: &Buffers<'_>) {
     let model = constants.model;
-    let f32_bytes = size_of::<f32>() as u64;
+    let bf16_bytes = size_of::<u16>() as u64;
     for (name, offset_bytes) in [
         ("conv_state", buffers.conv_state_offset_bytes),
         ("next_conv_state", buffers.next_conv_state_offset_bytes),
         ("recurrent_state", buffers.recurrent_state_arena_offset_bytes),
     ] {
         assert_eq!(
-            offset_bytes % f32_bytes,
+            offset_bytes % bf16_bytes,
             0,
-            "GDN {name} byte offset must be f32-aligned"
+            "GDN {name} byte offset must be BF16-aligned"
         );
     }
     assert!(
-        buffers.qkv.len_bytes() >= model.num_qkv_values(shape) * size_of::<f32>(),
+        buffers.qkv.len_bytes() >= model.num_qkv_values(shape) * size_of::<u16>(),
         "GDN qkv buffer is too small"
     );
     assert!(
-        buffers.a.len_bytes() >= shape.num_total_tokens as usize * model.num_v_heads as usize * size_of::<f32>(),
+        buffers.a.len_bytes() >= shape.num_total_tokens as usize * model.num_v_heads as usize * size_of::<u16>(),
         "GDN a buffer is too small"
     );
     assert!(
-        buffers.b.len_bytes() >= shape.num_total_tokens as usize * model.num_v_heads as usize * size_of::<f32>(),
+        buffers.b.len_bytes() >= shape.num_total_tokens as usize * model.num_v_heads as usize * size_of::<u16>(),
         "GDN b buffer is too small"
     );
     assert!(
-        buffers.z.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<f32>(),
+        buffers.z.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<u16>(),
         "GDN z buffer is too small"
     );
     assert_eq!(
@@ -940,10 +940,10 @@ fn validate_buffers(constants: VariantConstants, shape: Shape, buffers: &Buffers
         "GDN flat_materialized_conv_state_slots buffer is too small"
     );
     let conv_state_region_bytes = (model.num_conv_state_values(shape) as u64)
-        .checked_mul(f32_bytes)
+        .checked_mul(bf16_bytes)
         .expect("GDN convolution state region bytes must fit u64");
     let recurrent_state_region_bytes = (model.recurrent_state_stride() as u64)
-        .checked_mul(f32_bytes)
+        .checked_mul(bf16_bytes)
         .expect("GDN recurrent state region bytes must fit u64");
     assert!(
         buffers.conv_state.len_bytes_u64()
@@ -969,15 +969,15 @@ fn validate_buffers(constants: VariantConstants, shape: Shape, buffers: &Buffers
                 .expect("GDN recurrent state region size overflow")
     );
     assert!(
-        buffers.conv_qkv.len_bytes() >= model.num_qkv_values(shape) * size_of::<f32>(),
+        buffers.conv_qkv.len_bytes() >= model.num_qkv_values(shape) * size_of::<u16>(),
         "GDN conv_qkv buffer is too small"
     );
     assert!(
-        buffers.recurrent_output.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<f32>(),
+        buffers.recurrent_output.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<u16>(),
         "GDN recurrent_output buffer is too small"
     );
     assert!(
-        buffers.norm_gated_output.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<f32>(),
+        buffers.norm_gated_output.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<u16>(),
         "GDN norm_gated_output buffer is too small"
     );
 }

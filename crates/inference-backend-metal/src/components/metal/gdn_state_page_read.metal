@@ -15,7 +15,7 @@ using namespace metal;
 //
 // page_id, recurrent_state_slot, and conv_state_slot are data inputs, not Task
 // coordinates. state_kind selects the applicable physical slot.
-kernel void gdn_state_page_batch_read_f32(
+kernel void gdn_state_page_batch_read_bf16(
     device const uchar* pages [[buffer(0)]],
     device uchar* recurrent_states [[buffer(1)]],
     device uchar* conv_states [[buffer(2)]],
@@ -56,13 +56,13 @@ kernel void gdn_state_page_batch_read_f32(
     const ulong state_slot_offset_bytes =
         ((ulong)gdn_layer_index * (ulong)num_state_slots + state_slot) * (ulong)state_bytes;
 
-    for (uint byte_offset_in_page = thread_index_in_threadblock * sizeof(float4);
+    for (uint byte_offset_in_page = thread_index_in_threadblock * sizeof(uint4);
          byte_offset_in_page < page_bytes;
-         byte_offset_in_page += num_threads * sizeof(float4)) {
+         byte_offset_in_page += num_threads * sizeof(uint4)) {
         const ulong state_byte_offset =
             (ulong)page_index_in_state * (ulong)page_bytes + (ulong)byte_offset_in_page;
         if (state_byte_offset >= (ulong)state_bytes) break;
-        *reinterpret_cast<device float4*>(states + state_slot_offset_bytes + state_byte_offset) =
-            *reinterpret_cast<device const float4*>(pages + page_offset_bytes + byte_offset_in_page);
+        *reinterpret_cast<device uint4*>(states + state_slot_offset_bytes + state_byte_offset) =
+            *reinterpret_cast<device const uint4*>(pages + page_offset_bytes + byte_offset_in_page);
     }
 }

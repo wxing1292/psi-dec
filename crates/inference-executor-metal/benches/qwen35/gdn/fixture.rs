@@ -206,7 +206,7 @@ impl<'a> RealGDNFixture<'a> {
         );
         let next_conv_state = Buffer::new_zeroed(
             device,
-            num_state_slots as usize * GDN_CONV_DIM * (GDN_CONV_KERNEL_SIZE - 1) * size_of::<f32>(),
+            num_state_slots as usize * GDN_CONV_DIM * (GDN_CONV_KERNEL_SIZE - 1) * size_of::<u16>(),
         );
         let recurrent_state_arena = Buffer::from_slice(
             device,
@@ -216,14 +216,14 @@ impl<'a> RealGDNFixture<'a> {
                 num_state_slots as usize * GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM,
             ),
         );
-        let qkvabz = Buffer::new_zeroed(device, num_tokens as usize * GDN_QKVABZ_DIM * size_of::<f32>());
-        let qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<f32>());
-        let a = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_HEADS * size_of::<f32>());
-        let b = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_HEADS * size_of::<f32>());
-        let z = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
-        let conv_qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<f32>());
-        let recurrent_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
-        let norm_gated_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
+        let qkvabz = Buffer::new_zeroed(device, num_tokens as usize * GDN_QKVABZ_DIM * size_of::<u16>());
+        let qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<u16>());
+        let a = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_HEADS * size_of::<u16>());
+        let b = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_HEADS * size_of::<u16>());
+        let z = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<u16>());
+        let conv_qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<u16>());
+        let recurrent_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<u16>());
+        let norm_gated_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<u16>());
         let mut recorder = MetalReplayRuntime::new(&stream).create_recorder();
         let _ = <GDN as ReplayLayer>::record(
             &backend,

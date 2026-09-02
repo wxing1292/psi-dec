@@ -1,6 +1,7 @@
 use std::mem::size_of;
 use std::path::PathBuf;
 
+use half::bf16;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
@@ -30,8 +31,8 @@ const SNAPSHOT_FILES: GDNStateSnapshotFiles = GDNStateSnapshotFiles::new(
 #[derive(Debug, PartialEq)]
 struct GDNStateReference {
     request_state: GDNRequestSlots,
-    recurrent_state: Vec<f32>,
-    conv_state: Vec<f32>,
+    recurrent_state: Vec<u16>,
+    conv_state: Vec<u16>,
 }
 
 #[test]
@@ -130,7 +131,7 @@ fn test_selected_state_unload_load() {
         state.layout.num_gdn_layers,
         state.layout.num_state_slots,
         selected_recurrent_state_slot,
-        state.recurrent_state_bytes() / size_of::<f32>(),
+        state.recurrent_state_bytes() / size_of::<u16>(),
     );
     assert_selected_state_values(
         &restored.conv_state,
@@ -138,7 +139,7 @@ fn test_selected_state_unload_load() {
         state.layout.num_gdn_layers,
         state.layout.num_state_slots,
         selected_conv_state_slot,
-        state.conv_state_bytes() / size_of::<f32>(),
+        state.conv_state_bytes() / size_of::<u16>(),
     );
     std::fs::remove_dir_all(snapshot_path).unwrap();
 }
@@ -166,11 +167,11 @@ fn test_layout() {
     assert_eq!(state.layer_bindings(0).conv_layer_offset_bytes, 0);
     assert_eq!(
         state.layer_bindings(1).recurrent_layer_offset_bytes,
-        8 * 4 * size_of::<f32>() as u64
+        8 * 16 * size_of::<u16>() as u64
     );
     assert_eq!(
         state.layer_bindings(1).conv_layer_offset_bytes,
-        8 * 12 * size_of::<f32>() as u64
+        8 * 24 * size_of::<u16>() as u64
     );
     assert_eq!(
         state.layer_bindings(0).recurrent_states.as_raw_ptr(),
@@ -210,9 +211,10 @@ fn test_transaction_lifecycle_handles_mixed_commit_modes_and_deferred_publish() 
         LIFECYCLE_PAGE_BYTES,
     );
     let batch_metadata = GDNMetadataBuffers::new(&device, 3, 12);
-    let pages_at_version_2 = (10..18).collect::<Vec<_>>();
-    let pages_at_version_4 = (20..28).collect::<Vec<_>>();
-    let pages_at_version_6 = (30..38).collect::<Vec<_>>();
+    let pages_per_state = u32::try_from(state.num_pages_per_state_slot()).unwrap();
+    let pages_at_version_2 = (10..10 + pages_per_state).collect::<Vec<_>>();
+    let pages_at_version_4 = (20..20 + pages_per_state).collect::<Vec<_>>();
+    let pages_at_version_6 = (30..30 + pages_per_state).collect::<Vec<_>>();
     prepare_state(
         &state,
         &batch_metadata,
@@ -377,7 +379,7 @@ fn test_restore_and_reset_preserve_neighbor_request_state() {
         LIFECYCLE_PAGE_BYTES,
     );
     let batch_metadata = GDNMetadataBuffers::new(&device, 1, 1);
-    let snapshot_page_ids = vec![10, 11, 12, 13, 14, 15, 16, 17];
+    let snapshot_page_ids = (10..10 + u32::try_from(state.num_pages_per_state_slot()).unwrap()).collect::<Vec<_>>();
     advance_to_distinct_state_slots_for_req(&state, 0, 0);
     advance_to_distinct_state_slots_for_req(&state, 1, 0);
     let (
@@ -564,7 +566,7 @@ fn advance_to_distinct_state_slots_for_req(state: &GDNRequestStateTable, req_slo
     );
 }
 
-fn write_state_values(state: &GDNRequestStateTable, recurrent_state: &[f32], conv_state: &[f32]) {
+fn write_state_values(state: &GDNRequestStateTable, recurrent_state: &[u16], conv_state: &[u16]) {
     let resources = state.resources();
     assert_eq!(
         std::mem::size_of_val(recurrent_state),
@@ -588,26 +590,26 @@ fn capture_state(state: &GDNRequestStateTable) -> GDNStateReference {
 fn state_value_counts(state: &GDNRequestStateTable) -> (usize, usize) {
     let resources = state.resources();
     (
-        resources.recurrent_states.len_bytes() / size_of::<f32>(),
-        resources.conv_states.len_bytes() / size_of::<f32>(),
+        resources.recurrent_states.len_bytes() / size_of::<u16>(),
+        resources.conv_states.len_bytes() / size_of::<u16>(),
     )
 }
 
-fn fixed_values(len: usize, offset: f32) -> Vec<f32> {
+fn fixed_values(len: usize, offset: f32) -> Vec<u16> {
     (0..len)
-        .map(|index| ((index % 17) as f32 - 8.0) * 0.25 + offset)
+        .map(|index| bf16::from_f32(((index % 17) as f32 - 8.0) * 0.25 + offset).to_bits())
         .collect()
 }
 
 fn assert_selected_state_values(
-    restored: &[f32],
-    source: &[f32],
+    restored: &[u16],
+    source: &[u16],
     num_layers: usize,
     num_state_slots: usize,
     selected_state_slot: usize,
     values_per_state: usize,
 ) {
-    let mut expected = vec![0.0; source.len()];
+    let mut expected = vec![0_u16; source.len()];
     for layer_index in 0..num_layers {
         let start = (layer_index * num_state_slots + selected_state_slot) * values_per_state;
         let end = start + values_per_state;
@@ -618,21 +620,21 @@ fn assert_selected_state_values(
 
 fn assert_reset_state_values(
     state: &GDNRequestStateTable,
-    recurrent_before_reset: &[f32],
-    conv_before_reset: &[f32],
+    recurrent_before_reset: &[u16],
+    conv_before_reset: &[u16],
     reset_recurrent_state_slot: usize,
     reset_conv_state_slot: usize,
 ) {
     let mut expected_recurrent = recurrent_before_reset.to_vec();
     let mut expected_conv = conv_before_reset.to_vec();
-    let recurrent_values_per_state = state.recurrent_state_bytes() / size_of::<f32>();
-    let conv_values_per_state = state.conv_state_bytes() / size_of::<f32>();
+    let recurrent_values_per_state = state.recurrent_state_bytes() / size_of::<u16>();
+    let conv_values_per_state = state.conv_state_bytes() / size_of::<u16>();
     for layer_index in 0..state.layout.num_gdn_layers {
         let recurrent_start =
             (layer_index * state.layout.num_state_slots + reset_recurrent_state_slot) * recurrent_values_per_state;
-        expected_recurrent[recurrent_start..recurrent_start + recurrent_values_per_state].fill(0.0);
+        expected_recurrent[recurrent_start..recurrent_start + recurrent_values_per_state].fill(0);
         let conv_start = (layer_index * state.layout.num_state_slots + reset_conv_state_slot) * conv_values_per_state;
-        expected_conv[conv_start..conv_start + conv_values_per_state].fill(0.0);
+        expected_conv[conv_start..conv_start + conv_values_per_state].fill(0);
     }
     let restored = capture_state(state);
     assert_eq!(restored.recurrent_state, expected_recurrent);
@@ -661,11 +663,11 @@ impl TestRandom {
         self.0 as u32
     }
 
-    fn values(&mut self, len: usize) -> Vec<f32> {
+    fn values(&mut self, len: usize) -> Vec<u16> {
         (0..len)
             .map(|_| {
                 let value = (self.next_u32() % 20_001) as i32 - 10_000;
-                value as f32 / 128.0
+                bf16::from_f32(value as f32 / 128.0).to_bits()
             })
             .collect()
     }
@@ -706,9 +708,9 @@ fn core(model_layer_index: usize) -> GDNCore {
         model_layer_index,
         hidden_dim: 4,
         num_qk_heads: 1,
-        qk_head_dim: 2,
+        qk_head_dim: 4,
         num_v_heads: 1,
-        v_head_dim: 2,
+        v_head_dim: 4,
         conv_kernel_size: 3,
         q_scale: 1.0,
     }

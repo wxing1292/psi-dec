@@ -195,7 +195,7 @@ fn cu_tokens(num_tokens_per_req: &[u32]) -> Vec<i32> {
     cu
 }
 
-fn gdn_conv_state_fixture(existing_context_len: u32, num_reqs: usize, len: usize) -> Vec<f32> {
+fn gdn_conv_state_fixture(existing_context_len: u32, num_reqs: usize, len: usize) -> Vec<u16> {
     gdn_state_fixture(
         existing_context_len,
         len,
@@ -205,7 +205,7 @@ fn gdn_conv_state_fixture(existing_context_len: u32, num_reqs: usize, len: usize
     )
 }
 
-fn gdn_recurrent_state_fixture(existing_context_len: u32, num_reqs: usize, len: usize) -> Vec<f32> {
+fn gdn_recurrent_state_fixture(existing_context_len: u32, num_reqs: usize, len: usize) -> Vec<u16> {
     gdn_state_fixture(
         existing_context_len,
         len,
@@ -215,8 +215,8 @@ fn gdn_recurrent_state_fixture(existing_context_len: u32, num_reqs: usize, len: 
     )
 }
 
-fn gdn_state_fixture(existing_context_len: u32, len: usize, num_reqs: usize, slot_len: usize, scale: f32) -> Vec<f32> {
-    let mut values = vec![0.0; len];
+fn gdn_state_fixture(existing_context_len: u32, len: usize, num_reqs: usize, slot_len: usize, scale: f32) -> Vec<u16> {
+    let mut values = vec![0; len];
     if existing_context_len == 0 {
         return values;
     }
@@ -226,7 +226,7 @@ fn gdn_state_fixture(existing_context_len: u32, len: usize, num_reqs: usize, slo
         "GDN state fixture source state slot cannot exceed state arena"
     );
     for (index, value) in values.iter_mut().take(src_state_len).enumerate() {
-        *value = ((index % 29) as f32 - 14.0) * scale;
+        *value = bf16::from_f32(((index % 29) as f32 - 14.0) * scale).to_bits();
     }
     values
 }
@@ -403,7 +403,7 @@ fn gdn_qkvabz_affine_config() -> affine_quantized::Config {
         group_size: GROUP_SIZE.try_into().expect("GDN group size must fit i32"),
         bits: BITS.try_into().expect("GDN bits must fit i32"),
         input_dtype: Dtype::Bfloat16,
-        output_dtype: Dtype::Float32,
+        output_dtype: Dtype::Bfloat16,
         scale_bias_dtype: Dtype::Bfloat16,
     }
 }
@@ -414,7 +414,7 @@ fn gdn_output_affine_config() -> affine_quantized::Config {
         k: GDN_V_DIM.try_into().expect("GDN output k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GDN group size must fit i32"),
         bits: BITS.try_into().expect("GDN bits must fit i32"),
-        input_dtype: Dtype::Float32,
+        input_dtype: Dtype::Bfloat16,
         output_dtype: Dtype::Bfloat16,
         scale_bias_dtype: Dtype::Bfloat16,
     }

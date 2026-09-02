@@ -274,8 +274,12 @@ component path as the design.
   Preserve relayout and conversion only at initialization.
   Do not leak Metal buffers into executor-core.
   Do not add per-request weight preparation.
-- Revisit native-FP8 GQA KV only with evidence against BF16.
-  The evidence must cover generated instructions, traffic, occupancy, component parity, and end-to-end decode.
+- Replace software E4M3FN GQA KV conversion with native Metal FP8 conversion only when both the target `MTLDevice` and
+  Metal compiler expose the required scalar or Metal Performance Primitives operation. Metal 4 tensor storage support
+  alone is not sufficient. The macOS 27 SDK can allocate `MTLTensorDataTypeMetalFloat8E4M3` on Apple9 M3 Max, but the
+  same device cannot compile `metal_fp8_e4m3_format` in an MSL 4 scalar kernel or tensor matmul. Re-probe each newer GPU
+  family. Before changing the implementation, compare generated instructions, traffic, occupancy, component parity,
+  and end-to-end decode with BF16 and the current packed software conversion.
 - Add an opt-in Metal timeline profiler.
   Use counter and timestamp samples for stable replay and component boundaries.
   Keep these measurements separate from ordinary throughput runs.

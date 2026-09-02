@@ -32,15 +32,32 @@ inline ushort2 frag_coord(ushort lane_id) {
     return ushort2{col, row};
 }
 
-inline bfloat16_t fp8_e4m3_to_bf16(uchar bits) {
-    const uint sign = uint(bits & uchar(0x80)) << 24;
-    const uint exponent = (uint(bits) >> 3) & 0x0fu;
-    const uint mantissa = uint(bits) & 0x07u;
-    const float normal = as_type<float>(sign | ((exponent + 120u) << 23) | (mantissa << 20));
-    const float subnormal_magnitude = float(mantissa) * (1.0f / 512.0f);
-    const float subnormal = sign == 0u ? subnormal_magnitude : -subnormal_magnitude;
-    const float finite = select(normal, subnormal, exponent == 0u);
-    return bfloat16_t(select(finite, as_type<float>(sign | 0x7fc00000u), exponent == 15u && mantissa == 7u));
+constant ushort FP8_E4M3_SUBNORMAL_BF16_BITS[8] = {
+    0x0000, 0x3b00, 0x3b80, 0x3bc0, 0x3c00, 0x3c20, 0x3c40, 0x3c60,
+};
+
+inline ushort fp8_e4m3_to_bf16_bits(uchar bits) {
+    const ushort sign = ushort(bits & uchar(0x80)) << 8;
+    const ushort exponent = (ushort(bits) >> 3) & ushort(0x0f);
+    const ushort mantissa = ushort(bits) & ushort(0x07);
+    const ushort normal = sign | ushort((exponent + 120) << 7) | ushort(mantissa << 4);
+    const ushort subnormal = sign | FP8_E4M3_SUBNORMAL_BF16_BITS[mantissa];
+    const ushort finite = select(normal, subnormal, exponent == 0);
+    return select(finite, ushort(sign | 0x7fc0), exponent == 15 && mantissa == 7);
+}
+
+inline uint fp8_e4m3x2_to_bf16x2(uint bits) {
+    return uint(fp8_e4m3_to_bf16_bits(uchar(bits)))
+        | (uint(fp8_e4m3_to_bf16_bits(uchar(bits >> 8))) << 16);
+}
+
+inline uint4 fp8_e4m3x8_to_bf16x8(uint2 bits) {
+    return uint4(
+        fp8_e4m3x2_to_bf16x2(bits.x),
+        fp8_e4m3x2_to_bf16x2(bits.x >> 16),
+        fp8_e4m3x2_to_bf16x2(bits.y),
+        fp8_e4m3x2_to_bf16x2(bits.y >> 16)
+    );
 }
 
 struct FragMax {
@@ -191,18 +208,26 @@ kernel void gqa_split_kv_tiled_q_map(
                     + (ulong)(((0 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS_PER_PAGE + page_token_index) * HEAD_DIM);
                 const device uchar* v = kv_pages + page_base
                     + (ulong)(((1 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS_PER_PAGE + page_token_index) * HEAD_DIM);
+                constexpr uint LOAD_VALUES = 8;
                 #pragma unroll
-                for (uint dim = lane; dim < uint(HEAD_DIM); dim += uint(NUM_SIMD_LANES)) {
-                    k_shared[kv_token_offset * LEADING_DIM + dim] =
-                        fp8_e4m3_to_bf16(k[dim]);
-                    v_shared[kv_token_offset * LEADING_DIM + dim] =
-                        fp8_e4m3_to_bf16(v[dim]);
+                for (uint dim = lane * LOAD_VALUES; dim < uint(HEAD_DIM);
+                     dim += uint(NUM_SIMD_LANES) * LOAD_VALUES) {
+                    const uint2 k_fp8 = *reinterpret_cast<device const uint2*>(k + dim);
+                    const uint2 v_fp8 = *reinterpret_cast<device const uint2*>(v + dim);
+                    *reinterpret_cast<threadgroup uint4*>(
+                        k_shared + kv_token_offset * LEADING_DIM + dim) = fp8_e4m3x8_to_bf16x8(k_fp8);
+                    *reinterpret_cast<threadgroup uint4*>(
+                        v_shared + kv_token_offset * LEADING_DIM + dim) = fp8_e4m3x8_to_bf16x8(v_fp8);
                 }
             } else {
+                constexpr uint LOAD_VALUES = 8;
                 #pragma unroll
-                for (uint dim = lane; dim < uint(HEAD_DIM); dim += uint(NUM_SIMD_LANES)) {
-                    k_shared[kv_token_offset * LEADING_DIM + dim] = bfloat16_t(0.0f);
-                    v_shared[kv_token_offset * LEADING_DIM + dim] = bfloat16_t(0.0f);
+                for (uint dim = lane * LOAD_VALUES; dim < uint(HEAD_DIM);
+                     dim += uint(NUM_SIMD_LANES) * LOAD_VALUES) {
+                    *reinterpret_cast<threadgroup uint4*>(
+                        k_shared + kv_token_offset * LEADING_DIM + dim) = uint4(0);
+                    *reinterpret_cast<threadgroup uint4*>(
+                        v_shared + kv_token_offset * LEADING_DIM + dim) = uint4(0);
                 }
             }
         }

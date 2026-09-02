@@ -94,18 +94,18 @@ impl GDNFixture {
 
         let stream = Stream::new(device);
         let kernels = backend_compute::Compute::new(device, config);
-        let qkv = f32_pattern_buffer(device, config.num_qkv_values(shape), 0.001);
-        let a = f32_pattern_buffer(
+        let qkv = bf16_pattern_buffer(device, config.num_qkv_values(shape), 0.001);
+        let a = bf16_pattern_buffer(
             device,
             shape.num_total_tokens as usize * config.num_v_heads as usize,
             0.002,
         );
-        let b = f32_pattern_buffer(
+        let b = bf16_pattern_buffer(
             device,
             shape.num_total_tokens as usize * config.num_v_heads as usize,
             -0.001,
         );
-        let z = f32_pattern_buffer(device, config.num_recurrent_output_values(shape), 0.0015);
+        let z = bf16_pattern_buffer(device, config.num_recurrent_output_values(shape), 0.0015);
         let conv_weight = bf16_pattern_buffer(
             device,
             config.qkv_dim() as usize * config.conv_kernel_size as usize,
@@ -118,20 +118,20 @@ impl GDNFixture {
         let src_state_slots = Buffer::from_slice(device, &src_state_slot_values);
         let flat_final_state_slots = Buffer::from_slice(device, &flat_final_state_slot_values);
         let candidate_dst_slot_ids = Buffer::from_slice(device, &candidate_dst_slot_id_values);
-        let conv_state = f32_pattern_buffer(device, config.num_conv_state_values(shape), 0.001);
+        let conv_state = bf16_pattern_buffer(device, config.num_conv_state_values(shape), 0.001);
         let next_conv_state = Buffer::new_zeroed(
             device,
-            state_slot_count as usize * config.qkv_dim() as usize * config.conv_state_len() as usize * size_of::<f32>(),
+            state_slot_count as usize * config.qkv_dim() as usize * config.conv_state_len() as usize * size_of::<u16>(),
         );
-        let recurrent_state_arena = f32_pattern_buffer(
+        let recurrent_state_arena = bf16_pattern_buffer(
             device,
             config.recurrent_state_stride() * state_slot_count as usize,
             0.0001,
         );
-        let conv_qkv = Buffer::new_zeroed(device, config.num_qkv_values(shape) * size_of::<f32>());
-        let recurrent_output = Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<f32>());
+        let conv_qkv = Buffer::new_zeroed(device, config.num_qkv_values(shape) * size_of::<u16>());
+        let recurrent_output = Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<u16>());
         let norm_gated_output =
-            Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<f32>());
+            Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<u16>());
         let buffers = backend_compute::Buffers {
             qkv: &qkv,
             a: &a,
@@ -221,16 +221,6 @@ fn build_gdn_forward_candidate_state_update_replay(
         ReplayU32::Fixed(shape.num_total_tokens),
     ));
     builder.build()
-}
-
-fn f32_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {
-    let values = (0..len)
-        .map(|index| {
-            let value = (index % FIXTURE_PATTERN_PERIOD) as f32 - FIXTURE_PATTERN_CENTER;
-            value * scale
-        })
-        .collect::<Vec<_>>();
-    Buffer::from_slice(device, &values)
 }
 
 fn bf16_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {

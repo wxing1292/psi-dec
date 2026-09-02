@@ -32,11 +32,11 @@ impl KernelConstants {
 /// Projection-split tensor contract:
 ///
 /// ```text
-/// qkvabz: [T, Cqkv + 2 * Hv + Hv * Dv] (F32)
-/// qkv:    [T, Cqkv]                      (F32)
-/// a:      [T, Hv]                        (F32)
-/// b:      [T, Hv]                        (F32)
-/// z:      [T, Hv, Dv]                    (F32)
+/// qkvabz: [T, Cqkv + 2 * Hv + Hv * Dv] (BF16)
+/// qkv:    [T, Cqkv]                      (BF16)
+/// a:      [T, Hv]                        (BF16)
+/// b:      [T, Hv]                        (BF16)
+/// z:      [T, Hv, Dv]                    (BF16)
 /// ```
 ///
 /// `T` is the flattened token axis; `Hv` and `Dv` are the value-head and
@@ -137,7 +137,7 @@ impl Compute {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: CompiledKernel::new(device, SOURCE, "gdn_qkvabz_split_f32"),
+            kernel: CompiledKernel::new(device, SOURCE, "gdn_qkvabz_split_bf16"),
         }
     }
 
@@ -203,23 +203,25 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 fn validate_qkvabz_split_buffers(config: Config, shape: Shape, buffers: &Buffers<'_>) {
     assert!(
         buffers.qkvabz.len_bytes()
-            >= checked_product("GDN qkvabz input", &[config.num_qkvabz_values(shape), size_of::<f32>()])
+            >= checked_product("GDN qkvabz input", &[config.num_qkvabz_values(shape), size_of::<u16>()])
     );
     assert!(
         buffers.qkv.len_bytes()
-            >= checked_product("GDN Q/K/V output", &[config.num_qkv_values(shape), size_of::<f32>()])
+            >= checked_product("GDN Q/K/V output", &[config.num_qkv_values(shape), size_of::<u16>()])
     );
     assert!(
-        buffers.a.len_bytes() >= checked_product("GDN a output", &[config.num_gate_values(shape), size_of::<f32>()])
+        buffers.a.len_bytes() >= checked_product("GDN a output", &[config.num_gate_values(shape), size_of::<u16>()])
     );
     assert!(
-        buffers.b.len_bytes() >= checked_product("GDN b output", &[config.num_gate_values(shape), size_of::<f32>()])
+        buffers.b.len_bytes() >= checked_product("GDN b output", &[config.num_gate_values(shape), size_of::<u16>()])
     );
-    assert!(buffers.z.len_bytes() >= checked_product("GDN z output", &[config.num_z_values(shape), size_of::<f32>()]));
+    assert!(buffers.z.len_bytes() >= checked_product("GDN z output", &[config.num_z_values(shape), size_of::<u16>()]));
 }
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
+
     use super::*;
     use crate::metal::Dtype;
     use crate::metal::ReplayArguments;
@@ -244,11 +246,11 @@ mod tests {
         let qkvabz_values = (0..NUM_TOTAL_TOKENS as usize * row_stride)
             .map(|index| index as f32 * 0.125 - 3.0)
             .collect::<Vec<_>>();
-        let qkvabz = Buffer::from_slice(&device, &qkvabz_values);
-        let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
-        let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
-        let b = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
-        let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Float32);
+        let qkvabz = bf16_buffer(&device, &qkvabz_values);
+        let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Bfloat16);
+        let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Bfloat16);
+        let b = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Bfloat16);
+        let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Bfloat16);
         let compute = Compute::new(&device, config);
         let mut cache = ReplayTestCache::new();
         let (_, cache_hit) = cache.record(shape.num_total_tokens, || {
@@ -288,11 +290,29 @@ mod tests {
             let expected_a = flatten_columns(&active_rows, a_begin, b_begin);
             let expected_b = flatten_columns(&active_rows, b_begin, z_begin);
             let expected_z = flatten_columns(&active_rows, z_begin, row_stride);
-            assert_eq!(qkv.read_typed::<f32>(0, expected_qkv.len()), expected_qkv);
-            assert_eq!(a.read_typed::<f32>(0, expected_a.len()), expected_a);
-            assert_eq!(b.read_typed::<f32>(0, expected_b.len()), expected_b);
-            assert_eq!(z.read_typed::<f32>(0, expected_z.len()), expected_z);
+            assert_eq!(read_bf16(&qkv, expected_qkv.len()), expected_qkv);
+            assert_eq!(read_bf16(&a, expected_a.len()), expected_a);
+            assert_eq!(read_bf16(&b, expected_b.len()), expected_b);
+            assert_eq!(read_bf16(&z, expected_z.len()), expected_z);
         }
+    }
+
+    fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
+        Buffer::from_slice(
+            device,
+            &values
+                .iter()
+                .map(|&value| bf16::from_f32(value).to_bits())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn read_bf16(buffer: &Buffer, count: usize) -> Vec<f32> {
+        buffer
+            .read_typed::<u16>(0, count)
+            .into_iter()
+            .map(|bits| bf16::from_bits(bits).to_f32())
+            .collect()
     }
 
     fn flatten_columns(rows: &[&[f32]], start: usize, end: usize) -> Vec<f32> {

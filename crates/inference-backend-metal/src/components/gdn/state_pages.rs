@@ -53,11 +53,11 @@ impl Config {
         assert!(self.num_gdn_layers > 0);
         assert!(self.num_state_slots > 0);
         assert!(self.recurrent_state_bytes > 0);
-        assert_eq!(self.recurrent_state_bytes % (4 * size_of::<f32>() as u32), 0);
+        assert_eq!(self.recurrent_state_bytes % 16, 0);
         assert!(self.conv_state_bytes > 0);
-        assert_eq!(self.conv_state_bytes % (4 * size_of::<f32>() as u32), 0);
+        assert_eq!(self.conv_state_bytes % 16, 0);
         assert!(self.page_bytes > 0);
-        assert_eq!(self.page_bytes % (4 * size_of::<f32>() as u32), 0);
+        assert_eq!(self.page_bytes % 16, 0);
     }
 
     pub fn validate_shape(self, shape: Shape) {
@@ -136,7 +136,7 @@ impl Write {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: CompiledKernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_f32"),
+            kernel: CompiledKernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_bf16"),
         }
     }
 
@@ -222,7 +222,7 @@ impl Read {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: CompiledKernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_f32"),
+            kernel: CompiledKernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_bf16"),
         }
     }
 
@@ -344,8 +344,8 @@ mod tests {
         let config = Config {
             num_gdn_layers: 2,
             num_state_slots: 3,
-            recurrent_state_bytes: 8 * size_of::<f32>() as u32,
-            conv_state_bytes: 4 * size_of::<f32>() as u32,
+            recurrent_state_bytes: 16 * size_of::<u16>() as u32,
+            conv_state_bytes: 8 * size_of::<u16>() as u32,
             page_bytes: 32,
         };
         let page_read = Read::new(&device, config);
@@ -353,15 +353,15 @@ mod tests {
         let shape = Shape {
             num_total_state_io_requests: 2,
         };
-        let recurrent_values = (0..48).map(|value| value as f32 + 10.0).collect::<Vec<_>>();
-        let conv_values = (0..24).map(|value| value as f32 + 100.0).collect::<Vec<_>>();
+        let recurrent_values = (0..96).map(|value| value as u16 + 10).collect::<Vec<_>>();
+        let conv_values = (0..48).map(|value| value as u16 + 100).collect::<Vec<_>>();
         let recurrent_source = Buffer::from_slice(&device, &recurrent_values);
         let conv_source = Buffer::from_slice(&device, &conv_values);
-        let state_canary = -777.0_f32;
-        let page_canary = -999.0_f32;
+        let state_canary = 0x7bcd_u16;
+        let page_canary = 0x7def_u16;
         let recurrent_target = Buffer::from_slice(&device, &vec![state_canary; recurrent_values.len()]);
         let conv_target = Buffer::from_slice(&device, &vec![state_canary; conv_values.len()]);
-        let pages = Buffer::from_slice(&device, &[page_canary; 9 * 8]);
+        let pages = Buffer::from_slice(&device, &[page_canary; 9 * 16]);
         let page_ids = Buffer::from_slice(&device, &[1_u32, 3, 5, 7, 2, 4, 6, 8]);
         let recurrent_state_slots = Buffer::from_slice(&device, &[2_u32, 0]);
         let conv_state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
@@ -382,18 +382,18 @@ mod tests {
         stream.submit_replay(&write.build()).wait();
 
         let expected_pages = [
-            vec![page_canary; 8],
-            recurrent_values[16..24].to_vec(),
-            recurrent_values[0..8].to_vec(),
-            [conv_values[4..8].to_vec(), vec![0.0; 4]].concat(),
-            [conv_values[0..4].to_vec(), vec![0.0; 4]].concat(),
-            recurrent_values[40..48].to_vec(),
-            recurrent_values[24..32].to_vec(),
-            [conv_values[16..20].to_vec(), vec![0.0; 4]].concat(),
-            [conv_values[12..16].to_vec(), vec![0.0; 4]].concat(),
+            vec![page_canary; 16],
+            recurrent_values[32..48].to_vec(),
+            recurrent_values[0..16].to_vec(),
+            [conv_values[8..16].to_vec(), vec![0; 8]].concat(),
+            [conv_values[0..8].to_vec(), vec![0; 8]].concat(),
+            recurrent_values[80..96].to_vec(),
+            recurrent_values[48..64].to_vec(),
+            [conv_values[32..40].to_vec(), vec![0; 8]].concat(),
+            [conv_values[24..32].to_vec(), vec![0; 8]].concat(),
         ]
         .concat();
-        assert_eq!(pages.read_typed::<f32>(0, expected_pages.len()), expected_pages);
+        assert_eq!(pages.read_typed::<u16>(0, expected_pages.len()), expected_pages);
 
         let mut read = stream.create_replay_program();
         read.record(page_read.invoke(
@@ -412,22 +412,22 @@ mod tests {
 
         for layer in 0..2 {
             for state_slot in 0..3 {
-                let recurrent_start = (layer * 3 + state_slot) * 8;
+                let recurrent_start = (layer * 3 + state_slot) * 16;
                 let expected = if matches!(state_slot, 0 | 2) {
-                    &recurrent_values[recurrent_start..recurrent_start + 8]
+                    &recurrent_values[recurrent_start..recurrent_start + 16]
+                } else {
+                    &[state_canary; 16]
+                };
+                assert_eq!(recurrent_target.read_typed::<u16>(recurrent_start, 16), expected);
+            }
+            for state_slot in 0..3 {
+                let conv_start = (layer * 3 + state_slot) * 8;
+                let expected = if matches!(state_slot, 0 | 1) {
+                    &conv_values[conv_start..conv_start + 8]
                 } else {
                     &[state_canary; 8]
                 };
-                assert_eq!(recurrent_target.read_typed::<f32>(recurrent_start, 8), expected);
-            }
-            for state_slot in 0..3 {
-                let conv_start = (layer * 3 + state_slot) * 4;
-                let expected = if matches!(state_slot, 0 | 1) {
-                    &conv_values[conv_start..conv_start + 4]
-                } else {
-                    &[state_canary; 4]
-                };
-                assert_eq!(conv_target.read_typed::<f32>(conv_start, 4), expected);
+                assert_eq!(conv_target.read_typed::<u16>(conv_start, 8), expected);
             }
         }
     }
@@ -435,8 +435,8 @@ mod tests {
     #[test]
     fn test_write_replay_matches_page_reference_across_active_counts() {
         const NUM_TOTAL_REQUESTS: u32 = 8;
-        const VALUES_PER_PAGE: usize = 4;
-        const PAGE_CANARY: f32 = -911.0;
+        const VALUES_PER_PAGE: usize = 8;
+        const PAGE_CANARY: u16 = 0x7def;
         const ACTIVE_COUNTS: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
 
         let device = Device::system_default();
@@ -444,16 +444,16 @@ mod tests {
         let config = Config {
             num_gdn_layers: 1,
             num_state_slots: NUM_TOTAL_REQUESTS,
-            recurrent_state_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
-            conv_state_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
-            page_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
+            recurrent_state_bytes: (VALUES_PER_PAGE * size_of::<u16>()) as u32,
+            conv_state_bytes: (VALUES_PER_PAGE * size_of::<u16>()) as u32,
+            page_bytes: (VALUES_PER_PAGE * size_of::<u16>()) as u32,
         };
         let shape = Shape {
             num_total_state_io_requests: NUM_TOTAL_REQUESTS,
         };
         let state_values = NUM_TOTAL_REQUESTS as usize * VALUES_PER_PAGE;
-        let recurrent_values = (0..state_values).map(|index| index as f32 + 1.0).collect::<Vec<_>>();
-        let conv_values = (0..state_values).map(|index| index as f32 + 101.0).collect::<Vec<_>>();
+        let recurrent_values = (0..state_values).map(|index| index as u16 + 1).collect::<Vec<_>>();
+        let conv_values = (0..state_values).map(|index| index as u16 + 101).collect::<Vec<_>>();
         let recurrent_states = Buffer::from_slice(&device, &recurrent_values);
         let conv_states = Buffer::from_slice(&device, &conv_values);
         let page_ids = Buffer::from_slice(&device, &(0..NUM_TOTAL_REQUESTS * 2).collect::<Vec<_>>());
@@ -496,15 +496,15 @@ mod tests {
                 expected[page_begin + VALUES_PER_PAGE..page_begin + 2 * VALUES_PER_PAGE]
                     .copy_from_slice(&conv_values[state_begin..state_begin + VALUES_PER_PAGE]);
             }
-            assert_eq!(pages.read_typed::<f32>(0, page_values), expected);
+            assert_eq!(pages.read_typed::<u16>(0, page_values), expected);
         }
     }
 
     #[test]
     fn test_read_replay_matches_state_reference_across_active_counts() {
         const NUM_TOTAL_REQUESTS: u32 = 8;
-        const VALUES_PER_PAGE: usize = 4;
-        const CANARY: f32 = -777.0;
+        const VALUES_PER_PAGE: usize = 8;
+        const CANARY: u16 = 0x7bcd;
         const ACTIVE_COUNTS: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
 
         let device = Device::system_default();
@@ -512,15 +512,15 @@ mod tests {
         let config = Config {
             num_gdn_layers: 1,
             num_state_slots: NUM_TOTAL_REQUESTS,
-            recurrent_state_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
-            conv_state_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
-            page_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
+            recurrent_state_bytes: (VALUES_PER_PAGE * size_of::<u16>()) as u32,
+            conv_state_bytes: (VALUES_PER_PAGE * size_of::<u16>()) as u32,
+            page_bytes: (VALUES_PER_PAGE * size_of::<u16>()) as u32,
         };
         let shape = Shape {
             num_total_state_io_requests: NUM_TOTAL_REQUESTS,
         };
         let page_values = (0..NUM_TOTAL_REQUESTS as usize * 2 * VALUES_PER_PAGE)
-            .map(|index| index as f32 + 1.0)
+            .map(|index| index as u16 + 1)
             .collect::<Vec<_>>();
         let pages = Buffer::from_slice(&device, &page_values);
         let page_ids = Buffer::from_slice(&device, &(0..NUM_TOTAL_REQUESTS * 2).collect::<Vec<_>>());
@@ -567,8 +567,8 @@ mod tests {
                 expected_conv[state_begin..state_begin + VALUES_PER_PAGE]
                     .copy_from_slice(&page_values[conv_page_begin..conv_page_begin + VALUES_PER_PAGE]);
             }
-            assert_eq!(recurrent_states.read_typed::<f32>(0, state_values), expected_recurrent);
-            assert_eq!(conv_states.read_typed::<f32>(0, state_values), expected_conv);
+            assert_eq!(recurrent_states.read_typed::<u16>(0, state_values), expected_recurrent);
+            assert_eq!(conv_states.read_typed::<u16>(0, state_values), expected_conv);
         }
     }
 }

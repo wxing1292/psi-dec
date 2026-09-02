@@ -169,8 +169,8 @@ impl GDNRequestStateTable {
         );
         assert!(page_bytes.is_power_of_two(), "GDN page size must be a power of two");
         assert!(
-            page_bytes.is_multiple_of(size_of::<f32>() * 4),
-            "GDN page size must contain an integral number of float4 values"
+            page_bytes.is_multiple_of(16),
+            "GDN page size must contain an integral number of 16-byte vectors"
         );
         let request_table = GDNRequestSlots::new(num_req_slots, capacity.num_state_slots_per_req);
         let num_state_slots = num_req_slots
@@ -185,17 +185,25 @@ impl GDNRequestStateTable {
             first_core.num_v_heads,
             first_core.v_head_dim,
             first_core.qk_head_dim,
-            size_of::<f32>(),
+            size_of::<u16>(),
         ]
         .into_iter()
         .try_fold(1usize, |product, factor| product.checked_mul(factor))
         .expect("GDN recurrent state slot size must fit usize");
-        let conv_state_bytes = [first_core.qkv_dim(), first_core.conv_state_len(), size_of::<f32>()]
+        let conv_state_bytes = [first_core.qkv_dim(), first_core.conv_state_len(), size_of::<u16>()]
             .into_iter()
             .try_fold(1usize, |product, factor| product.checked_mul(factor))
             .expect("GDN convolution state slot size must fit usize");
         u32::try_from(recurrent_state_bytes).expect("GDN recurrent state slot bytes must fit shader u32");
         u32::try_from(conv_state_bytes).expect("GDN convolution state slot bytes must fit shader u32");
+        assert!(
+            recurrent_state_bytes.is_multiple_of(16),
+            "GDN recurrent state slot must contain an integral number of 16-byte vectors"
+        );
+        assert!(
+            conv_state_bytes.is_multiple_of(16),
+            "GDN convolution state slot must contain an integral number of 16-byte vectors"
+        );
         assert!(
             cores.iter().all(|core| {
                 core.num_v_heads == first_core.num_v_heads
@@ -602,8 +610,8 @@ impl GDNRequestStateResources {
             .expect("GDN convolution layer byte length must fit u64");
         // Kernels bind the aggregate arenas at offset zero and add these layer
         // bases with Metal `ulong`. Their layer-local element indices remain u32.
-        assert_u32_element_index_domain(recurrent_layer_bytes, size_of::<f32>(), "GDN recurrent layer state");
-        assert_u32_element_index_domain(conv_layer_bytes, size_of::<f32>(), "GDN convolution layer state");
+        assert_u32_element_index_domain(recurrent_layer_bytes, size_of::<u16>(), "GDN recurrent layer state");
+        assert_u32_element_index_domain(conv_layer_bytes, size_of::<u16>(), "GDN convolution layer state");
         let recurrent_states_bytes = (layout.num_gdn_layers as u64)
             .checked_mul(recurrent_layer_bytes)
             .expect("GDN recurrent state arena byte length must fit u64");

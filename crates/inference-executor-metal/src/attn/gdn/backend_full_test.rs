@@ -65,8 +65,8 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
     let source_recurrent = generated_values(NUM_SOURCE_STATE_SLOTS * recurrent_stride, 0x792A_5F15, 0.0078125);
     let initial_conv_arena = state_arena(&source_conv, conv_stride);
     let initial_recurrent_arena = state_arena(&source_recurrent, recurrent_stride);
-    let conv_state_arena = Buffer::from_slice(&device, &initial_conv_arena);
-    let recurrent_state_arena = Buffer::from_slice(&device, &initial_recurrent_arena);
+    let conv_state_arena = bf16_buffer(&device, &initial_conv_arena);
+    let recurrent_state_arena = bf16_buffer(&device, &initial_recurrent_arena);
     let mut replay = Replay::new("test GDN", TestGDN(component));
     let mut recorded_keys = HashSet::new();
     let cases = [(1_u32, 1_u32), (8, 4), (3, 2), (7, 3), (2, 1), (6, 4), (4, 3), (5, 2)];
@@ -110,8 +110,8 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
         let seen = !recorded_keys.insert(key);
         assert_eq!(cache_hit, seen);
 
-        conv_state_arena.write_typed(0, &initial_conv_arena);
-        recurrent_state_arena.write_typed(0, &initial_recurrent_arena);
+        write_bf16_values(&conv_state_arena, &initial_conv_arena);
+        write_bf16_values(&recurrent_state_arena, &initial_recurrent_arena);
         next_hidden.zero_bytes(0, next_hidden.len_bytes());
         let mut arguments = ReplayArguments::new();
         add_gdn_replay_arguments(shape, &mut arguments);
@@ -132,8 +132,8 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
         );
         let actual_output = read_bf16_values(&next_hidden, reference.output.len());
         assert_close(&actual_output, &reference.output, 0.0625);
-        let actual_conv = conv_state_arena.read_typed::<f32>(0, initial_conv_arena.len());
-        let actual_recurrent = recurrent_state_arena.read_typed::<f32>(0, initial_recurrent_arena.len());
+        let actual_conv = read_bf16_values(&conv_state_arena, initial_conv_arena.len());
+        let actual_recurrent = read_bf16_values(&recurrent_state_arena, initial_recurrent_arena.len());
         assert_close(&actual_conv, &reference.conv_state_arena, 0.0025);
         assert_close(&actual_recurrent, &reference.recurrent_state_arena, 0.0025);
     }
@@ -255,13 +255,13 @@ fn gdn_reference(
 ) -> GDNReference {
     let num_requests = cu_tokens.len() - 1;
     let num_tokens = *cu_tokens.last().unwrap() as usize;
-    let qkvabz = quantized_affine_reference(
+    let qkvabz = bf16_round_trip(&quantized_affine_reference(
         affine_reference_shape(num_tokens, core.qkvabz_dim(), core.hidden_dim),
         &hidden[..num_tokens * core.hidden_dim],
         &weights.qkvabz_weight_values,
         &weights.qkvabz_scale_values,
         &weights.qkvabz_bias_values,
-    );
+    ));
     let mut qkv = Vec::with_capacity(num_tokens * core.qkv_dim());
     let mut a = Vec::with_capacity(num_tokens * core.num_v_heads);
     let mut b = Vec::with_capacity(num_tokens * core.num_v_heads);
@@ -277,48 +277,56 @@ fn gdn_reference(
     }
     let conv_stride = core.qkv_dim() * core.conv_state_len();
     let recurrent_stride = core.num_v_heads * core.v_head_dim * core.qk_head_dim;
+    let quantized_source_conv = bf16_round_trip(source_conv);
+    let quantized_source_recurrent = bf16_round_trip(source_recurrent);
+    let quantized_conv_weight = bf16_round_trip(&weights.conv_weight_values);
+    let quantized_a_log = bf16_round_trip(&weights.a_log_values);
+    let quantized_dt_bias = bf16_round_trip(&weights.dt_bias_values);
     let conv = gdn_short_conv_reference(
         core,
         cu_tokens,
-        &source_conv[..num_requests * conv_stride],
+        &quantized_source_conv[..num_requests * conv_stride],
         &qkv,
-        &weights.conv_weight_values,
+        &quantized_conv_weight,
     );
+    let quantized_conv_qkv = bf16_round_trip(&conv.conv_qkv);
     let recurrent = gdn_recurrent_reference(
         core,
         GDNRecurrentReferenceInput {
             cu_tokens,
-            source_recurrent_state: &source_recurrent[..num_requests * recurrent_stride],
-            conv_qkv: &conv.conv_qkv,
+            source_recurrent_state: &quantized_source_recurrent[..num_requests * recurrent_stride],
+            conv_qkv: &quantized_conv_qkv,
             a: &a,
             b: &b,
-            a_log: &weights.a_log_values,
-            dt_bias: &weights.dt_bias_values,
+            a_log: &quantized_a_log,
+            dt_bias: &quantized_dt_bias,
         },
     );
+    let quantized_recurrent_output = bf16_round_trip(&recurrent.recurrent_output);
     let norm_gated = gdn_output_norm_gate_reference(
         core,
-        &recurrent.recurrent_output,
+        &quantized_recurrent_output,
         &z,
-        &weights.norm_weight_values,
+        &bf16_round_trip(&weights.norm_weight_values),
         config.norm_eps,
     );
-    let output = quantize_bf16(&quantized_affine_reference(
+    let output = bf16_round_trip(&quantized_affine_reference(
         affine_reference_shape(num_tokens, core.hidden_dim, core.v_dim()),
-        &norm_gated,
+        &bf16_round_trip(&norm_gated),
         &weights.output_weight_values,
         &weights.output_scale_values,
         &weights.output_bias_values,
     ));
-    let mut conv_state_arena = initial_conv_arena.to_vec();
-    let mut recurrent_state_arena = initial_recurrent_arena.to_vec();
+    let mut conv_state_arena = bf16_round_trip(initial_conv_arena);
+    let mut recurrent_state_arena = bf16_round_trip(initial_recurrent_arena);
     for request_index in 0..num_requests {
         let candidate_slot = NUM_SOURCE_STATE_SLOTS + request_index;
-        conv_state_arena[candidate_slot * conv_stride..(candidate_slot + 1) * conv_stride]
-            .copy_from_slice(&conv.next_conv_state[request_index * conv_stride..(request_index + 1) * conv_stride]);
+        conv_state_arena[candidate_slot * conv_stride..(candidate_slot + 1) * conv_stride].copy_from_slice(
+            &bf16_round_trip(&conv.next_conv_state)[request_index * conv_stride..(request_index + 1) * conv_stride],
+        );
         recurrent_state_arena[candidate_slot * recurrent_stride..(candidate_slot + 1) * recurrent_stride]
             .copy_from_slice(
-                &recurrent.next_recurrent_state
+                &bf16_round_trip(&recurrent.next_recurrent_state)
                     [request_index * recurrent_stride..(request_index + 1) * recurrent_stride],
             );
     }
@@ -429,12 +437,47 @@ fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
         .collect()
 }
 
-fn quantize_bf16(values: &[f32]) -> Vec<f32> {
-    values.iter().map(|&value| bf16::from_f32(value).to_f32()).collect()
+fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
+    buffer.write_typed(
+        0,
+        &values
+            .iter()
+            .map(|&value| bf16::from_f32(value).to_bits())
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn f32_to_bf16(value: f32) -> bf16 {
+    bf16::from_f32(value)
+}
+
+fn bf16_to_f32(value: bf16) -> f32 {
+    value.to_f32()
+}
+
+fn bf16_round_trip(values: &[f32]) -> Vec<f32> {
+    values.iter().map(|&value| bf16_to_f32(f32_to_bf16(value))).collect()
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
+    let mean_abs_error = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .sum::<f32>()
+        / actual.len().max(1) as f32;
+    let max_abs_error = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let mean_abs_tolerance = tolerance * 0.1;
+    assert!(
+        max_abs_error <= tolerance && mean_abs_error <= mean_abs_tolerance,
+        "GDN quality mismatch: max_abs_error={max_abs_error} max_abs_tolerance={tolerance} \
+         mean_abs_error={mean_abs_error} mean_abs_tolerance={mean_abs_tolerance}"
+    );
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
         let difference = (actual - expected).abs();
         assert!(

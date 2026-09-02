@@ -1,17 +1,18 @@
 
 #include <metal_stdlib>
 using namespace metal;
+typedef bfloat bfloat16_t;
 
 // qkv_dim is Cqkv = 2 * Hqk * Dqk + Hv * Dv, the concatenated Q/K/V
 // channel width. It is not a head axis, head width, or convolution-kernel
 // extent.
 
-kernel void gdn_qkvabz_split_f32(
-    device const float* qkvabz [[buffer(0)]],
-    device float* qkv [[buffer(1)]],
-    device float* a [[buffer(2)]],
-    device float* b [[buffer(3)]],
-    device float* z [[buffer(4)]],
+kernel void gdn_qkvabz_split_bf16(
+    device const bfloat16_t* qkvabz [[buffer(0)]],
+    device bfloat16_t* qkv [[buffer(1)]],
+    device bfloat16_t* a [[buffer(2)]],
+    device bfloat16_t* b [[buffer(3)]],
+    device bfloat16_t* z [[buffer(4)]],
     constant uint& num_active_tokens [[buffer(5)]],
     constant uint& qkv_dim [[buffer(6)]],
     constant uint& num_v_heads [[buffer(7)]],
@@ -26,7 +27,7 @@ kernel void gdn_qkvabz_split_f32(
 
     uint flat_token_index = global_linear_index / qkvabz_row_stride;
     uint qkvabz_dim_index = global_linear_index - flat_token_index * qkvabz_row_stride;
-    float value = qkvabz[global_linear_index];
+    const bfloat16_t value = qkvabz[global_linear_index];
     if (qkvabz_dim_index < qkv_dim) {
         qkv[flat_token_index * qkv_dim + qkvabz_dim_index] = value;
         return;

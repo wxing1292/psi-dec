@@ -217,7 +217,7 @@ impl Qwen3xGDNWeights {
             metal.group_size,
             metal.bits,
             metal.input_dtype,
-            Dtype::Float32,
+            Dtype::Bfloat16,
             metal.qkvabz_scale_bias_dtype,
         );
         validate_len("GDN qkvabz weight", qkvabz_weight.len(), qkvabz_config.weight_bytes())?;
@@ -237,7 +237,7 @@ impl Qwen3xGDNWeights {
             core.v_dim(),
             metal.group_size,
             metal.bits,
-            Dtype::Float32,
+            Dtype::Bfloat16,
             metal.output_dtype,
             metal.output_scale_bias_dtype,
         );

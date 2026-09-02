@@ -116,19 +116,19 @@ pub type GDNOutput<'a> = &'a Buffer;
 /// ```text
 /// hidden_state (BF16)
 ///   -> qkvabz
-///   -> scratch.qkvabz (F32)
+///   -> scratch.qkvabz (BF16)
 ///   -> qkvabz_to_qkv_a_b_z
-///      |- scratch.qkv (F32)
-///      |- scratch.a (F32)
-///      |- scratch.b (F32)
-///      `- scratch.z (F32)
+///      |- scratch.qkv (BF16)
+///      |- scratch.a (BF16)
+///      |- scratch.b (BF16)
+///      `- scratch.z (BF16)
 ///             |
 ///             v
-///          compute (F32)
+///          compute (BF16 storage, F32 arithmetic)
 ///      short_conv -> ragged_recurrent -> output_norm_gate
 ///             |
 ///             v
-///      scratch.norm_gated_output (F32)
+///      scratch.norm_gated_output (BF16)
 ///             |
 ///             v
 ///          output
@@ -159,7 +159,7 @@ impl GDN {
                     qkvabz_dim,
                     core.hidden_dim,
                     config.input_dtype,
-                    Dtype::Float32,
+                    Dtype::Bfloat16,
                     config.qkvabz_scale_bias_dtype,
                     config,
                 ),
@@ -171,7 +171,7 @@ impl GDN {
                 affine_config(
                     core.hidden_dim,
                     core.v_dim(),
-                    Dtype::Float32,
+                    Dtype::Bfloat16,
                     config.output_dtype,
                     config.output_scale_bias_dtype,
                     config,

@@ -11,11 +11,11 @@ constant uint GDN_INVALID_STATE_SLOT_ID = 0xffffffffu;
 // Short convolution operates independently along Cqkv; conv_kernel_size is
 // its temporal kernel extent, not a tensor-channel dimension.
 
-kernel void gdn_compute_short_conv_f32(
-    device float* conv_qkv [[buffer(0)]],
-    device float* next_conv_state [[buffer(1)]],
-    device const float* qkv [[buffer(2)]],
-    device const float* conv_state [[buffer(3)]],
+kernel void gdn_compute_short_conv_bf16(
+    device bfloat16_t* conv_qkv [[buffer(0)]],
+    device bfloat16_t* next_conv_state [[buffer(1)]],
+    device const bfloat16_t* qkv [[buffer(2)]],
+    device const bfloat16_t* conv_state [[buffer(3)]],
     device const bfloat16_t* conv_weight [[buffer(4)]],
     device const uint* src_conv_state_slots [[buffer(5)]],
     device const uint* flat_materialized_conv_state_slots [[buffer(6)]],
@@ -27,8 +27,8 @@ kernel void gdn_compute_short_conv_f32(
     constant uint& write_final_conv_state [[buffer(12)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
-    const ulong conv_state_base = conv_state_offset_bytes / sizeof(float);
-    const ulong next_conv_state_base = next_conv_state_offset_bytes / sizeof(float);
+    const ulong conv_state_base = conv_state_offset_bytes / sizeof(bfloat16_t);
+    const ulong next_conv_state_base = next_conv_state_offset_bytes / sizeof(bfloat16_t);
     const uint num_conv_qkv_values = num_active_tokens * qkv_dim;
     const uint num_next_conv_state_values = num_active_reqs * qkv_dim * conv_state_len;
 
@@ -62,7 +62,7 @@ kernel void gdn_compute_short_conv_f32(
             const uint weight_offset = channel_index * conv_kernel_size + kernel_index;
             acc += x * float(conv_weight[weight_offset]);
         }
-        conv_qkv[global_linear_index] = acc / (1.0f + metal::exp(-acc));
+        conv_qkv[global_linear_index] = bfloat16_t(acc / (1.0f + metal::exp(-acc)));
     }
 
     if (global_linear_index < num_next_conv_state_values) {
@@ -89,15 +89,15 @@ kernel void gdn_compute_short_conv_f32(
         }
         if (write_final_conv_state != 0 && state_slot != GDN_INVALID_STATE_SLOT_ID) {
             const uint dst_offset = (state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
-            next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
+            next_conv_state[next_conv_state_base + (ulong)dst_offset] = bfloat16_t(x);
         }
     }
 }
 
-kernel void gdn_compute_candidate_conv_state_f32(
-    device float* next_conv_state [[buffer(0)]],
-    device const float* qkv [[buffer(1)]],
-    device const float* conv_state [[buffer(2)]],
+kernel void gdn_compute_candidate_conv_state_bf16(
+    device bfloat16_t* next_conv_state [[buffer(0)]],
+    device const bfloat16_t* qkv [[buffer(1)]],
+    device const bfloat16_t* conv_state [[buffer(2)]],
     device const uint* src_conv_state_slots [[buffer(3)]],
     device const uint* flat_materialized_conv_state_slots [[buffer(4)]],
     device const uint* cu_tokens [[buffer(5)]],
@@ -107,8 +107,8 @@ kernel void gdn_compute_candidate_conv_state_f32(
     constant ulong& next_conv_state_offset_bytes [[buffer(9)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
-    const ulong conv_state_base = conv_state_offset_bytes / sizeof(float);
-    const ulong next_conv_state_base = next_conv_state_offset_bytes / sizeof(float);
+    const ulong conv_state_base = conv_state_offset_bytes / sizeof(bfloat16_t);
+    const ulong next_conv_state_base = next_conv_state_offset_bytes / sizeof(bfloat16_t);
     const uint state_index = global_linear_index % conv_state_len;
     uint coordinate_linear_index = global_linear_index / conv_state_len;
     const uint channel_index = coordinate_linear_index % qkv_dim;
@@ -144,7 +144,7 @@ kernel void gdn_compute_candidate_conv_state_f32(
         x = qkv[input_offset];
     }
     const uint dst_offset = (state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
-    next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
+    next_conv_state[next_conv_state_base + (ulong)dst_offset] = bfloat16_t(x);
 }
 
 // One logical FinalRecurrentStateThreadBlockTask maps 1:1 to one
@@ -160,12 +160,12 @@ kernel void gdn_compute_candidate_conv_state_f32(
 //   v_dim_indices,      // grid-derived half-open range
 //   flat_token_indices, // cu_tokens[request_index]..cu_tokens[request_index + 1]
 // }
-kernel void gdn_compute_final_recurrent_state_f32(
-    device float* recurrent_output [[buffer(0)]],
-    device float* recurrent_state_arena [[buffer(1)]],
-    device const float* conv_qkv [[buffer(2)]],
-    device const float* a [[buffer(3)]],
-    device const float* b [[buffer(4)]],
+kernel void gdn_compute_final_recurrent_state_bf16(
+    device bfloat16_t* recurrent_output [[buffer(0)]],
+    device bfloat16_t* recurrent_state_arena [[buffer(1)]],
+    device const bfloat16_t* conv_qkv [[buffer(2)]],
+    device const bfloat16_t* a [[buffer(3)]],
+    device const bfloat16_t* b [[buffer(4)]],
     device const bfloat16_t* a_log [[buffer(5)]],
     device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_recurrent_state_slots [[buffer(7)]],
@@ -177,7 +177,7 @@ kernel void gdn_compute_final_recurrent_state_f32(
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadblock [[thread_position_in_threadgroup]]
 ) {
-    const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(float);
+    const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(bfloat16_t);
     const uint qk_dim_thread_index = thread_position_in_threadblock.x;
     const uint v_row_index_in_range = thread_position_in_threadblock.y;
     const uint num_qk_dim_threads = final_recurrent_state_num_qk_dim_threads;
@@ -287,7 +287,8 @@ kernel void gdn_compute_final_recurrent_state_f32(
         }
         const float recurrent_output_value = simd_sum(state_q_partial);
         if (qk_dim_thread_index == 0) {
-            recurrent_output[(flat_token_index * num_v_heads + v_head_index) * v_head_dim + v_dim_index] = recurrent_output_value;
+            recurrent_output[(flat_token_index * num_v_heads + v_head_index) * v_head_dim + v_dim_index] =
+                bfloat16_t(recurrent_output_value);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -299,7 +300,7 @@ kernel void gdn_compute_final_recurrent_state_f32(
                 recurrent_state_arena[
                     recurrent_state_base
                     + (ulong)(state_slot * recurrent_state_stride + state_row_offset + qk_dim_index)] =
-                    state_fragments[state_fragment_index];
+                    bfloat16_t(state_fragments[state_fragment_index]);
             }
         }
     }
@@ -315,12 +316,12 @@ kernel void gdn_compute_final_recurrent_state_f32(
 // rows. The kernel derives the task from its arguments, thread-block index,
 // and constants.
 // It does not require a materialized task buffer.
-kernel void gdn_compute_candidate_recurrent_state_f32(
-    device float* recurrent_output [[buffer(0)]],
-    device float* recurrent_state_arena [[buffer(1)]],
-    device const float* conv_qkv [[buffer(2)]],
-    device const float* a [[buffer(3)]],
-    device const float* b [[buffer(4)]],
+kernel void gdn_compute_candidate_recurrent_state_bf16(
+    device bfloat16_t* recurrent_output [[buffer(0)]],
+    device bfloat16_t* recurrent_state_arena [[buffer(1)]],
+    device const bfloat16_t* conv_qkv [[buffer(2)]],
+    device const bfloat16_t* a [[buffer(3)]],
+    device const bfloat16_t* b [[buffer(4)]],
     device const bfloat16_t* a_log [[buffer(5)]],
     device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_recurrent_state_slots [[buffer(7)]],
@@ -361,7 +362,7 @@ kernel void gdn_compute_candidate_recurrent_state_f32(
     const uint v_base = k_base + num_qk_heads * qk_head_dim;
     const uint recurrent_state_stride = num_v_heads * v_head_dim * qk_head_dim;
     const uint src_state_slot = src_recurrent_state_slots[req_index];
-    const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(float);
+    const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(bfloat16_t);
 
     thread float state_fragments[
         candidate_recurrent_state_num_v_rows_per_simdgroup * num_state_fragments];
@@ -475,7 +476,7 @@ kernel void gdn_compute_candidate_recurrent_state_f32(
                 if (candidate_state_slot != GDN_INVALID_STATE_SLOT_ID && qk_dim_index < qk_head_dim) {
                     recurrent_state_arena[
                         recurrent_state_base + (ulong)candidate_state_slot * recurrent_state_stride
-                        + state_row_offset + qk_dim_index] = updated_state;
+                        + state_row_offset + qk_dim_index] = bfloat16_t(updated_state);
                 }
                 state_q_partial += updated_state * q_fragments[state_fragment_index];
             }
@@ -483,7 +484,7 @@ kernel void gdn_compute_candidate_recurrent_state_f32(
             if (qk_dim_thread_index == v_row_index_in_range) {
                 recurrent_output[
                     ((ulong)flat_token_index * num_v_heads + v_head_index) * v_head_dim + v_dim_index] =
-                    recurrent_output_value;
+                    bfloat16_t(recurrent_output_value);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -499,10 +500,10 @@ kernel void gdn_compute_candidate_recurrent_state_f32(
 //   flat_token_index,  // grid-derived from threadblock linear index / Hv
 //   v_head_index,      // grid-derived from threadblock linear index % Hv
 // }
-kernel void gdn_compute_output_norm_gate_f32(
-    device float* norm_gated_output [[buffer(0)]],
-    device const float* recurrent_output [[buffer(1)]],
-    device const float* z [[buffer(2)]],
+kernel void gdn_compute_output_norm_gate_bf16(
+    device bfloat16_t* norm_gated_output [[buffer(0)]],
+    device const bfloat16_t* recurrent_output [[buffer(1)]],
+    device const bfloat16_t* z [[buffer(2)]],
     device const bfloat16_t* norm_weight [[buffer(3)]],
     constant float& eps [[buffer(4)]],
     constant uint& num_active_tokens [[buffer(5)]],
@@ -546,6 +547,6 @@ kernel void gdn_compute_output_norm_gate_f32(
         const float z_value = z[output_index];
         const float silu_z = z_value / (1.0f + metal::exp(-z_value));
         const float normalized_value = recurrent_output[output_index] * inv_rms * float(norm_weight[v_dim_index]);
-        norm_gated_output[output_index] = normalized_value * silu_z;
+        norm_gated_output[output_index] = bfloat16_t(normalized_value * silu_z);
     }
 }

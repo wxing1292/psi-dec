@@ -109,7 +109,8 @@ dt_bias                            bf16
 ```
 
 Metal kernels promote BF16 parameters to F32 at the operation that consumes them. The loader does not create persistent
-F32 copies or derive `-exp(a_log)`. Convolution and recurrent state remain F32 runtime state.
+F32 copies or derive `-exp(a_log)`. All global transient tensors and persistent convolution and recurrent state use
+BF16. Kernels promote each value to F32 for computation.
 
 `qkv` is the projection-split output and short-convolution input. `conv_qkv` is the short-convolution output
 and recurrent-core input.
@@ -256,7 +257,7 @@ thread_block_dimensions = (num_qk_dim_threads, num_v_rows, 1)
 ```
 
 One final recurrent-state thread block owns an `[8, 128]` state slice. This slice contains
-`8 * 128 * sizeof(f32) = 4 KiB` of logical state.
+`8 * 128 * sizeof(bfloat) = 2 KiB` of global state.
 
 For `Dqk=128`, one thread owns four strided state values:
 
@@ -279,8 +280,9 @@ thread(x, y).state_fragments = [
 The 32 x-lanes collectively hold one 128D state row. Eight y-rows collectively hold the complete `[8, 128]` state
 slice. MSL declares `thread float state_fragments[4]`. Physical register placement remains a compiler decision.
 
-In each round, the 32 x-lanes access one contiguous 128-byte span (`32 * sizeof(f32)`). Four rounds cover one 512-byte
-row. This pattern describes memory access. It does not guarantee one 512-byte hardware transaction.
+In each round, the 32 x-lanes access one contiguous 64-byte BF16 span (`32 * sizeof(bfloat)`). Four rounds cover one
+256-byte row. The kernel promotes the values into F32 thread-local fragments. This pattern describes memory access. It
+does not guarantee one 256-byte hardware transaction.
 
 The candidate recurrent-state kernel uses this task relation:
 
@@ -349,7 +351,8 @@ The read and write kernels use the same private `state_pages::KernelConstants`. 
 read/write task geometry. The batch shape and state-page counts remain dynamic invocation data.
 
 The grid derives all task coordinates. `page_id`, `recurrent_state_slot`, and `conv_state_slot` are data inputs.
-`state_kind` selects the applicable physical slot. One thread block copies one page with `float4` lanes.
+`state_kind` selects the applicable physical slot. One thread block copies one page as raw 16-byte `uint4` units. The
+copy preserves BF16 payload bits and does not convert the values.
 
 ## Canonical metadata and host/Metal ABI
 
@@ -495,8 +498,10 @@ q_scale
 The independent dimensions derive `qk_dim`, `v_dim`, `qkv_dim = Cqkv`, and the convolution history length.
 `GDNCore` and the backend invocation shape do not store duplicate fields.
 
-The current GDN Metal execution contract uses BF16 model input and output boundaries. It uses F32 for projection outputs,
-GDN compute, and persistent recurrent state. `GDNCore` remains backend-neutral and does not define these data types.
+The current GDN Metal execution contract uses BF16 for model input and output boundaries, projection outputs, GDN global
+scratch, convolution state, recurrent state, recurrent output, and norm/gate output. Kernels use F32 registers,
+SIMDgroup matrices, threadgroup accumulators, and scalar arithmetic. `GDNCore` remains backend-neutral and does not
+define these data types.
 
 `GDNMetalConfig` owns numeric and storage configuration. It includes norm epsilon, `input_dtype`, `output_dtype`,
 `qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`. The current implementation accepts only BF16 model boundaries.
@@ -582,8 +587,8 @@ start in the same order. ID equality is not a contract. C0 prepare, compute, com
 consume the two IDs independently. The trailing dimensions come directly from the shared GDN core. They are not separate
 request-slot axes.
 
-`page_bytes` is the raw allocation unit. Page I/O divides by `sizeof(f32)` only when it indexes f32 state. A layout or
-state object never stores that derived capacity.
+`page_bytes` is the raw allocation unit. State layout code divides by `sizeof(u16)` only when it indexes BF16 state. Page
+I/O copies raw 16-byte units. A layout or state object never stores a derived element or copy-unit capacity.
 
 Runtime page IDs remain CPU transaction data in `GDNStatePages` vectors. `GDNStatePageIO` owns the reusable
 `page_ids`, `recurrent_state_slots`, and `conv_state_slots` GPU staging buffers and the batched read/write kernels. It
@@ -669,18 +674,19 @@ recurrent/conv tensor dimensions.
 
 Arena lengths and the leading dimensions derive the per-slot and per-layer byte strides. The layout does not duplicate
 these strides. It directly derives aggregate allocation lengths and the all-layer page-ID count. It does not store derived
-f32-per-page counts, recurrent/conv page counts, or a selected layer coordinate.
+BF16-per-page counts, recurrent/conv page counts, or a selected layer coordinate.
 
-Backend code then runs the recurrent state update and output projection. GDN math keeps `qkv`, gates,
-`conv_qkv`, recurrent state, `recurrent_output`, and `norm_gated_output` in f32.
+Backend code then runs the recurrent state update and output projection. Global `qkv`, gates, `conv_qkv`, recurrent
+state, `recurrent_output`, and `norm_gated_output` use BF16. Kernels promote inputs to F32 and use F32 for all arithmetic
+and reductions before they round global outputs to BF16.
 
 Qwen checkpoint weights and affine parameters remain packed U32 or BF16 in persistent Metal buffers. Quantized matmul
 kernels dequantize packed weights and promote BF16 affine parameters during execution. GDN core kernels promote
 `conv_weight`, `norm_weight`, `a_log`, and `dt_bias` when they read each value. The recurrent kernel computes
 `-exp(a_log)` in F32.
 
-`GDNMetalConfig` requires BF16 at both Qwen3.6 model boundaries. GDN state and internal math remain F32 because BF16 can
-cause downstream NaN/Inf.
+`GDNMetalConfig` requires BF16 at both Qwen3.6 model boundaries. The storage contract is fixed. It does not expose a
+legacy F32 global-storage path or a runtime storage-format switch.
 
 ## Replay contract
 
@@ -798,23 +804,23 @@ The replay order is:
 
 ```text
 hidden_state (BF16)
-  -> qkvabz: affine_quantized::Matmul (BF16 -> F32)
-  -> qkvabz (F32)
+  -> qkvabz: affine_quantized::Matmul (BF16 -> BF16, F32 accumulation)
+  -> qkvabz (BF16)
   -> qkvabz_to_qkv_a_b_z
-     |- qkv (F32)
-     |- a (F32)
-     |- b (F32)
-     `- z (F32)
+     |- qkv (BF16)
+     |- a (BF16)
+     |- b (BF16)
+     `- z (BF16)
           |
           v
        backend_compute::Compute (F32)
      short_conv -> final_recurrent_state -> output_norm_gate
           |
           v
-       norm_gated_output (F32)
+       norm_gated_output (BF16)
           |
           v
-       output: affine_quantized::Matmul (F32 -> BF16)
+       output: affine_quantized::Matmul (BF16 -> BF16, F32 accumulation)
           |
           v
        next_hidden_state (BF16)
@@ -933,9 +939,9 @@ flat_materialized_recurrent_state_slots
                                     persistent recurrent slot per forward row, or u32::MAX
 flat_materialized_conv_state_slots
                                     persistent convolution slot per forward row, or u32::MAX
-conv_state               f32 slot arena for convolution state
+conv_state               BF16 slot arena for convolution state
 next_conv_state          destination conv-state arena; may be the same backing as conv_state
-recurrent_state_arena    f32 slot arena for recurrent state
+recurrent_state_arena    BF16 slot arena for recurrent state
 ```
 
 When `conv_state` and `next_conv_state` share backing storage, source and destination slot IDs must name distinct slots
@@ -1060,9 +1066,9 @@ Publish is a separate replay from main forward and sampling. It consumes the alr
 affect response tokens. It can execute while the scheduler processes that response.
 
 Qwen model replay keeps selected-path GDN transient scratch in one model-owned `GDNScratch`. The shared `GDN` backend
-creates this scratch from its retained device and validated geometry. The scratch includes the F32 qkvabz
-projection/split buffers and the F32 convolution/core/output-gate buffers. GDN layers execute serially in the replay
-slice. Therefore, this scratch is reusable across layers.
+creates this scratch from its retained device and validated geometry. The scratch includes BF16 qkvabz
+projection/split buffers and BF16 convolution/core/output-gate buffers. GDN layers execute serially in the replay slice.
+Therefore, this scratch is reusable across layers.
 
 State-page I/O writes directly between global state pages and the model-owned contiguous state arenas. It does not use
 page-value scratch. Every production state kernel binds the aggregate arena at Metal offset zero.
@@ -1105,9 +1111,9 @@ recurrent_states[layer, slot, v_head, v_dim, qk_dim]
 Short convolution reads the source conv-state slot and `qkv`. It writes `conv_qkv` for every current row. It writes the
 next conv-state only when the row's convolution state slot is valid.
 
-The recurrent core reads `conv_qkv`, raw F32 `a`/`b`, and raw BF16 `a_log`/`dt_bias`. It promotes the BF16 parameters
-and derives normalized q/k, beta, decay, and output values in F32. It then advances the recurrent state in token order
-for each request segment.
+The recurrent core reads BF16 `conv_qkv`, raw BF16 `a`/`b`, and raw BF16 `a_log`/`dt_bias`. It promotes the values and
+derives normalized q/k, beta, decay, and output values in F32. It then advances the recurrent state in token order for
+each request segment.
 
 For candidate materialization, one SIMDgroup loads a `[2, Dqk]` source-state slice into registers. It keeps the slice
 local across the segment. Two SIMDgroups share one normalized Q/K vector and gate pair. Each SIMDgroup writes its slice
@@ -1165,7 +1171,7 @@ publish
 Runtime core owns state page IDs and cache lifecycle notifications. The executor owns GDN state tensor layout,
 request-slot current/candidate slot mapping, and all-layer page-I/O command records.
 
-`state_version` is the canonical absolute coordinate of verified mutable state. Immutable fp32 state pages are boundary
+`state_version` is the canonical absolute coordinate of verified mutable state. Immutable BF16 state pages are boundary
 checkpoints. Restore loads one into mutable state after a prefix hit. Publish writes only a verified commit.
 
 Backend page-I/O components receive compact page IDs, recurrent and convolution state slots, and `page_bytes`. Request
@@ -1288,6 +1294,47 @@ Recommendation: Barrier audits follow this data flow:
 2. Core update
 3. Candidate write
 4. Verified commit/publish
+
+## BF16 storage conversion evidence
+
+The BF16 conversion reduces the byte size of every GDN global transient tensor and persistent state tensor by exactly
+50% relative to F32. F32 register and threadgroup arithmetic does not change this global-memory calculation.
+
+The component quality fixture quantizes each global stage before it runs the unchanged CPU recurrent oracle. It covers
+final and candidate recurrent-state materialization. The gate requires maximum absolute error `<= 0.005` and mean
+absolute error `<= 0.0005`. The observed maximum absolute error was `0.00390625`. The largest observed mean absolute
+error was `0.00038775802`. The full GDN owner also checks maximum and mean errors for the output and complete persistent
+state arenas.
+
+The performance baseline was clean commit `192ceaec3b8baa941b90dea3bba943b2c259642d`. The converted result used clean
+commit `f9831607a4be3bc03e364447c10468c90c0b9caf`. The converted benchmark writes valid BF16 fixture values into every
+BF16 input and state buffer. Both measurements used macOS 27.0 build 26A5425a on an arm64 Apple M3 Max with 48 GB
+memory. No `PSI_*` environment variables were set. These are normal wall-clock replay measurements. They do not use
+force-sync or profile-summary mode.
+
+The backend Criterion medians were:
+
+| Tokens | Component | F32 baseline | BF16 storage | Delta |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | recurrent | 297.78 µs | 290.40 µs | -2.48% |
+| 16 | recurrent | 323.91 µs | 347.93 µs | +7.42% |
+
+The one-token result improves by 2.48%. The 16-token result regresses by 7.42%. The conversion adds BF16 global-storage
+conversion and writeback work, but it halves global-memory traffic and storage. The dominant effect changes with the
+workload. Do not classify the conversion as an unconditional latency gain or regression.
+
+A load-width audit found no GQA-style scalar staging defect in GDN state access. State-page read and write copy raw
+BF16 payloads as 16-byte `uint4` units. Each recurrent-state fragment round assigns one Dqk value to each of 32 lanes.
+The lanes access one contiguous 64-byte BF16 span and promote their owned values to F32 registers. A packed per-lane
+load would cross the recurrent reduction's lane ownership and would require a data redistribution. Convolution-state
+and output paths also consume their loaded value in the thread that owns its arithmetic. Keep these access patterns
+unless a separate profile identifies a bottleneck.
+
+The exact commands were:
+
+```text
+cargo bench -p inference-backend-metal --bench gdn_attn -- 'metal/gdn-attn/core-ragged_recurrent/replay/batch1/tokens(1|16)$' --warm-up-time 1 --measurement-time 2 --sample-size 20 --noplot
+```
 
 Shared GPU serialization, benchmark metrics, and performance-evidence rules are in
 [`executor_benchmarks.md`](executor_benchmarks.md).

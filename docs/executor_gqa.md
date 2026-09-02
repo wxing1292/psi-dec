@@ -478,7 +478,8 @@ cache-format kernel.
 The cache conversion uses fixed unit scale and IEEE-style round-to-nearest, ties-to-even. It saturates finite overflow
 and infinity to `±448`. It preserves the sign of zero. It encodes NaN with an E4M3FN NaN code. The cache does not own a
 scale buffer, scale metadata, or a scale lifecycle. `SingleQ` decodes each cache byte directly to F32. `TiledQ` decodes
-each cache byte to BF16 threadgroup K/V storage before it performs F32 matrix arithmetic.
+eight adjacent cache bytes directly to packed BF16 bit patterns for threadgroup K/V storage. It then performs F32
+matrix arithmetic.
 
 This format is the only production GQA cache contract. The implementation does not keep a BF16 compatibility cache,
 an alternate writer, a runtime fallback, or a feature flag.
@@ -824,10 +825,13 @@ active rows.
 ```text
 thread-local Q fragments stay resident for the KV split
                               |
-paged K/V -- 32 lanes x 16 B per row
+paged K/V -- each participating lane reads 8 FP8 bytes
                               |
                               v
-FP8 decode -> threadgroup K[16, D+8] + V[16, D+8] BF16
+software E4M3FN decode -- each lane writes 16 packed BF16 bytes
+                              |
+                              v
+threadgroup K[16, D+8] + V[16, D+8] BF16
                               |
             Q x K^T, explicit visible-range mask
                  online-softmax update
@@ -842,8 +846,12 @@ FP8 decode -> threadgroup K[16, D+8] + V[16, D+8] BF16
 partial output[up to max_q_tokens, max_q_heads, D] + statistics
 ```
 
-For each K or V row, lanes load contiguous 16-byte segments. The two threadgroup tiles occupy 8.5 KiB for Qwen3-14B
-(`2 * 16 * 136 * sizeof(bf16)`).
+For each K or V row, one participating lane reads a contiguous eight-byte FP8 segment and writes one contiguous
+16-byte BF16 segment. `D=256` uses all 32 lanes. `D=128` uses 16 lanes. This mapping matches the previous 16-byte BF16
+load path because both paths assign eight cache values to each participating lane. A 16-value FP8 packet uses only
+half as many lanes for `D=256` and performs worse on M3 Max.
+
+The two threadgroup tiles occupy 8.5 KiB for Qwen3-14B (`2 * 16 * 136 * sizeof(bf16)`).
 
 The tiles occupy 16.5 KiB for `D=256` (`2 * 16 * 264 * sizeof(bf16)`). Q, scores, running statistics, and output
 fragments are MSL thread-local.
@@ -1292,41 +1300,40 @@ unit-scale path, but both recommend calibrated or checkpoint-provided scales whe
 SGLang [KV-cache dtype mapping](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/kv_cache_dtype.py),
 and SGLang [quantized KV-cache guide](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/quantized_kv_cache.mdx).
 
-The performance baseline was clean commit `e8f6d7f24cf9791d24ecc3cda539116772f03405`. The converted result used the
-dirty worktree at that commit before the conversion commit. Both measurements used macOS 27.0 build 26A5425a on an
-arm64 Apple M3 Max with 48 GB memory. No `PSI_*` environment variables were set. These are normal wall-clock replay
-measurements. They do not use force-sync or profile-summary mode.
+The packed-read measurement used clean source commit `732759e969ee9569b283286084cf4a0d7c6593a1`. The original FP8
+control used clean commit `18a1ce994337ffde970aa1ae6b8a523ed5e7f280`. The BF16 control used clean commit
+`e8f6d7f24cf9791d24ecc3cda539116772f03405`; its GQA source matches the parent of the FP8 conversion. The GDN changes
+at that control commit do not execute in this component benchmark.
 
-The backend SingleQ Criterion medians were:
+All measurements used the Qwen3.6-27B 4-bit checkpoint, macOS 27.0 build 26A5425a, and an arm64 Apple M3 Max with 48
+GB memory. No `PSI_*` environment variables were set. The screen was locked. Commands ran serially. These are normal
+wall-clock replay measurements. They do not use force-sync or profile-summary mode.
 
-| Context tokens | BF16 cache | FP8 cache | Delta |
-| ---: | ---: | ---: | ---: |
-| 128 | 281.28 µs | 375.30 µs | +33.43% |
-| 4,096 | 411.82 µs | 548.53 µs | +33.20% |
+The following results use an existing context of 4,096 tokens. Each value is a median across 11 timed samples. The
+packed FP8 values are the mean of two or three interleaved command medians. The controls use one adjacent command
+median.
 
-The production one-layer Qwen3.6-27B 4-bit replay medians were:
+| Tokens | Metric | BF16 cache | Original FP8 | Packed FP8 | Packed vs original | Packed vs BF16 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | TiledQ Map/Reduce | 785.788 µs | 863.831 µs | 807.387 µs | -6.53% | +2.75% |
+| 1 | Full GQA replay | 977.861 µs | 1,072.759 µs | 1,001.020 µs | -6.69% | +2.37% |
+| 64 | TiledQ Map/Reduce | 1,666.346 µs | 2,075.997 µs | 1,816.607 µs | -12.49% | +9.02% |
+| 64 | Full GQA replay | 3,000.283 µs | 3,361.380 µs | 3,150.068 µs | -6.28% | +4.99% |
 
-| Tokens | Context | Variant | BF16 cache | FP8 cache | Delta |
-| ---: | ---: | --- | ---: | ---: | ---: |
-| 1 | 128 | SingleQ | 799.583 µs | 664.458 µs | -16.90% |
-| 1 | 128 | TiledQ | 642.308 µs | 1,010.942 µs | +57.39% |
-| 1 | 4,096 | SingleQ | 850.767 µs | 1,211.700 µs | +42.42% |
-| 1 | 4,096 | TiledQ | 903.567 µs | 1,244.625 µs | +37.75% |
-| 64 | 128 | SingleQ | 1,832.992 µs | 2,029.225 µs | +10.71% |
-| 64 | 128 | TiledQ | 1,697.658 µs | 1,849.308 µs | +8.93% |
-| 64 | 4,096 | SingleQ | 5,781.425 µs | 7,070.025 µs | +22.29% |
-| 64 | 4,096 | TiledQ | 2,915.542 µs | 3,786.067 µs | +29.86% |
+The unchanged SingleQ subcomponent acted as a control during the one-token comparison. Its adjacent medians were
+430.345 µs for original FP8 and 432.240 µs for the packed-read source, a +0.44% difference. This result indicates that
+the TiledQ improvement does not come from a global GPU speed-state change.
 
-The one-layer command uses three runs and shows system noise, especially in short workloads. The backend Criterion
-result gives the more stable decoder comparison. The evidence classifies the current FP8 cache as a memory-capacity
-and traffic improvement with a measured latency regression on this device. The likely cost is software E4M3FN decode
-on hardware without native FP8 arithmetic. This cause is an inference from the implementation and measurements.
+The packed path removes much of the original scalar staging cost. FP8 remains slower than BF16 on this device because
+Apple9 M3 Max does not expose native E4M3FN arithmetic to this custom shader. The current implementation performs a
+software decode. This classification follows from the local compiler capability probe and the interleaved component
+measurements.
 
 The exact commands were:
 
 ```text
-cargo bench -p inference-backend-metal --bench gqa_split_kv -- 'metal/gqa-split-kv/single-q/replay/ctx(128|4096)$' --warm-up-time 1 --measurement-time 2 --sample-size 20 --noplot
-cargo bench -p inference-executor-metal --bench qwen35_gqa -- --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit --gqa-model 27b --tokens 1,64 --contexts 128,4096 --num-reqs 1 --subcomponents --gqa-split-kv-variants single_q,tiled_q --iters 5 --warmup-iters 3 --runs 3
+cargo bench -p inference-executor-metal --bench qwen35_gqa -- --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit --gqa-model 27b --tokens 1 --contexts 4096 --num-reqs 1 --gqa-split-kv-variants single_q,tiled_q --subcomponents --gqa-subcomponents split-kv-single-q,split-kv-tiled-q --warmup-iters 100 --iters 200 --runs 11
+cargo bench -p inference-executor-metal --bench qwen35_gqa -- --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit --gqa-model 27b --tokens 64 --contexts 4096 --num-reqs 1 --gqa-split-kv-variants tiled_q --subcomponents --gqa-subcomponents split-kv-tiled-q --warmup-iters 100 --iters 100 --runs 11
 ```
 
 Shared GPU serialization, benchmark metrics, and performance-evidence rules are in

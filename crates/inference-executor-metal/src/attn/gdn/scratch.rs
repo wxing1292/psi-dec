@@ -37,14 +37,14 @@ impl GDNScratch {
         };
 
         Self {
-            qkvabz: Buffer::new_zeroed_elements(device, tensor_elements(core.qkvabz_dim()), Dtype::Float32),
-            qkv: Buffer::new_zeroed_elements(device, tensor_elements(core.qkv_dim()), Dtype::Float32),
-            a: Buffer::new_zeroed_elements(device, tensor_elements(core.num_v_heads), Dtype::Float32),
-            b: Buffer::new_zeroed_elements(device, tensor_elements(core.num_v_heads), Dtype::Float32),
-            z: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), Dtype::Float32),
-            conv_qkv: Buffer::new_zeroed_elements(device, tensor_elements(core.qkv_dim()), Dtype::Float32),
-            recurrent_output: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), Dtype::Float32),
-            norm_gated_output: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), Dtype::Float32),
+            qkvabz: Buffer::new_zeroed_elements(device, tensor_elements(core.qkvabz_dim()), Dtype::Bfloat16),
+            qkv: Buffer::new_zeroed_elements(device, tensor_elements(core.qkv_dim()), Dtype::Bfloat16),
+            a: Buffer::new_zeroed_elements(device, tensor_elements(core.num_v_heads), Dtype::Bfloat16),
+            b: Buffer::new_zeroed_elements(device, tensor_elements(core.num_v_heads), Dtype::Bfloat16),
+            z: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), Dtype::Bfloat16),
+            conv_qkv: Buffer::new_zeroed_elements(device, tensor_elements(core.qkv_dim()), Dtype::Bfloat16),
+            recurrent_output: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), Dtype::Bfloat16),
+            norm_gated_output: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), Dtype::Bfloat16),
         }
     }
 
