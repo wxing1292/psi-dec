@@ -412,18 +412,13 @@ mod tests {
             executor_hibernation_mode: ExecutorHibernationMode::Selected,
             context_window: 4096,
             num_tokens_per_cache_block: 1024,
-            num_kv_heads: 1,
-            kv_head_dim: 1,
-            kv_dtype_bytes: 1,
             num_pages: 64,
-            page_bytes: 32,
             cache_lanes: vec![CacheLaneRuntimeConfig {
                 num_pages_per_kv_block: 64,
                 num_pages_per_state_block: 0,
                 block_cache_capacity: 1,
             }],
         };
-        assert_eq!(runtime_config.num_tokens_per_page(), 16);
         assert_eq!(runtime_config.num_tokens_per_cache_block(), 1024);
 
         let runtime = InferenceRuntime::<1024, 1, 4>::new(
@@ -761,11 +756,7 @@ mod tests {
                 executor_hibernation_mode,
                 context_window,
                 num_tokens_per_cache_block: 1024,
-                num_kv_heads: 1,
-                kv_head_dim: 1,
-                kv_dtype_bytes: 1,
                 num_pages: 64 * L,
-                page_bytes: 32,
                 cache_lanes: (0..L)
                     .map(|_| {
                         CacheLaneRuntimeConfig {

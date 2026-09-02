@@ -1,5 +1,7 @@
 //! Shared history-plus-block GQA recording.
 
+use std::mem::size_of;
+
 use inference_backend_metal::components::gqa::bidi_block_sdpa as backend_bidi_block_sdpa;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
@@ -78,7 +80,7 @@ impl BiDiBlockGQAMetalConfig {
             .num_kv_heads
             .checked_mul(core.head_dim)
             .and_then(|values| values.checked_mul(2))
-            .and_then(|values| values.checked_mul(self.io_dtype.item_size()))
+            .and_then(|values| values.checked_mul(size_of::<u8>()))
             .expect("BiDiBlockGQA KV bytes per token must fit usize");
         let page_bytes = self.page_bytes as usize;
         assert!(

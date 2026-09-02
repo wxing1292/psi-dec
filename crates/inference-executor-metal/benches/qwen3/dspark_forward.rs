@@ -1,4 +1,5 @@
 use std::hint::black_box;
+use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -711,7 +712,7 @@ fn qwen3_main_page_ids_per_cache_block(config: &Qwen3ModelConfig) -> usize {
         .num_key_value_heads
         .checked_mul(text.head_dim)
         .and_then(|values| values.checked_mul(2))
-        .and_then(|values| values.checked_mul(Dtype::Bfloat16.item_size()))
+        .and_then(|values| values.checked_mul(size_of::<u8>()))
         .expect("Main comparison K/V token size must fit usize");
     assert!(QWEN3_PAGE_SIZE_BYTES.is_multiple_of(kv_token_bytes));
     let tokens_per_page = QWEN3_PAGE_SIZE_BYTES / kv_token_bytes;

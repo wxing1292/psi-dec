@@ -69,7 +69,11 @@ impl Config {
         assert!(self.num_kv_heads > 0);
         assert!(self.num_tokens_per_page() > 0);
         assert!(self.head_dim > 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert_eq!(
+            self.dtype,
+            Dtype::Bfloat16,
+            "GQA FP8 KV page write requires BF16 source tensors"
+        );
     }
 
     pub fn num_tokens_per_page(self) -> u32 {
@@ -78,7 +82,7 @@ impl Config {
             .num_kv_heads
             .checked_mul(self.head_dim)
             .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(self.dtype.item_size().try_into().expect("dtype size must fit u32")))
+            .and_then(|bytes| bytes.checked_mul(size_of::<u8>().try_into().expect("FP8 size must fit u32")))
             .expect("GQA K/V bytes per token must fit u32");
         assert!(
             self.page_bytes.is_multiple_of(kv_bytes_per_token),
@@ -150,14 +154,9 @@ impl Compute {
         config.validate();
         let constants = KernelConstants::current(config);
         let source = kv_page_write_source(constants);
-        let function_name = match config.dtype {
-            Dtype::Float32 => "gqa_kv_page_write_f32",
-            Dtype::Bfloat16 => "gqa_kv_page_write_u16",
-            dtype => panic!("unsupported GQA KV page write dtype {dtype:?}"),
-        };
         Self {
             constants,
-            kernel: CompiledKernel::new(device, &source, function_name),
+            kernel: CompiledKernel::new(device, &source, "gqa_kv_page_write_fp8_e4m3fn"),
         }
     }
 
@@ -255,7 +254,11 @@ impl Invocation<'_> {
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
+
     use super::*;
+    use crate::components::gqa::fp8::bf16_to_fp8_e4m3;
+    use crate::components::gqa::fp8::f32_to_bf16;
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
@@ -288,24 +291,24 @@ mod tests {
     fn test_replay_matches_page_reference_across_active_counts() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let page_values = 8_usize;
+        let page_values = 16_usize;
         let num_pages = 4_usize;
-        let initial_page_value = 0x3555_u16;
-        let flat_k_values = (0..16).map(|index| 100 + index as u16).collect::<Vec<_>>();
-        let flat_v_values = (0..16).map(|index| 200 + index as u16).collect::<Vec<_>>();
+        let initial_page_value = 0x55_u8;
+        let flat_k_values = (0..16).map(|index| 1.0 + index as f32 * 0.125).collect::<Vec<_>>();
+        let flat_v_values = (0..16).map(|index| -1.0 - index as f32 * 0.125).collect::<Vec<_>>();
         let req_slot_values = [0_u32, 1, 0, 1, 0, 1, 0, 1];
         let token_index_values = [0_u32, 0, 1, 1, 2, 2, 3, 3];
         let page_id_values = [0_u32, 1, 2, 3];
         let pages = Buffer::from_slice(&device, &vec![initial_page_value; num_pages * page_values]);
-        let flat_k = Buffer::from_slice(&device, &flat_k_values);
-        let flat_v = Buffer::from_slice(&device, &flat_v_values);
+        let flat_k = bf16_buffer(&device, &flat_k_values);
+        let flat_v = bf16_buffer(&device, &flat_v_values);
         let req_slots = Buffer::from_slice(&device, &req_slot_values);
         let flat_token_indices = Buffer::from_slice(&device, &token_index_values);
         let page_ids = Buffer::from_slice(&device, &page_id_values);
         let config = Config {
             num_kv_heads: 1,
             head_dim: 2,
-            page_bytes: (page_values * size_of::<u16>()) as u32,
+            page_bytes: page_values as u32,
             dtype: Dtype::Bfloat16,
         };
         let shape = Shape {
@@ -362,36 +365,55 @@ mod tests {
                 for dim_index in 0..config.head_dim as usize {
                     let page_token_offset = page_token_index * config.head_dim as usize + dim_index;
                     let flat_offset = write_index * config.head_dim as usize + dim_index;
-                    expected[page_id * page_values + page_token_offset] = flat_k_values[flat_offset];
+                    expected[page_id * page_values + page_token_offset] =
+                        bf16_to_fp8_e4m3(f32_to_bf16(flat_k_values[flat_offset]));
                     expected[page_id * page_values + kv_values_per_page + page_token_offset] =
-                        flat_v_values[flat_offset];
+                        bf16_to_fp8_e4m3(f32_to_bf16(flat_v_values[flat_offset]));
                 }
             }
-            assert_eq!(pages.read_typed::<u16>(0, expected.len()), expected);
+            assert_eq!(pages.read_typed::<u8>(0, expected.len()), expected);
         }
     }
 
     #[test]
-    fn test_f32_replay_matches_page_reference() {
+    fn test_fp8_replay_matches_page_reference() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let expected = [0.0, 0.0, 10.0, 11.0, 0.0, 0.0, 20.0, 21.0];
-        let pages = Buffer::new_zeroed(&device, expected.len() * size_of::<f32>());
-        let k = Buffer::from_slice(&device, &[10.0f32, 11.0]);
-        let v = Buffer::from_slice(&device, &[20.0f32, 21.0]);
-        run(&device, &stream, Dtype::Float32, &pages, &k, &v);
-        assert_eq!(pages.read_typed::<f32>(0, expected.len()), expected);
+        let k_values = [
+            -0.0,
+            2.0_f32.powi(-10),
+            2.0_f32.powi(-9),
+            1.0625,
+            1.1875,
+            400.0,
+            448.0,
+            449.0,
+            f32::INFINITY,
+        ];
+        let v_values = k_values.map(|value| -value);
+        let mut expected = vec![0; 4 * k_values.len()];
+        for (index, value) in k_values.into_iter().enumerate() {
+            expected[k_values.len() + index] = bf16_to_fp8_e4m3(f32_to_bf16(value));
+        }
+        for (index, value) in v_values.into_iter().enumerate() {
+            expected[3 * k_values.len() + index] = bf16_to_fp8_e4m3(f32_to_bf16(value));
+        }
+        let pages = Buffer::new_zeroed(&device, expected.len());
+        let k = bf16_buffer(&device, &k_values);
+        let v = bf16_buffer(&device, &v_values);
+        run(&device, &stream, &pages, &k, &v);
+        assert_eq!(pages.read_typed::<u8>(0, expected.len()), expected);
     }
 
-    fn run(device: &Device, stream: &Stream, dtype: Dtype, pages: &Buffer, k: &Buffer, v: &Buffer) {
+    fn run(device: &Device, stream: &Stream, pages: &Buffer, k: &Buffer, v: &Buffer) {
         let req_slots = Buffer::from_slice(device, &[0u32]);
         let flat_token_indices = Buffer::from_slice(device, &[1u32]);
         let page_ids = Buffer::from_slice(device, &[0u32]);
         let config = Config {
             num_kv_heads: 1,
-            head_dim: 2,
+            head_dim: (k.len_bytes() / size_of::<u16>()).try_into().unwrap(),
             page_bytes: pages.len_bytes() as u32,
-            dtype,
+            dtype: Dtype::Bfloat16,
         };
         let shape = Shape {
             num_total_token_writes: 1,
@@ -430,5 +452,15 @@ mod tests {
                 &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, shape.num_total_token_writes),
             )
             .wait();
+    }
+
+    fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
+        Buffer::from_slice(
+            device,
+            &values
+                .iter()
+                .map(|&value| bf16::from_f32(value).to_bits())
+                .collect::<Vec<_>>(),
+        )
     }
 }

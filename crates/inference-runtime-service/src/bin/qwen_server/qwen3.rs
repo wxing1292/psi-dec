@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use inference_executor_core::model::ReplayableDecoderModel;
-use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model;
@@ -24,9 +23,8 @@ use crate::qwen_server::sizing::context_window;
 use crate::rpc::HTTPService;
 use crate::runtime::serve_replay_model;
 
-// Qwen3 has no GDN snapshot to amortize across a large logical block. Two
-// eight-token physical KV pages per layer keep trie granularity small without
-// making each physical page a separate runtime block.
+// Qwen3 has no GDN snapshot to amortize across a large logical block. One
+// 16-token physical KV page per layer keeps trie granularity small.
 const TOKENS_PER_CACHE_BLOCK: usize = 16;
 
 pub fn run() {
@@ -143,11 +141,7 @@ fn build_runtime_config(service_config: &Qwen3Config, model: &Qwen3Executor) -> 
         executor_hibernation_mode: service_config.executor_hibernation_mode(),
         context_window: context_window(text.max_position_embeddings, dspark_num_spec_tokens)?,
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
-        num_kv_heads: text.num_key_value_heads,
-        kv_head_dim: text.head_dim,
-        kv_dtype_bytes: 2,
         num_pages: num_cache_pages,
-        page_bytes: QWEN3_PAGE_SIZE_BYTES,
         cache_lanes: vec![cache_lane],
     })
 }
@@ -174,20 +168,20 @@ mod tests {
 
     #[test]
     fn test_main_cache_lane_uses_no_state_pages() {
-        let lane = main_cache_lane(40 * 1024, 80).unwrap();
+        let lane = main_cache_lane(40 * 1024, 40).unwrap();
 
-        assert_eq!(lane.num_pages_per_kv_block, 80);
+        assert_eq!(lane.num_pages_per_kv_block, 40);
         assert_eq!(lane.num_pages_per_state_block, 0);
-        assert_eq!(lane.block_cache_capacity, 512);
+        assert_eq!(lane.block_cache_capacity, 1024);
     }
 
     #[test]
     fn test_main_cache_lane_reports_dynamic_minimum_pages() {
         assert!(matches!(
-            main_cache_lane(79, 80),
+            main_cache_lane(39, 40),
             Err(Error::InvalidArgument(message))
-                if message.contains("--num-cache-pages=79")
-                    && message.contains("requiring 80 pages")
+                if message.contains("--num-cache-pages=39")
+                    && message.contains("requiring 40 pages")
         ));
     }
 }

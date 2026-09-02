@@ -300,7 +300,7 @@ max_kv_iterations_per_map_task
 num_logical_qk_token_pairs
 ```
 
-The D=256, eight-token-page policy keeps the measured crossover threshold. It rejects a TiledQ candidate when active QK
+The D=256, 16-token-page policy keeps the measured crossover threshold. It rejects a TiledQ candidate when active QK
 token pairs use less than half of its scheduled QK token pairs. It then applies the existing selection score. The score
 is a tuning heuristic. It is not a FLOP, byte, token, or elapsed-time unit.
 
@@ -352,5 +352,5 @@ Metal numerical kernel.
 ## Validation
 
 The implementation must keep registry capability tests, selector crossover tests, ragged-tail tests, metadata ABI
-tests, SingleQ and TiledQ Metal parity tests, the Qwen3.8 D=256 page-eight parity test, and representative one-layer
+tests, SingleQ and TiledQ Metal parity tests, the Qwen3.8 D=256 page-16 parity test, and representative one-layer
 production performance checks.

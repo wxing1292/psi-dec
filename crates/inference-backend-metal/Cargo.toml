@@ -9,6 +9,7 @@ build = "build.rs"
 
 [dependencies]
 block2 = { workspace = true }
+half = { workspace = true }
 libc = { workspace = true }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
@@ -29,7 +30,6 @@ objc2-metal = { workspace = true, features = [
 
 [dev-dependencies]
 criterion = { workspace = true }
-half = { workspace = true }
 inference-executor-core = { path = "../inference-executor-core" }
 
 [[bench]]

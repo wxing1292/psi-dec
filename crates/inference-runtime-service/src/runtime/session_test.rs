@@ -172,11 +172,7 @@ fn new_runtime(max_running_requests: usize) -> (Arc<TestRuntime>, Shutdown) {
             executor_hibernation_mode: ExecutorHibernationMode::Selected,
             context_window: 4096,
             num_tokens_per_cache_block: 1024,
-            num_kv_heads: 1,
-            kv_head_dim: 1,
-            kv_dtype_bytes: 1,
             num_pages: 64 * max_running_requests,
-            page_bytes: 32,
             cache_lanes: vec![CacheLaneRuntimeConfig {
                 num_pages_per_kv_block: 64,
                 num_pages_per_state_block: 0,

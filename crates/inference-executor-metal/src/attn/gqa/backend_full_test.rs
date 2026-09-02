@@ -2,6 +2,10 @@ use std::collections::HashSet;
 use std::mem::size_of;
 
 use half::bf16;
+use inference_backend_metal::components::gqa::fp8::bf16_to_f32;
+use inference_backend_metal::components::gqa::fp8::bf16_to_fp8_e4m3;
+use inference_backend_metal::components::gqa::fp8::f32_to_bf16;
+use inference_backend_metal::components::gqa::fp8::fp8_e4m3_to_bf16;
 use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -107,8 +111,12 @@ fn test_replay_matches_cpu_reference_across_active_counts() {
         let reference = gqa_reference(&core, config, num_active_tokens as usize, &hidden_values, &weights);
         let actual_hidden = read_bf16_values(&next_hidden, reference.output.len());
         assert_close(&actual_hidden, &reference.output, 0.03125);
-        let actual_pages = read_bf16_values(&kv_pages, config.page_bytes as usize / size_of::<u16>());
-        assert_close(&actual_pages, &reference.kv_pages, 0.015625);
+        let actual_pages = kv_pages
+            .read_typed::<u8>(0, config.page_bytes as usize)
+            .into_iter()
+            .map(|bits| bf16_to_f32(fp8_e4m3_to_bf16(bits)))
+            .collect::<Vec<_>>();
+        assert_close(&actual_pages, &reference.kv_pages, 0.0);
     }
 }
 
@@ -211,7 +219,7 @@ fn gqa_reference(
     weights: &FixtureWeights,
 ) -> GQAReference {
     let hidden = &hidden[..num_tokens * core.hidden_dim];
-    let qgkv = quantize_bf16(&quantized_affine_reference(
+    let qgkv = bf16_round_trip(&quantized_affine_reference(
         affine_reference_shape(num_tokens, core.qgkv_dim(), core.hidden_dim),
         hidden,
         &weights.qgkv_weight_values,
@@ -233,22 +241,24 @@ fn gqa_reference(
     }
     let q = rms_norm_rope_reference(&q, num_tokens, NUM_Q_HEADS, &weights.q_norm_values, config);
     let k = rms_norm_rope_reference(&k, num_tokens, NUM_KV_HEADS, &weights.k_norm_values, config);
-    let attention = quantize_bf16(&projected_gqa_reference(
+    let quantized_k = fp8_e4m3_round_trip(&k);
+    let quantized_v = fp8_e4m3_round_trip(&v);
+    let attention = bf16_round_trip(&projected_gqa_reference(
         core,
         GQAReferenceInput {
             cu_tokens: &[0, num_tokens as u32],
             token_indices: &[0],
             q: &q,
-            context_k_by_req: &[&k],
-            context_v_by_req: &[&v],
+            context_k_by_req: &[&quantized_k],
+            context_v_by_req: &[&quantized_v],
         },
     ));
     let gated = attention
         .iter()
         .zip(&g)
-        .map(|(&attention, &gate)| quantize_bf16_value(attention * sigmoid_bf16(gate)))
+        .map(|(&attention, &gate)| bf16_round_trip_value(attention * sigmoid_bf16(gate)))
         .collect::<Vec<_>>();
-    let output = quantize_bf16(&quantized_affine_reference(
+    let output = bf16_round_trip(&quantized_affine_reference(
         affine_reference_shape(num_tokens, core.hidden_dim, core.q_dim()),
         &gated,
         &weights.output_weight_values,
@@ -281,8 +291,8 @@ fn rms_norm_rope_reference(
                 .iter()
                 .zip(norm_weight)
                 .map(|(&value, &weight)| {
-                    let scaled = quantize_bf16_value(value * inv_rms);
-                    quantize_bf16_value(weight * scaled)
+                    let scaled = bf16_round_trip_value(value * inv_rms);
+                    bf16_round_trip_value(weight * scaled)
                 })
                 .collect::<Vec<_>>();
             for dim in 0..rope_half {
@@ -290,8 +300,8 @@ fn rms_norm_rope_reference(
                 let (sin, cos) = theta.sin_cos();
                 let x1 = normalized[dim];
                 let x2 = normalized[dim + rope_half];
-                normalized[dim] = quantize_bf16_value(x1 * cos - x2 * sin);
-                normalized[dim + rope_half] = quantize_bf16_value(x1 * sin + x2 * cos);
+                normalized[dim] = bf16_round_trip_value(x1 * cos - x2 * sin);
+                normalized[dim + rope_half] = bf16_round_trip_value(x1 * sin + x2 * cos);
             }
             output[row_begin..row_begin + HEAD_DIM].copy_from_slice(&normalized);
         }
@@ -300,7 +310,7 @@ fn rms_norm_rope_reference(
 }
 
 fn kv_page_reference(k: &[f32], v: &[f32], config: GQAMetalConfig) -> Vec<f32> {
-    let mut pages = vec![0.0; config.page_bytes as usize / size_of::<u16>()];
+    let mut pages = vec![0.0; config.page_bytes as usize];
     let num_tokens = k.len() / (NUM_KV_HEADS * HEAD_DIM);
     for token_index in 0..num_tokens {
         for head_index in 0..NUM_KV_HEADS {
@@ -308,8 +318,8 @@ fn kv_page_reference(k: &[f32], v: &[f32], config: GQAMetalConfig) -> Vec<f32> {
                 let source = (token_index * NUM_KV_HEADS + head_index) * HEAD_DIM + dim;
                 let k_target = (head_index * NUM_TOKENS_PER_PAGE + token_index) * HEAD_DIM + dim;
                 let v_target = ((NUM_KV_HEADS + head_index) * NUM_TOKENS_PER_PAGE + token_index) * HEAD_DIM + dim;
-                pages[k_target] = k[source];
-                pages[v_target] = v[source];
+                pages[k_target] = bf16_to_f32(fp8_e4m3_to_bf16(bf16_to_fp8_e4m3(f32_to_bf16(k[source]))));
+                pages[v_target] = bf16_to_f32(fp8_e4m3_to_bf16(bf16_to_fp8_e4m3(f32_to_bf16(v[source]))));
             }
         }
     }
@@ -317,12 +327,12 @@ fn kv_page_reference(k: &[f32], v: &[f32], config: GQAMetalConfig) -> Vec<f32> {
 }
 
 fn sigmoid_bf16(value: f32) -> f32 {
-    let absolute = quantize_bf16_value(value.abs());
-    let exponential = quantize_bf16_value((-absolute).exp());
-    let denominator = quantize_bf16_value(1.0 + exponential);
-    let positive = quantize_bf16_value(1.0 / denominator);
+    let absolute = bf16_round_trip_value(value.abs());
+    let exponential = bf16_round_trip_value((-absolute).exp());
+    let denominator = bf16_round_trip_value(1.0 + exponential);
+    let positive = bf16_round_trip_value(1.0 / denominator);
     if value < 0.0 {
-        quantize_bf16_value(1.0 - positive)
+        bf16_round_trip_value(1.0 - positive)
     } else {
         positive
     }
@@ -343,7 +353,7 @@ fn fixture_config() -> GQAMetalConfig {
     GQAMetalConfig {
         group_size: GROUP_SIZE as u32,
         bits: BITS as u32,
-        page_bytes: (2 * NUM_KV_HEADS * NUM_TOKENS_PER_PAGE * HEAD_DIM * size_of::<u16>()) as u32,
+        page_bytes: (2 * NUM_KV_HEADS * NUM_TOKENS_PER_PAGE * HEAD_DIM * size_of::<u8>()) as u32,
         rope_dim: HEAD_DIM as u32,
         norm_eps: NORM_EPS,
         rope_theta: ROPE_THETA,
@@ -379,7 +389,7 @@ fn generated_bf16_values(count: usize, mut state: u32) -> Vec<f32> {
     (0..count)
         .map(|_| {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            quantize_bf16_value(((state >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0)
+            bf16_round_trip_value(((state >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0)
         })
         .collect()
 }
@@ -402,16 +412,40 @@ fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
         .collect()
 }
 
-fn quantize_bf16(values: &[f32]) -> Vec<f32> {
-    values.iter().map(|&value| quantize_bf16_value(value)).collect()
+fn bf16_round_trip(values: &[f32]) -> Vec<f32> {
+    values.iter().map(|&value| bf16_round_trip_value(value)).collect()
 }
 
-fn quantize_bf16_value(value: f32) -> f32 {
-    bf16::from_f32(value).to_f32()
+fn bf16_round_trip_value(value: f32) -> f32 {
+    bf16_to_f32(f32_to_bf16(value))
+}
+
+fn fp8_e4m3_round_trip(values: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|&value| bf16_to_f32(fp8_e4m3_to_bf16(bf16_to_fp8_e4m3(f32_to_bf16(value)))))
+        .collect()
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
+    let mean_abs_error = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .sum::<f32>()
+        / actual.len().max(1) as f32;
+    let max_abs_error = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let mean_abs_tolerance = tolerance * 0.25;
+    assert!(
+        max_abs_error <= tolerance && mean_abs_error <= mean_abs_tolerance,
+        "GQA quality mismatch: max_abs_error={max_abs_error} max_abs_tolerance={tolerance} \
+         mean_abs_error={mean_abs_error} mean_abs_tolerance={mean_abs_tolerance}"
+    );
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
         assert!(
             (actual - expected).abs() <= tolerance,

@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use inference_executor_core::model::ReplayableDecoderModel;
-use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;
@@ -27,7 +26,6 @@ use crate::qwen_server::config::Qwen35Config;
 use crate::qwen_server::config::Qwen35ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::context_window;
-use crate::qwen_server::sizing::kv_dtype_bytes;
 use crate::rpc::HTTPService;
 use crate::runtime::serve_replay_model;
 use crate::specialization::SpecializedWorker;
@@ -264,7 +262,6 @@ fn build_runtime_config(
 ) -> Result<RuntimeConfig> {
     let num_cache_pages = service_config.num_cache_pages();
     let text = &model_config.text_config;
-    let kv_dtype_bytes = kv_dtype_bytes(text.dtype.as_deref())?;
     let num_gqa_pages_per_main_block = model.num_main_lane_gqa_page_ids_per_block();
     let num_gdn_pages_per_main_block = model.num_gdn_state_page_ids_per_block();
     let mtp_gqa_page_ids_per_block = model.num_mtp_gqa_page_ids_per_block();
@@ -296,11 +293,7 @@ fn build_runtime_config(
         executor_hibernation_mode: service_config.executor_hibernation_mode(),
         context_window: context_window(text.max_position_embeddings, block_spec_num_spec_tokens)?,
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
-        num_kv_heads: text.num_key_value_heads,
-        kv_head_dim: text.head_dim,
-        kv_dtype_bytes,
         num_pages: num_cache_pages,
-        page_bytes: QWEN35_PAGE_SIZE_BYTES,
         cache_lanes,
     };
     Ok(runtime_config)

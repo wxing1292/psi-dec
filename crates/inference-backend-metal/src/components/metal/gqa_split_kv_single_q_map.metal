@@ -115,7 +115,7 @@ for (uint kv_iteration_begin = kv_token_begin; kv_iteration_begin < kv_token_end
             scores[local_q_head] = 0.0f;
         }
         for (uint d = 0; d < uint(KV_HEAD_DIM); ++d) {
-            float k = static_cast<float>(k_ptr[d]);
+            const float k = fp8_e4m3_to_bf16(k_ptr[d]);
             for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
                 const device T* q_ptr = q_head_range_ptr + local_q_head * KV_HEAD_DIM;
                 scores[local_q_head] += static_cast<float>(q_ptr[d]) * k;
@@ -207,7 +207,7 @@ for (uint kv_iteration_begin = kv_token_begin; kv_iteration_begin < kv_token_end
                             + (ulong)(((1 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS
                                        + page_token_index)
                                       * KV_HEAD_DIM));
-            float v = static_cast<float>(v_ptr[d]);
+            float v = fp8_e4m3_to_bf16(v_ptr[d]);
             for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
                 iteration_output[local_q_head] +=
                     logits[local_q_head * KV_TOKENS_PER_ITERATION + token_offset] * v;

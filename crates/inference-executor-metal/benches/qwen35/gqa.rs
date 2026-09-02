@@ -11,6 +11,8 @@ use std::time::Instant;
 
 use half::bf16;
 use inference_backend_metal::components::gqa::activation_gate as backend_activation_gate;
+use inference_backend_metal::components::gqa::fp8::bf16_to_f32;
+use inference_backend_metal::components::gqa::fp8::fp8_e4m3_to_bf16;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::qgkv_split as backend_qgkv_split;
 use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
@@ -113,7 +115,7 @@ impl GQAModelProfile {
     }
 
     fn num_tokens_per_page(self) -> u32 {
-        let bytes_per_token = 2 * self.num_kv_heads * self.head_dim * Dtype::Bfloat16.item_size();
+        let bytes_per_token = 2 * self.num_kv_heads * self.head_dim * size_of::<u8>();
         assert!(QWEN35_PAGE_SIZE_BYTES.is_multiple_of(bytes_per_token));
         (QWEN35_PAGE_SIZE_BYTES / bytes_per_token)
             .try_into()
@@ -495,7 +497,7 @@ fn gqa_attention_reference_at(
         flat_token_index * model.q_dim() + q_head_index * model.head_dim,
         model.head_dim,
     );
-    let kv_page_values = kv_pages_buffer.read_typed::<u16>(0, kv_pages_buffer.len_bytes() / size_of::<u16>());
+    let kv_page_values = kv_pages_buffer.read_typed::<u8>(0, kv_pages_buffer.len_bytes());
     let page_id_values = page_ids_buffer.read_typed::<u32>(0, page_ids_buffer.len_bytes() / size_of::<u32>());
     let tokens_per_page = model.num_tokens_per_page() as usize;
     let page_slots = 2 * model.num_kv_heads * tokens_per_page * model.head_dim;
@@ -508,7 +510,7 @@ fn gqa_attention_reference_at(
         let dot = q_values
             .iter()
             .zip(&kv_page_values[k_start..k_start + model.head_dim])
-            .map(|(&q_value, &k_value)| bf16::from_bits(q_value).to_f32() * bf16::from_bits(k_value).to_f32())
+            .map(|(&q_value, &k_value)| bf16::from_bits(q_value).to_f32() * bf16_to_f32(fp8_e4m3_to_bf16(k_value)))
             .sum::<f32>();
         logits.push(dot * (model.head_dim as f32).sqrt().recip());
     }
@@ -524,7 +526,7 @@ fn gqa_attention_reference_at(
             let v_index = page_id * page_slots
                 + ((model.num_kv_heads + kv_head_index) * tokens_per_page + page_token_index) * model.head_dim
                 + dim;
-            ((logit - max_logit).exp() / exp_sum) * bf16::from_bits(kv_page_values[v_index]).to_f32()
+            ((logit - max_logit).exp() / exp_sum) * bf16_to_f32(fp8_e4m3_to_bf16(kv_page_values[v_index]))
         })
         .sum()
 }

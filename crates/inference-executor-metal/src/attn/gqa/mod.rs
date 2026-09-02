@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 
 use self::backend::GQAMetalConfig;
@@ -22,7 +24,7 @@ fn gqa_sdpa_config(
     let io_bytes_per_token = u64::from(num_kv_heads)
         .checked_mul(u64::from(head_dim))
         .and_then(|value| value.checked_mul(2))
-        .and_then(|value| value.checked_mul(config.io_dtype.item_size() as u64))
+        .and_then(|value| value.checked_mul(size_of::<u8>() as u64))
         .expect("GQA KV-cache bytes per token must fit u64");
     assert_eq!(
         u64::from(config.page_bytes) % io_bytes_per_token,

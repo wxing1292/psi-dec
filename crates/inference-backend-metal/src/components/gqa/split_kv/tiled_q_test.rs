@@ -4,6 +4,10 @@ use inference_executor_core::attn::gqa::reference::GQAReferenceInput;
 use inference_executor_core::attn::gqa::reference::projected_gqa_reference;
 
 use super::*;
+use crate::components::gqa::fp8::bf16_to_f32;
+use crate::components::gqa::fp8::bf16_to_fp8_e4m3;
+use crate::components::gqa::fp8::f32_to_bf16;
+use crate::components::gqa::fp8::fp8_e4m3_to_bf16;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::Stream;
@@ -31,7 +35,7 @@ fn test_replay_bucketing() {
     let k_values = generated_bf16_values(kv_values_per_kind, 0x4751_4155);
     let v_values = generated_bf16_values(kv_values_per_kind, 0x4751_4156);
     let q = bf16_buffer(&device, &q_values);
-    let kv_pages = bf16_buffer(&device, &kv_page_values(config, &k_values, &v_values));
+    let kv_pages = Buffer::from_slice(&device, &kv_page_values(config, &k_values, &v_values));
     let req_slots = Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize, Dtype::Uint32);
     let page_ids = Buffer::from_slice(&device, &[0_u32]);
     let visible_kv_token_ranges =
@@ -112,14 +116,16 @@ fn test_replay_bucketing() {
             )
             .wait();
 
+        let quantized_k = fp8_e4m3_round_trip(&k_values[..num_active_tokens * kv_values_per_token]);
+        let quantized_v = fp8_e4m3_round_trip(&v_values[..num_active_tokens * kv_values_per_token]);
         let expected = projected_gqa_reference(
             &fixture_core(config),
             GQAReferenceInput {
                 cu_tokens: &[0, num_active_tokens as u32],
                 token_indices: &[0],
                 q: &q_values[..num_active_tokens * q_values_per_token],
-                context_k_by_req: &[&k_values[..num_active_tokens * kv_values_per_token]],
-                context_v_by_req: &[&v_values[..num_active_tokens * kv_values_per_token]],
+                context_k_by_req: &[&quantized_k],
+                context_v_by_req: &[&quantized_v],
             },
         );
         let actual = read_bf16_values(&output, num_active_tokens * q_values_per_token);
@@ -167,7 +173,7 @@ fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (Config, Shape) {
             num_kv_heads: 1,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            page_bytes: 2 * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size() as u32,
+            page_bytes: 2 * num_tokens_per_page * head_dim * size_of::<u8>() as u32,
             dtype: Dtype::Bfloat16,
             page_table_layout: PageTableLayout {
                 num_req_slots: 1,
@@ -199,12 +205,12 @@ fn fixture_core(config: Config) -> GQACore {
     )
 }
 
-fn kv_page_values(config: Config, k: &[f32], v: &[f32]) -> Vec<f32> {
+fn kv_page_values(config: Config, k: &[f32], v: &[f32]) -> Vec<u8> {
     assert_eq!(k.len(), v.len());
     let values_per_token = config.num_kv_heads as usize * config.head_dim as usize;
     let num_tokens_per_page = config.num_tokens_per_page() as usize;
     assert_eq!(k.len(), num_tokens_per_page * values_per_token);
-    let mut page = vec![0.0; 2 * k.len()];
+    let mut page = vec![0_u8; 2 * k.len()];
     for token in 0..num_tokens_per_page {
         for kv_head in 0..config.num_kv_heads as usize {
             for dim in 0..config.head_dim as usize {
@@ -213,12 +219,19 @@ fn kv_page_values(config: Config, k: &[f32], v: &[f32]) -> Vec<f32> {
                 let v_target = ((config.num_kv_heads as usize + kv_head) * num_tokens_per_page + token)
                     * config.head_dim as usize
                     + dim;
-                page[k_target] = k[source];
-                page[v_target] = v[source];
+                page[k_target] = bf16_to_fp8_e4m3(f32_to_bf16(k[source]));
+                page[v_target] = bf16_to_fp8_e4m3(f32_to_bf16(v[source]));
             }
         }
     }
     page
+}
+
+fn fp8_e4m3_round_trip(values: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|&value| bf16_to_f32(fp8_e4m3_to_bf16(bf16_to_fp8_e4m3(f32_to_bf16(value)))))
+        .collect()
 }
 
 fn generated_bf16_values(count: usize, random_seed: u32) -> Vec<f32> {
@@ -249,6 +262,17 @@ fn read_bf16_values(buffer: &Buffer, count: usize) -> Vec<f32> {
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
+    let mean_abs_error = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .sum::<f32>()
+        / actual.len().max(1) as f32;
+    let mean_abs_tolerance = tolerance * 0.25;
+    assert!(
+        mean_abs_error <= mean_abs_tolerance,
+        "GQA TiledQ mean mismatch: mean_abs_error={mean_abs_error} mean_abs_tolerance={mean_abs_tolerance}"
+    );
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
         assert!(
             (actual - expected).abs() <= tolerance,

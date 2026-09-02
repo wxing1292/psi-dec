@@ -121,8 +121,9 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
   The timed buffer-to-file case overwrites the same range with `F_NOCACHE` enabled and calls `sync_all` during each
   iteration.
   File creation, file opening, pattern generation, correctness validation, and cleanup remain outside all timed cases.
-- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It derives KV
-  tokens per page from the production 32 KiB page size and the selected model profile. It can run an explicit untimed
+- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It derives FP8
+  E4M3FN KV tokens per page from the production 32 KiB page size and the selected model profile. It can run an explicit
+  untimed
   `--validate-split-kv-tiled-q` comparison. `--max-tokens` fixes the segment-metadata capacity and the current
   active-partial-state scheduling budget for both candidates. The default is the server default of 128. Each case
   reports the active KV splits, fixed-TQ reserved partial slots, active partial states, and segment distribution.
@@ -250,9 +251,13 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
   Each result includes input and output FNV-1a fingerprints.
   A Prefill result uses an untimed deterministic Decode probe for its output fingerprint.
   The target verifies case-order independence and Prefill chunk decomposition before measurement.
-  It also compares Decode after alternate context chunking when the capacity permits the comparison.
+  It also compares a single-step Decode probe after alternate context chunking when the capacity permits the
+  comparison. The single step isolates context construction from autoregressive sampling feedback.
   Repeated trajectories and case-order checks require exact token and probability bits.
-  Chunk-decomposition checks require exact tokens and an absolute sampled-probability difference of at most `0.01`.
+  Chunk-decomposition checks use an untimed greedy Decode probe with `temperature=0` and `top_p=0`.
+  They require exact next-token identity.
+  This probe separates execution chunking from stochastic sampling sensitivity.
+  Measured trajectories and exact repeat checks continue to use the requested sampling configuration.
   Each result reports the replay-cache-cold operation separately from steady-state samples.
   Result timing separates context rebuild, prepare, record, Main replay, Main sampling replay, Spec replay, finish, and
   commit feedback.
@@ -338,7 +343,7 @@ cargo bench -p inference-executor-metal --bench qwen35_vanilla_prefill_decode --
   --model-dir <model-dir> --cases prefill,decode \
   --contexts 7 --prefill-tokens 2 --decode-tokens 2 \
   --num-reqs 1 --max-tokens 2 --max-tokens-per-request 2 \
-  --num-tokens-per-block 8 --num-cache-pages 16384 \
+  --num-tokens-per-block 2048 --num-cache-pages 16384 \
   --iters 1 --warmup-iters 1 --runs 1
 ```
 

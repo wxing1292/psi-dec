@@ -1,10 +1,13 @@
 use std::hint::black_box;
+use std::mem::size_of;
 
 use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use half::bf16;
+use inference_backend_metal::components::gqa::fp8::bf16_to_fp8_e4m3;
+use inference_backend_metal::components::gqa::fp8::f32_to_bf16;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
@@ -81,7 +84,7 @@ impl GQAFixture {
             num_kv_heads: GQA_NUM_KV_HEADS,
             head_dim: GQA_HEAD_DIM,
             scale: 1.0 / (GQA_HEAD_DIM as f32).sqrt(),
-            page_bytes: 2 * GQA_NUM_KV_HEADS * GQA_TOKENS_PER_PAGE * GQA_HEAD_DIM * Dtype::Bfloat16.item_size() as u32,
+            page_bytes: 2 * GQA_NUM_KV_HEADS * GQA_TOKENS_PER_PAGE * GQA_HEAD_DIM * size_of::<u8>() as u32,
             page_table_layout,
             dtype: Dtype::Bfloat16,
         };
@@ -104,12 +107,11 @@ impl GQAFixture {
         shape.validate(config);
 
         let q = bf16_pattern_buffer(device, config.num_output_values(shape), 0.003);
-        let kv_pages = bf16_pattern_buffer(
+        let kv_pages = fp8_pattern_buffer(
             device,
             page_table_layout.num_req_slots as usize
                 * page_table_layout.num_blocks as usize
-                * config.page_bytes as usize
-                / Dtype::Bfloat16.item_size(),
+                * config.page_bytes as usize,
             0.002,
         );
         let req_slots = Buffer::from_slice(device, &(0..num_tokens).collect::<Vec<_>>());
@@ -224,6 +226,13 @@ fn bf16_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {
         })
         .collect::<Vec<_>>();
     Buffer::from_slice(device, &v)
+}
+
+fn fp8_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {
+    let values = (0..len)
+        .map(|index| bf16_to_fp8_e4m3(f32_to_bf16(((index % 251) as f32 - 125.0) * scale)))
+        .collect::<Vec<_>>();
+    Buffer::from_slice(device, &values)
 }
 
 criterion_group!(benches, bench_gqa_split_kv);

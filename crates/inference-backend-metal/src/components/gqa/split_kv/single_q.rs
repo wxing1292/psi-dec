@@ -114,7 +114,7 @@ impl Config {
             .num_kv_heads
             .checked_mul(self.head_dim)
             .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(self.dtype.item_size().try_into().expect("dtype size must fit u32")))
+            .and_then(|bytes| bytes.checked_mul(size_of::<u8>().try_into().expect("FP8 size must fit u32")))
             .expect("GQA SDPA K/V bytes per token must fit u32");
         assert!(
             self.page_bytes.is_multiple_of(kv_bytes_per_token),
@@ -385,8 +385,18 @@ fn gqa_split_kv_single_q_map_source(constants: KernelConstants, shape: Shape) ->
 #include <metal_stdlib>
 using namespace metal;
 typedef bfloat bfloat16_t;
+inline bfloat16_t fp8_e4m3_to_bf16(uchar bits) {{
+    const uint sign = uint(bits & uchar(0x80)) << 24;
+    const uint exponent = (uint(bits) >> 3) & 0x0fu;
+    const uint mantissa = uint(bits) & 0x07u;
+    const float normal = as_type<float>(sign | ((exponent + 120u) << 23) | (mantissa << 20));
+    const float subnormal_magnitude = float(mantissa) * (1.0f / 512.0f);
+    const float subnormal = sign == 0u ? subnormal_magnitude : -subnormal_magnitude;
+    const float finite = select(normal, subnormal, exponent == 0u);
+    return bfloat16_t(select(finite, as_type<float>(sign | 0x7fc00000u), exponent == 15u && mantissa == 7u));
+}}
 #define T {dtype}
-#define KV_T {dtype}
+#define KV_T uchar
 #define NUM_Q_HEADS {num_q_heads}
 #define NUM_KV_HEADS {num_kv_heads}
 #define KV_HEAD_DIM {head_dim}

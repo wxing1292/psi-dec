@@ -242,11 +242,7 @@ fn new_runtime(context_window: usize) -> Arc<TestRuntime> {
             executor_hibernation_mode: ExecutorHibernationMode::Selected,
             context_window,
             num_tokens_per_cache_block: 1024,
-            num_kv_heads: 1,
-            kv_head_dim: 1,
-            kv_dtype_bytes: 1,
             num_pages: 64,
-            page_bytes: 32,
             cache_lanes: vec![CacheLaneRuntimeConfig {
                 num_pages_per_kv_block: 64,
                 num_pages_per_state_block: 0,

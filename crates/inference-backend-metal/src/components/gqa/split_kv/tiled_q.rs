@@ -136,9 +136,9 @@ impl Config {
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         let tiled_q_profile = (self.head_dim, self.num_tokens_per_page());
         assert!(
-            matches!(tiled_q_profile, (128, 8) | (256, 8 | 16)),
-            "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8), (256, 8), and (256, 16), \
-             got {tiled_q_profile:?}"
+            matches!(tiled_q_profile, (128, 8 | 16) | (256, 8 | 16 | 32)),
+            "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8), (128, 16), (256, 8), \
+             (256, 16), and (256, 32), got {tiled_q_profile:?}"
         );
         assert!(self.scale > 0.0);
         assert_eq!(self.dtype, Dtype::Bfloat16, "GQA SplitKV TiledQ specializes bf16");
@@ -150,7 +150,7 @@ impl Config {
             .num_kv_heads
             .checked_mul(self.head_dim)
             .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(self.dtype.item_size().try_into().expect("dtype size must fit u32")))
+            .and_then(|bytes| bytes.checked_mul(size_of::<u8>().try_into().expect("FP8 size must fit u32")))
             .expect("GQA SplitKV TiledQ K/V bytes per token must fit u32");
         assert!(self.page_bytes.is_multiple_of(kv_bytes_per_token));
         self.page_bytes / kv_bytes_per_token

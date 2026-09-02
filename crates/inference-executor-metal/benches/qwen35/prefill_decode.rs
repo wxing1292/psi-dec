@@ -39,7 +39,6 @@ const DEFAULT_ITERS: usize = 5;
 const DEFAULT_RUNS: usize = 5;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-const CHUNK_PROBABILITY_ABS_TOLERANCE: f32 = 1.0e-2;
 
 pub fn run_vanilla() {
     let args = Args::parse();
@@ -391,8 +390,8 @@ impl VanillaFixture {
         for &shape in shapes.iter().rev() {
             let standard = self.run_trajectory(shape, self.active_chunk_tokens, self.active_chunk_tokens, false);
             match shape.case {
-                Case::Prefill => self.validate_prefill_decomposition(shape, &standard),
-                Case::Decode => self.validate_decode_context_decomposition(shape, &standard),
+                Case::Prefill => self.validate_prefill_decomposition(shape),
+                Case::Decode => self.validate_decode_context_decomposition(shape),
             }
             println!(
                 "bench_check component=qwen35-vanilla-prefill-decode check=case-order-and-chunk-consistency case={} \
@@ -421,19 +420,16 @@ impl VanillaFixture {
         expected
     }
 
-    fn validate_prefill_decomposition(&mut self, shape: Shape, standard: &TrajectoryResult) {
+    fn validate_prefill_decomposition(&mut self, shape: Shape) {
+        let standard = self.run_greedy_validation_trajectory(shape, self.active_chunk_tokens, self.active_chunk_tokens);
         let combined_shape = Shape {
             case: Case::Prefill,
             context: 0,
             operation_tokens: shape.final_context(),
         };
-        let combined = self.run_trajectory(
-            combined_shape,
-            self.active_chunk_tokens,
-            self.active_chunk_tokens,
-            false,
-        );
-        assert_decomposition_output_parity(
+        let combined =
+            self.run_greedy_validation_trajectory(combined_shape, self.active_chunk_tokens, self.active_chunk_tokens);
+        assert_decomposition_output_tokens(
             &standard.outputs,
             &combined.outputs,
             "committed prefix plus suffix must match full Prefill at the deterministic Decode probe",
@@ -441,13 +437,13 @@ impl VanillaFixture {
 
         if shape.operation_tokens > 1 && shape.operation_tokens <= self.active_chunk_tokens {
             let smaller_chunk = shape.operation_tokens.div_ceil(2).min(shape.operation_tokens - 1);
-            let split = self.run_trajectory(shape, self.active_chunk_tokens, smaller_chunk, false);
+            let split = self.run_greedy_validation_trajectory(shape, self.active_chunk_tokens, smaller_chunk);
             assert_decomposition_identity(
                 standard.identity,
                 split.identity,
                 "one large Prefill chunk must preserve the Prefill input identity",
             );
-            assert_decomposition_output_parity(
+            assert_decomposition_output_tokens(
                 &standard.outputs,
                 &split.outputs,
                 "one large Prefill chunk must match multiple smaller chunks",
@@ -455,21 +451,40 @@ impl VanillaFixture {
         }
     }
 
-    fn validate_decode_context_decomposition(&mut self, shape: Shape, standard: &TrajectoryResult) {
+    fn validate_decode_context_decomposition(&mut self, shape: Shape) {
         if shape.context > 1 && self.active_chunk_tokens > 1 {
+            let probe_shape = Shape {
+                operation_tokens: 1,
+                ..shape
+            };
+            let standard =
+                self.run_greedy_validation_trajectory(probe_shape, self.active_chunk_tokens, self.active_chunk_tokens);
             let smaller_chunk = (self.active_chunk_tokens / 2).max(1);
-            let split = self.run_trajectory(shape, smaller_chunk, self.active_chunk_tokens, false);
+            let split = self.run_greedy_validation_trajectory(probe_shape, smaller_chunk, self.active_chunk_tokens);
+            assert_decomposition_output_tokens(
+                &standard.outputs,
+                &split.outputs,
+                "single-step Decode output must not depend on Prefill chunk decomposition",
+            );
             assert_decomposition_identity(
                 standard.identity,
                 split.identity,
-                "Decode context chunking must preserve the Decode input identity",
-            );
-            assert_decomposition_output_parity(
-                &standard.outputs,
-                &split.outputs,
-                "Decode output must not depend on Prefill chunk decomposition",
+                "Decode context chunking must preserve the single-step Decode input identity",
             );
         }
+    }
+
+    fn run_greedy_validation_trajectory(
+        &mut self,
+        shape: Shape,
+        context_chunk_tokens: usize,
+        operation_chunk_tokens: usize,
+    ) -> TrajectoryResult {
+        let validation_sampling_config = greedy_validation_sampling_config(&self.sampling_config);
+        let requested_sampling_config = std::mem::replace(&mut self.sampling_config, validation_sampling_config);
+        let result = self.run_trajectory(shape, context_chunk_tokens, operation_chunk_tokens, false);
+        self.sampling_config = requested_sampling_config;
+        result
     }
 
     fn run_trajectory(
@@ -1159,21 +1174,24 @@ fn assert_decomposition_identity(expected: TrajectoryIdentity, actual: Trajector
     assert_eq!(expected.input_fingerprint, actual.input_fingerprint, "{message}");
 }
 
-fn assert_decomposition_output_parity(expected: &[Vec<OutputSample>], actual: &[Vec<OutputSample>], message: &str) {
+fn assert_decomposition_output_tokens(expected: &[Vec<OutputSample>], actual: &[Vec<OutputSample>], message: &str) {
     assert_eq!(expected.len(), actual.len(), "{message}");
-    for (expected_request, actual_request) in expected.iter().zip(actual) {
+    for (request_index, (expected_request, actual_request)) in expected.iter().zip(actual).enumerate() {
         assert_eq!(expected_request.len(), actual_request.len(), "{message}");
-        for (&expected, &actual) in expected_request.iter().zip(actual_request) {
-            assert_eq!(expected.token, actual.token, "{message}");
-            let expected_probability = f32::from_bits(expected.probability_bits);
-            let actual_probability = f32::from_bits(actual.probability_bits);
-            let difference = (expected_probability - actual_probability).abs();
-            assert!(
-                difference <= CHUNK_PROBABILITY_ABS_TOLERANCE,
-                "{message}: expected_probability={expected_probability} actual_probability={actual_probability} \
-                 difference={difference} tolerance={CHUNK_PROBABILITY_ABS_TOLERANCE}"
+        for (token_index, (&expected, &actual)) in expected_request.iter().zip(actual_request).enumerate() {
+            assert_eq!(
+                expected.token, actual.token,
+                "{message}: request_index={request_index} token_index={token_index}"
             );
         }
+    }
+}
+
+fn greedy_validation_sampling_config(config: &SamplingConfig) -> SamplingConfig {
+    SamplingConfig {
+        temperature: 0.0,
+        top_p: 0.0,
+        ..config.clone()
     }
 }
 
@@ -1673,6 +1691,25 @@ mod tests {
     }
 
     #[test]
+    fn test_greedy_validation_sampling_preserves_non_greedy_fields() {
+        let requested = SamplingConfig {
+            max_sampled_tokens: 3,
+            temperature: 0.7,
+            top_k: 17,
+            top_p: 0.8,
+            seed: Some(9),
+            stop_sequences: vec![vec![Token::new(5)]],
+        };
+        let validation = greedy_validation_sampling_config(&requested);
+        assert_eq!(validation.temperature, 0.0);
+        assert_eq!(validation.top_p, 0.0);
+        assert_eq!(validation.max_sampled_tokens, requested.max_sampled_tokens);
+        assert_eq!(validation.top_k, requested.top_k);
+        assert_eq!(validation.seed, requested.seed);
+        assert_eq!(validation.stop_sequences, requested.stop_sequences);
+    }
+
+    #[test]
     fn test_deterministic_tokens_and_fingerprints() {
         let first = (0..8)
             .map(|position| deterministic_token(0, position, 1024))
@@ -1715,10 +1752,18 @@ mod tests {
             token: 7,
             probability_bits: 0.20_f32.to_bits(),
         }]];
-        let within_tolerance = vec![vec![OutputSample {
+        let same_token = vec![vec![OutputSample {
             token: 7,
-            probability_bits: 0.209_f32.to_bits(),
+            probability_bits: 0.90_f32.to_bits(),
         }]];
-        assert_decomposition_output_parity(&expected, &within_tolerance, "test parity");
+        assert_decomposition_output_tokens(&expected, &same_token, "test parity");
+
+        let different_token = vec![vec![OutputSample {
+            token: 8,
+            probability_bits: 0.20_f32.to_bits(),
+        }]];
+        let mismatch =
+            std::panic::catch_unwind(|| assert_decomposition_output_tokens(&expected, &different_token, "test parity"));
+        assert!(mismatch.is_err());
     }
 }

@@ -386,16 +386,16 @@ One lifecycle owner stops both listeners in these conditions:
 The service rejects zero, use with another Spec type, or an incomplete Spec checkpoint argument pair.
 For a Main-only run, omit both Spec checkpoint arguments and `--num-spec-tokens`.
 
-Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 256K pages. The Qwen3-14B geometry stores eight
+Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 384K pages. The Qwen3-14B geometry stores 16
 tokens in one physical page.
 
-Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 3,276 complete blocks. These
-blocks contain 52,416 resident tokens in aggregate.
+Its 16-token logical cache block uses 40 pages across 40 layers. Thus, the default holds 9,830 complete blocks. These
+blocks contain 157,280 resident tokens in aggregate.
 
 When DSpark or DFlash2 is enabled, the executor adds persistent Spec history pages to the same logical block.
 The page count depends on the selected Spec layer and KV geometry.
 
-Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 256K shared pages.
+Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 384K shared pages.
 MTP step K adds K logical KV cache lanes to the Main lane.
 All lanes allocate from the same shared physical-page arena.
 

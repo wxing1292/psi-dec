@@ -3,7 +3,6 @@ use std::sync::Arc;
 use clap::Parser;
 use inference_executor_core::model::EncoderExecutorLifecycle;
 use inference_executor_core::model::ReplayableDecoderModel;
-use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_asr::QWEN3_ASR_AUDIO_RESOURCE_TYPE;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
@@ -109,11 +108,7 @@ fn build_runtime_config(service_config: &Qwen3ASRConfig, model: &Qwen3Executor) 
         executor_hibernation_mode: service_config.executor_hibernation_mode(),
         context_window: context_window(text.max_position_embeddings, 0)?,
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
-        num_kv_heads: text.num_key_value_heads,
-        kv_head_dim: text.head_dim,
-        kv_dtype_bytes: 2,
         num_pages: num_cache_pages,
-        page_bytes: QWEN3_PAGE_SIZE_BYTES,
         cache_lanes: vec![CacheLaneRuntimeConfig {
             num_pages_per_kv_block,
             num_pages_per_state_block: 0,

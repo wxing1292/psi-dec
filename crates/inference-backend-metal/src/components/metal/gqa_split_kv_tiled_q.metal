@@ -25,14 +25,22 @@ typedef bfloat bfloat16_t;
 // A sentinel Map task template returns without writing any partial output or
 // statistics.
 
-template <int NBYTES> struct LoadUnit;
-template <> struct LoadUnit<16> { using type = uint4; };
-
 inline ushort2 frag_coord(ushort lane_id) {
     const ushort qid = lane_id / 4;
     const ushort row = (qid & 4) + (lane_id / 2) % 4;
     const ushort col = (qid & 2) * 2 + (lane_id % 2) * 2;
     return ushort2{col, row};
+}
+
+inline bfloat16_t fp8_e4m3_to_bf16(uchar bits) {
+    const uint sign = uint(bits & uchar(0x80)) << 24;
+    const uint exponent = (uint(bits) >> 3) & 0x0fu;
+    const uint mantissa = uint(bits) & 0x07u;
+    const float normal = as_type<float>(sign | ((exponent + 120u) << 23) | (mantissa << 20));
+    const float subnormal_magnitude = float(mantissa) * (1.0f / 512.0f);
+    const float subnormal = sign == 0u ? subnormal_magnitude : -subnormal_magnitude;
+    const float finite = select(normal, subnormal, exponent == 0u);
+    return bfloat16_t(select(finite, as_type<float>(sign | 0x7fc00000u), exponent == 15u && mantissa == 7u));
 }
 
 struct FragMax {
@@ -52,7 +60,7 @@ inline float frag_row_reduce(float v) {
 
 kernel void gqa_split_kv_tiled_q_map(
     device const bfloat16_t* q [[buffer(0)]],
-    device const bfloat16_t* kv_pages [[buffer(1)]],
+    device const uchar* kv_pages [[buffer(1)]],
     device const uint* req_slots [[buffer(2)]],
     device const uint* page_ids [[buffer(3)]],
     device const uint* visible_kv_token_ranges [[buffer(4)]],
@@ -165,10 +173,6 @@ kernel void gqa_split_kv_tiled_q_map(
         (kv_token_end - kv_token_begin + uint(KV_TOKENS_PER_ITERATION - 1)) / uint(KV_TOKENS_PER_ITERATION);
     for (uint kv_iteration_index = 0; kv_iteration_index < num_kv_iterations; ++kv_iteration_index) {
         const uint kv_iteration_begin = kv_token_begin + kv_iteration_index * uint(KV_TOKENS_PER_ITERATION);
-        constexpr int LOAD_BYTES = 16;
-        constexpr int LOAD_VALUES = LOAD_BYTES / int(sizeof(bfloat16_t));
-        using Load = typename LoadUnit<LOAD_BYTES>::type;
-        static_assert(LEADING_DIM % LOAD_VALUES == 0);
         for (uint kv_token_offset = simdgroup_index; kv_token_offset < uint(KV_TOKENS_PER_ITERATION);
              kv_token_offset += uint(NUM_SIMDGROUPS)) {
             const uint kv_token_index = kv_iteration_begin + kv_token_offset;
@@ -182,26 +186,23 @@ kernel void gqa_split_kv_tiled_q_map(
                       * (ulong)NUM_BLOCKS + (ulong)block_index)
                      * (ulong)NUM_PAGE_IDS_PER_BLOCK) + (ulong)page_id_index;
                 const ulong page_id = (ulong)page_ids[page_table_index];
-                const ulong page_base = page_id * ((ulong)PAGE_BYTES / sizeof(bfloat16_t));
-                const device bfloat16_t* k = kv_pages + page_base
+                const ulong page_base = page_id * (ulong)PAGE_BYTES;
+                const device uchar* k = kv_pages + page_base
                     + (ulong)(((0 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS_PER_PAGE + page_token_index) * HEAD_DIM);
-                const device bfloat16_t* v = kv_pages + page_base
+                const device uchar* v = kv_pages + page_base
                     + (ulong)(((1 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS_PER_PAGE + page_token_index) * HEAD_DIM);
                 #pragma unroll
-                for (uint dim = lane * uint(LOAD_VALUES); dim < uint(HEAD_DIM);
-                     dim += uint(NUM_SIMD_LANES * LOAD_VALUES)) {
-                    *((threadgroup Load*)&k_shared[kv_token_offset * LEADING_DIM + dim]) =
-                        *((const device Load*)(k + dim));
-                    *((threadgroup Load*)&v_shared[kv_token_offset * LEADING_DIM + dim]) =
-                        *((const device Load*)(v + dim));
+                for (uint dim = lane; dim < uint(HEAD_DIM); dim += uint(NUM_SIMD_LANES)) {
+                    k_shared[kv_token_offset * LEADING_DIM + dim] =
+                        fp8_e4m3_to_bf16(k[dim]);
+                    v_shared[kv_token_offset * LEADING_DIM + dim] =
+                        fp8_e4m3_to_bf16(v[dim]);
                 }
             } else {
-                const Load zero = {};
                 #pragma unroll
-                for (uint dim = lane * uint(LOAD_VALUES); dim < uint(HEAD_DIM);
-                     dim += uint(NUM_SIMD_LANES * LOAD_VALUES)) {
-                    *((threadgroup Load*)&k_shared[kv_token_offset * LEADING_DIM + dim]) = zero;
-                    *((threadgroup Load*)&v_shared[kv_token_offset * LEADING_DIM + dim]) = zero;
+                for (uint dim = lane; dim < uint(HEAD_DIM); dim += uint(NUM_SIMD_LANES)) {
+                    k_shared[kv_token_offset * LEADING_DIM + dim] = bfloat16_t(0.0f);
+                    v_shared[kv_token_offset * LEADING_DIM + dim] = bfloat16_t(0.0f);
                 }
             }
         }

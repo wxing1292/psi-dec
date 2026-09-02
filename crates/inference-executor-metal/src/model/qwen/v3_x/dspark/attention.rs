@@ -1,3 +1,4 @@
+use std::mem::size_of;
 use std::rc::Rc;
 
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
@@ -255,7 +256,7 @@ pub fn qwen3x_dspark_gqa_sdpa_config(
     let page_bytes = to_u32("Qwen3x DSpark GQA page_bytes", page_bytes)?;
     let kv_bytes_per_token = num_kv_heads
         .checked_mul(head_dim)
-        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| value.checked_mul(2 * size_of::<u8>() as u32))
         .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark GQA KV bytes per token must fit u32"))?;
     if !page_bytes.is_multiple_of(kv_bytes_per_token) {
         return Err(ModelExecutorError::custom(
@@ -403,7 +404,7 @@ mod tests {
         assert_eq!(sdpa.num_q_heads, 4);
         assert_eq!(sdpa.num_kv_heads, 1);
         assert_eq!(sdpa.head_dim, 8);
-        assert_eq!(sdpa.tokens_per_page, 1024);
+        assert_eq!(sdpa.tokens_per_page, 2048);
     }
 
     #[test]

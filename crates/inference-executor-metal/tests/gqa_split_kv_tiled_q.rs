@@ -1,6 +1,7 @@
 use std::mem::size_of;
 
 use half::bf16;
+use inference_backend_metal::components::gqa::fp8;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
@@ -28,7 +29,7 @@ fn test_fixed() {
 
 #[test]
 fn test_qwen38_27b_profile() {
-    run_case(&[16], 6, 256, 8, 9);
+    run_case(&[16], 6, 256, 16, 17);
 }
 
 #[test]
@@ -43,7 +44,7 @@ fn test_multiple_q_token_ranges() {
 
 #[test]
 fn test_qwen3_profile() {
-    run_case(&[1, 4, 8, 13], 5, 128, 8, 9);
+    run_case(&[1, 4, 8, 13], 5, 128, 16, 17);
 }
 
 #[test]
@@ -56,7 +57,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     let num_tokens_per_page = 8usize;
     let num_total_tokens = 16usize;
     let num_blocks = 2usize;
-    let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
+    let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * size_of::<u8>();
     let config = backend_tiled_q::Config {
         num_q_heads: num_q_heads as u32,
         num_kv_heads: num_kv_heads as u32,
@@ -86,11 +87,11 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
         .collect::<Vec<_>>();
     let k_f32 = k_values
         .iter()
-        .map(|value| bf16::from_f32(*value).to_f32())
+        .map(|&value| fp8::bf16_to_f32(fp8::fp8_e4m3_to_bf16(fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value)))))
         .collect::<Vec<_>>();
     let v_f32 = v_values
         .iter()
-        .map(|value| bf16::from_f32(*value).to_f32())
+        .map(|&value| fp8::bf16_to_f32(fp8::fp8_e4m3_to_bf16(fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value)))))
         .collect::<Vec<_>>();
     let q_f32 = q_bf16
         .iter()
@@ -103,12 +104,12 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
         kv_page_values.extend(
             k_values[start..end]
                 .iter()
-                .map(|value| bf16::from_f32(*value).to_bits()),
+                .map(|&value| fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value))),
         );
         kv_page_values.extend(
             v_values[start..end]
                 .iter()
-                .map(|value| bf16::from_f32(*value).to_bits()),
+                .map(|&value| fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value))),
         );
     }
 
@@ -263,7 +264,7 @@ fn run_case(
     let num_tokens = num_tokens_per_req.iter().sum::<usize>();
     let num_blocks =
         (start_token_index + num_tokens_per_req.iter().copied().max().unwrap()).div_ceil(num_tokens_per_page);
-    let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
+    let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * size_of::<u8>();
     let q_values = pattern(num_tokens * num_q_heads * head_dim, 29, 0.015625);
     let mut context_k_values_by_req = Vec::new();
     let mut context_v_values_by_req = Vec::new();
@@ -275,8 +276,16 @@ fn run_case(
         for block_index in 0..num_blocks {
             let start = block_index * num_tokens_per_page * head_dim;
             let end = start + num_tokens_per_page * head_dim;
-            kv_page_values.extend(k[start..end].iter().map(|value| bf16::from_f32(*value).to_bits()));
-            kv_page_values.extend(v[start..end].iter().map(|value| bf16::from_f32(*value).to_bits()));
+            kv_page_values.extend(
+                k[start..end]
+                    .iter()
+                    .map(|&value| fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value))),
+            );
+            kv_page_values.extend(
+                v[start..end]
+                    .iter()
+                    .map(|&value| fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value))),
+            );
         }
         context_k_values_by_req.push(k);
         context_v_values_by_req.push(v);
@@ -360,7 +369,7 @@ fn run_case(
         .iter()
         .map(|k| {
             k.iter()
-                .map(|value| bf16::from_f32(*value).to_f32())
+                .map(|&value| fp8::bf16_to_f32(fp8::fp8_e4m3_to_bf16(fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value)))))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -368,7 +377,7 @@ fn run_case(
         .iter()
         .map(|v| {
             v.iter()
-                .map(|value| bf16::from_f32(*value).to_f32())
+                .map(|&value| fp8::bf16_to_f32(fp8::fp8_e4m3_to_bf16(fp8::bf16_to_fp8_e4m3(fp8::f32_to_bf16(value)))))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();

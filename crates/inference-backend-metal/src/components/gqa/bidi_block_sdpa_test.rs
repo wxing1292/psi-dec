@@ -1,6 +1,12 @@
+use std::mem::size_of;
+
 use half::bf16;
 
 use super::*;
+use crate::components::gqa::fp8::bf16_to_f32;
+use crate::components::gqa::fp8::bf16_to_fp8_e4m3;
+use crate::components::gqa::fp8::f32_to_bf16;
+use crate::components::gqa::fp8::fp8_e4m3_to_bf16;
 use crate::components::gqa::kv_page_write::PageTableLayout;
 use crate::components::gqa::sdpa;
 use crate::components::gqa::split_kv::tiled_q;
@@ -163,7 +169,7 @@ fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
     let num_kv_heads = 1usize;
     let head_dim = 128usize;
     let tokens_per_page = 8usize;
-    let page_bytes = 2 * num_kv_heads * tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
+    let page_bytes = 2 * num_kv_heads * tokens_per_page * head_dim * size_of::<u8>();
     let scale = (head_dim as f32).sqrt().recip();
     let tiled_config = tiled_q::Config {
         num_q_heads: num_q_heads as u32,
@@ -210,8 +216,10 @@ fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
     // Keep the history and block maxima close but distinct. This makes the
     // test sensitive to the log base in the shared partial-state ABI.
     let q_values = vec![1.0; num_q_tokens * num_q_heads * head_dim];
-    let history_k = vec![0.176_776_69; num_history_tokens * head_dim];
-    let history_v = vec![1.0; num_history_tokens * head_dim];
+    let history_k =
+        vec![bf16_to_f32(fp8_e4m3_to_bf16(bf16_to_fp8_e4m3(f32_to_bf16(0.176_776_69)))); num_history_tokens * head_dim];
+    let history_v =
+        vec![bf16_to_f32(fp8_e4m3_to_bf16(bf16_to_fp8_e4m3(f32_to_bf16(1.0)))); num_history_tokens * head_dim];
     let local_k_values = vec![0.220_970_87; num_q_tokens * head_dim];
     let local_v_values = vec![-1.0; num_q_tokens * head_dim];
     let q = buffer(&device, &q_values, Dtype::Bfloat16);
@@ -221,10 +229,20 @@ fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
     for page_index in 0..2 {
         let begin = page_index * tokens_per_page * head_dim;
         let end = begin + tokens_per_page * head_dim;
-        page_values.extend_from_slice(&history_k[begin..end]);
-        page_values.extend_from_slice(&history_v[begin..end]);
+        page_values.extend(
+            history_k[begin..end]
+                .iter()
+                .copied()
+                .map(|value| bf16_to_fp8_e4m3(f32_to_bf16(value))),
+        );
+        page_values.extend(
+            history_v[begin..end]
+                .iter()
+                .copied()
+                .map(|value| bf16_to_fp8_e4m3(f32_to_bf16(value))),
+        );
     }
-    let kv_pages = buffer(&device, &page_values, Dtype::Bfloat16);
+    let kv_pages = Buffer::from_slice(&device, &page_values);
     let req_slots = Buffer::from_slice(&device, &vec![0_u32; num_q_tokens]);
     let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
     let visible_kv_token_ranges = Buffer::from_slice(

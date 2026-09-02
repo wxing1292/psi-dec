@@ -6,7 +6,7 @@ use inference_executor_core::attn::GQAReplayShape;
 
 use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 
-const D256_PAGE8_MIN_SELECTION_SCORE: u64 = 2048;
+const D256_PAGE16_MIN_SELECTION_SCORE: u64 = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestShape {
@@ -456,7 +456,7 @@ fn select_candidate(config: backend_sdpa::Config, mut candidates: Vec<Selection>
         .map(|&index| candidates[index].variant.map.thread_block.max_q_heads)
         .max()
         .unwrap();
-    let desired_q_heads = if (config.head_dim, config.tokens_per_page) != (128, 8)
+    let desired_q_heads = if !matches!((config.head_dim, config.tokens_per_page), (128, 8 | 16))
         && u64::from(num_tokens) < 4 * u64::from(num_q_token_ranges)
     {
         config.q_heads_per_kv_head().div_ceil(2).min(full_q_heads)
@@ -469,15 +469,15 @@ fn select_candidate(config: backend_sdpa::Config, mut candidates: Vec<Selection>
         .find(|&index| candidates[index].variant.map.thread_block.max_q_heads == desired_q_heads)
         .unwrap_or(first_tiled_index);
 
-    if (config.head_dim, config.tokens_per_page) == (256, 8)
-        && !prefer_d256_page8_tiled_q(&candidates[single_q_index], &candidates[tiled_q_index])
+    if (config.head_dim, config.tokens_per_page) == (256, 16)
+        && !prefer_d256_page16_tiled_q(&candidates[single_q_index], &candidates[tiled_q_index])
     {
         return candidates.remove(single_q_index);
     }
     candidates.remove(tiled_q_index)
 }
 
-fn prefer_d256_page8_tiled_q(single_q: &Selection, tiled_q: &Selection) -> bool {
+fn prefer_d256_page16_tiled_q(single_q: &Selection, tiled_q: &Selection) -> bool {
     let selection_score = single_q
         .metrics
         .num_logical_qk_token_pairs
@@ -493,7 +493,7 @@ fn prefer_d256_page8_tiled_q(single_q: &Selection, tiled_q: &Selection) -> bool 
         .num_active_qk_token_pairs
         .checked_mul(2)
         .is_some_and(|active_pairs| active_pairs >= tiled_q.metrics.num_scheduled_qk_token_pairs);
-    tiled_q_has_sufficient_map_utilization && selection_score >= D256_PAGE8_MIN_SELECTION_SCORE
+    tiled_q_has_sufficient_map_utilization && selection_score >= D256_PAGE16_MIN_SELECTION_SCORE
 }
 
 #[cfg(test)]
@@ -512,7 +512,7 @@ mod tests {
             num_q_heads: 24,
             num_kv_heads: 4,
             head_dim: 256,
-            tokens_per_page: 8,
+            tokens_per_page: 16,
         })
     }
 
@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_selector_preserves_measured_d256_page8_crossovers() {
+    fn test_selector_preserves_measured_d256_page16_crossovers() {
         for (tokens, context) in [(1, 65536), (2, 65536), (4, 128), (8, 128), (25, 32)] {
             assert!(is_single_q(&selection(&[context], &[tokens])));
         }
@@ -545,29 +545,29 @@ mod tests {
     }
 
     #[test]
-    fn test_selector_preserves_non_page8_profile_selection() {
+    fn test_selector_preserves_other_profile_selection() {
         let request_shapes = RequestShape::from_batch(&[0; 4], &[0, 2, 4, 6, 8]);
-        let d256_page16 = selector_for(backend_sdpa::Config {
+        let d256_page32 = selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 24,
             num_kv_heads: 4,
             head_dim: 256,
-            tokens_per_page: 16,
+            tokens_per_page: 32,
         })
         .select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 8);
-        assert_eq!(d256_page16.variant().map.thread_block.max_q_tokens, 8);
-        assert_eq!(d256_page16.variant().map.thread_block.max_q_heads, 3);
+        assert_eq!(d256_page32.variant().map.thread_block.max_q_tokens, 8);
+        assert_eq!(d256_page32.variant().map.thread_block.max_q_heads, 3);
 
-        let d128_page8 = selector_for(backend_sdpa::Config {
+        let d128_page16 = selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 32,
             num_kv_heads: 4,
             head_dim: 128,
-            tokens_per_page: 8,
+            tokens_per_page: 16,
         })
         .select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 8);
-        assert_eq!(d128_page8.variant().map.thread_block.max_q_tokens, 8);
-        assert_eq!(d128_page8.variant().map.thread_block.max_q_heads, 8);
+        assert_eq!(d128_page16.variant().map.thread_block.max_q_tokens, 8);
+        assert_eq!(d128_page16.variant().map.thread_block.max_q_heads, 8);
 
         let unsupported = selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,

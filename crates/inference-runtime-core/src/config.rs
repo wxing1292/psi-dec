@@ -43,33 +43,14 @@ pub struct RuntimeConfig {
 
     /// Logical token extent of one shared trie/GQA/GDN cache block.
     pub num_tokens_per_cache_block: usize,
-    pub num_kv_heads: usize,
-    pub kv_head_dim: usize,
-    pub kv_dtype_bytes: usize,
 
     pub num_pages: usize,
-    pub page_bytes: usize,
     pub cache_lanes: Vec<CacheLaneRuntimeConfig>,
 }
 
 impl RuntimeConfig {
     pub fn num_tokens_per_cache_block(&self) -> usize {
         self.num_tokens_per_cache_block
-    }
-
-    pub fn kv_bytes_per_token(&self) -> usize {
-        2 * self.num_kv_heads * self.kv_head_dim * self.kv_dtype_bytes
-    }
-
-    pub fn num_tokens_per_page(&self) -> usize {
-        let kv_bytes_per_token = self.kv_bytes_per_token();
-        assert!(
-            self.page_bytes.is_multiple_of(kv_bytes_per_token),
-            "page_bytes={} must be divisible by kv_bytes_per_token={}",
-            self.page_bytes,
-            kv_bytes_per_token
-        );
-        self.page_bytes / kv_bytes_per_token
     }
 
     pub fn cache_lane(&self, cache_lane: usize) -> &CacheLaneRuntimeConfig {

@@ -1,15 +1,6 @@
 use inference_runtime_core::Result;
 use inference_runtime_core::log_err_internal;
-use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
-
-pub fn kv_dtype_bytes(dtype: Option<&str>) -> Result<usize> {
-    match dtype {
-        Some("float32") => Ok(4),
-        Some("float16") | Some("half") | Some("bfloat16") | Some("bf16") | None => Ok(2),
-        Some(dtype) => Err(log_err_unavailable!("unsupported Qwen KV dtype {dtype:?}")),
-    }
-}
 
 pub fn context_window(model_context_window: usize, block_spec_num_spec_tokens: usize) -> Result<usize> {
     if model_context_window <= block_spec_num_spec_tokens {

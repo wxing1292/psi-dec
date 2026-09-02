@@ -281,12 +281,13 @@ main_page_ids[num_req_slots][num_gqa_layers][num_blocks][num_page_ids_per_block]
 optional_mtp_page_ids[num_req_slots][1][num_blocks][num_page_ids_per_block]
 optional_bidi_block_gqa_page_ids[num_req_slots][num_spec_layers][num_blocks][num_page_ids_per_block]
 
-one KV page, viewed with the model KV dtype:
+one KV page, viewed as FP8 E4M3FN:
   [K/V][num_kv_heads][num_tokens_per_page][head_dim]
 ```
 
-The Metal config stores `page_bytes` and the shared activation/KV dtype. It derives `num_tokens_per_page` from these
-values, `num_kv_heads`, and `head_dim`. It does not store that derived value or a duplicate KV dtype.
+The Metal config stores `page_bytes` and the BF16 activation dtype. It derives `num_tokens_per_page` from `page_bytes`,
+`num_kv_heads`, `head_dim`, and the fixed one-byte FP8 cache element. It does not store that derived value or a
+configurable KV-cache dtype.
 
 For a flat token, the page lookup is exactly:
 
@@ -466,11 +467,21 @@ The alias does not allocate or add a wrapper.
 Focused tests and benches use the same `ReplayLayer::record(...)` entrypoint as model replay. The data-flow section
 defines the stage order and buffer dependencies.
 
-KV page write uses the same model KV dtype as projection scratch and SplitKV. The component derives its page stride
-and `num_tokens_per_page` with that dtype.
+KV page write reads BF16 projected K/V scratch and writes FP8 E4M3FN cache elements. SplitKV reads FP8 cache elements
+and converts them to BF16 before F32 dot-product and online-softmax computation. The component derives its page stride
+and `num_tokens_per_page` with the fixed one-byte cache element.
 
-The Metal component selects the matching bf16/f32 update kernel. `gqa::kv_page_write::Config` owns the stable
-`num_kv_heads`, `head_dim`, `page_bytes`, dtype, and derived tokens-per-page.
+The Metal component uses only `gqa_kv_page_write_fp8_e4m3fn`. `gqa::kv_page_write::Config` owns stable
+`num_kv_heads`, `head_dim`, `page_bytes`, the BF16 source dtype, and derived tokens-per-page. It does not select a
+cache-format kernel.
+
+The cache conversion uses fixed unit scale and IEEE-style round-to-nearest, ties-to-even. It saturates finite overflow
+and infinity to `±448`. It preserves the sign of zero. It encodes NaN with an E4M3FN NaN code. The cache does not own a
+scale buffer, scale metadata, or a scale lifecycle. `SingleQ` decodes each cache byte directly to F32. `TiledQ` decodes
+each cache byte to BF16 threadgroup K/V storage before it performs F32 matrix arithmetic.
+
+This format is the only production GQA cache contract. The implementation does not keep a BF16 compatibility cache,
+an alternate writer, a runtime fallback, or a feature flag.
 
 The private `gqa::kv_page_write::KernelConstants` contains this compile-time config and thread-block constants that require
 256 threads. One thread owns one flattened `(token write, KV head, head-dimension)` value. The dispatch grid and active
@@ -551,15 +562,15 @@ num_page_ids_per_block      physical page IDs assigned to one cache block
 
 Qwen3.5 service replay uses a 2048-token logical cache block. Physical KV pages remain 32 KiB.
 
-The model's tokens-per-physical-page and GQA-layer count determine the page-ID count. The 27B model uses 4,096 GQA
-pages per logical block (16 layers × 2048/8). The 35B-A3B model uses 1,280 pages (10 × 2048/16).
+The model's tokens-per-physical-page and GQA-layer count determine the page-ID count. The 27B model uses 2,048 GQA
+pages per logical block (16 layers × 2048/16). The 35B-A3B model uses 640 pages (10 × 2048/32).
 
 The runtime trie and GDN state table use this same logical boundary.
 
-Qwen3 has no GDN snapshot boundary. Its service uses a 16-token logical cache block. Qwen3-14B stores eight tokens in
-each 32 KiB physical page.
+Qwen3 has no GDN snapshot boundary. Its service uses a 16-token logical cache block. Qwen3-14B stores 16 tokens in each
+32 KiB physical page.
 
-One logical block therefore owns two pages per GQA layer. It owns 80 pages across all 40 layers.
+One logical block therefore owns one page per GQA layer. It owns 40 pages across all 40 layers.
 
 For Qwen3.5 model replay, the Qwen executor validates runtime cache lane 0 and writes the Main page table. DSpark or
 DFlash2 mode also writes its independent role-local page table. `Qwen35MTP` separately maps runtime cache lane
@@ -701,14 +712,13 @@ visible KV range [0, N)
 `cu_sdpa_partial_outputs` selects the consecutive partials for each Q-token range. Padded replay Map task templates use
 `q_token_range_index = u32::MAX`. Their threadblocks return without writing.
 
-The registry always includes the current one-Q variant. It includes tiled-Q variants only for the
-supported static shape. The explicit bf16 production profiles are
-`(D=128, 8 KV tokens/page)`, `(D=256, 8 KV tokens/page)`, and `(D=256, 16 KV tokens/page)`.
+The registry always includes the current one-Q variant. It includes tiled-Q variants only for supported static shapes.
+The low-level profiles are `(D=128, 8 or 16 KV tokens/page)` and `(D=256, 8, 16, or 32 KV tokens/page)`. The current
+FP8 production profiles are `(D=128, 16)`, `(D=256, 16)`, and `(D=256, 32)`.
 
 All profiles support at most 8 Q heads per KV head. The gated backend currently reaches only the `D=256` profiles.
 
-For the `(D=128, 8 KV tokens/page)` and `(D=256, 16 KV tokens/page)` profiles, the selector uses the average useful
-tokens per request-local Q range. It does not use floating-point division:
+The selector uses the average useful tokens per request-local Q range. It does not use floating-point division:
 
 ```text
 num_tokens < 2 * num_q_token_ranges       -> SingleQ
@@ -718,7 +728,7 @@ D=256 and num_tokens < 4 * num_q_token_ranges
 otherwise                                 -> TiledQ, full Q/KV group
 ```
 
-The gated `(D=256, 8 KV tokens/page)` profile uses an additional measured policy. This policy applies only to complete
+The gated `(D=256, 16 KV tokens/page)` production profile uses an additional measured policy. This policy applies only to complete
 selections for legal backend variants. It uses each request's Q-token count and history length. Each candidate
 already contains the current greedy KV-split allocation at the metadata capacity. The policy does not change that
 allocation.
@@ -735,9 +745,9 @@ reachable model variants are:
 
 | Model | `Hq / Hkv / D` | KV tokens/page | Production variant |
 | --- | --- | ---: | --- |
-| Qwen3-14B | `40 / 8 / 128` | 8 | selector policy above, tiled `max_q_heads=5` |
-| Qwen3.6/Qwen3.8-27B | `24 / 4 / 256` | 8 | measured selector policy above |
-| Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector policy above |
+| Qwen3-14B | `40 / 8 / 128` | 16 | selector policy above, tiled `max_q_heads=5` |
+| Qwen3.6/Qwen3.8-27B | `24 / 4 / 256` | 16 | measured selector policy above |
+| Qwen3.6-35B-A3B | `16 / 2 / 256` | 32 | selector policy above |
 | Qwen3 DSpark | checkpoint-derived | model-derived | selected SplitKV history + block bidirectional |
 | Qwen3x DFlash2 | checkpoint-derived | model-derived | selected sliding SplitKV history + block bidirectional |
 
@@ -817,7 +827,7 @@ thread-local Q fragments stay resident for the KV split
 paged K/V -- 32 lanes x 16 B per row
                               |
                               v
-threadgroup K[16, D+8] + V[16, D+8] bf16
+FP8 decode -> threadgroup K[16, D+8] + V[16, D+8] BF16
                               |
             Q x K^T, explicit visible-range mask
                  online-softmax update
@@ -898,7 +908,7 @@ q_token_ranges                      request-local flat-Q-token ranges consumed b
 sdpa_map_task_templates             materialized Q-token-range index and request-local KV-token range for Map tasks
 cu_sdpa_partial_outputs             cumulative partial-output counts selected per Q-token range by SplitKV Reduce
 page_ids                             fixed-stride [req_slot, gqa_layer_index, block_index, page_id_index]
-kv_pages                             shared runtime-provided KV arena backing
+kv_pages                             shared runtime-provided FP8 E4M3FN KV arena backing
 scratch                              caller-owned capacity buffers, used only up to current replay shape
 weights                              immutable fused projection, q/k norm, and output projection buffers
 ```
@@ -1041,9 +1051,10 @@ one isolated cache and the complete active-count sequence for capacity `8`. Focu
 logical cache block that spans multiple physical page IDs. The cases validate compact KV-split indexing,
 online-softmax iteration merging, request slots, page-table lookup, and causal visibility.
 
-`gqa/split_kv/tiled_q_test.rs` compares the BF16 SplitKV TiledQ map and reduce variant with the same CPU reference. One
-isolated test cache records a total capacity of `8`. The test replays `1, 8, 3, 7, 2, 6, 4, 5`. It refreshes the
-explicit visible ranges for each submission and compares the active output with the CPU projected-GQA reference.
+`gqa/split_kv/tiled_q_test.rs` compares the BF16-output SplitKV TiledQ map and reduce variant, with an FP8 E4M3FN KV
+cache, against the same CPU reference. One isolated test cache records a total capacity of `8`. The test replays
+`1, 8, 3, 7, 2, 6, 4, 5`. It refreshes the explicit visible ranges for each submission and compares the active output
+with the CPU projected-GQA reference.
 `gqa/split_kv/single_q_test.rs` uses the same active-count sequence and CPU-reference contract. Both tests ignore
 inactive scratch and output tails.
 
@@ -1055,9 +1066,9 @@ This test protects the BiDiBlockGQA total-dispatch and active-guard contract.
 It compares Q, K, and V active rows with the exact CPU row-split reference.
 
 `gqa/qgkv_split.rs` and `gqa/activation_gate.rs` use the same isolated-cache sequence. They compare the active Q/G/K/V
-rows and gated attention values with exact CPU references. `gqa/kv_page_write.rs` compares the complete affected page
-arena with a CPU page-table and page-offset reference because page writes update persistent state. A separate
-identity-capacity replay protects the F32 page-copy path.
+rows and gated attention values with exact CPU references. `gqa/kv_page_write.rs` compares the complete affected FP8
+page arena with a CPU page-table, page-offset, and E4M3FN conversion reference because page writes update persistent
+state.
 
 `attn/gqa/backend_full_test.rs` records the real gated `GQA` owner. It replays the non-monotonic active-token sequence
 through the production multi-domain cache keys. It compares the active output and the persistent KV page with an
@@ -1149,7 +1160,8 @@ For `qwen35_gqa`, `--gqa-model 27b|35b` selects the real-weight layer profile. P
 `--model-dir`.
 
 The bench uses the production 32 KiB physical page size. It derives the KV tokens per page from the selected model
-profile and the bf16 K/V element size. The 27B profile uses 8 tokens per page. The 35B profile uses 16 tokens per page.
+profile and the one-byte FP8 K/V element size. The 27B profile uses 16 tokens per page. The 35B profile uses 32 tokens
+per page.
 
 For GQA, `--tokens` is the total current flat-token count. `--num-reqs` is the number of request segments in that
 microbatch. `--contexts` is the existing context length for each request before its measured tokens.
@@ -1205,8 +1217,9 @@ Subcomponent probes use the same request-slot/page-table capacity contract as fu
 Do not hard-code one request slot. That value under-validates the page-table contract, even if the kernel reads the
 larger backing buffer.
 
-Production Qwen KV cache dtype follows the model config. The Qwen3.6 bf16/default config creates bf16 KV pages. The
-paged KV writer stores projected K/V in those page-table pages.
+Production Qwen GQA keeps Q, gate, projected K/V, attention output, and projection scratch in BF16. Its persistent KV
+pages use FP8 E4M3FN. The page writer converts projected BF16 K/V into those pages. Gated, ungated, BiDiBlockGQA,
+DSpark, and DFlash2 history reads use the same page format and lifecycle.
 
 The Metal executor keeps forward wiring out of `components/`. Gated `GQA` composes QGKV projection, the gate, and the
 shared attention building blocks.
@@ -1245,6 +1258,76 @@ Debug in this order:
 2. Real-weight GQA wrapper
 3. Attention slice in a layer
 4. Layer ladder
+
+## FP8 KV-cache conversion evidence
+
+FP8 E4M3FN reduces persistent GQA KV-cache bytes by exactly 50% relative to BF16. It doubles tokens per 32 KiB page.
+The page-ID table, page ownership, cache lifecycle, replay topology, SingleQ/TiledQ variant set, and model wiring stay
+in place. The conversion does not reduce BF16 activation scratch or F32 arithmetic storage.
+
+The host conversion tests cover fixed encodings, saturation, ties-to-even, exhaustive finite-code round trips, and
+quantization error. For subnormal inputs, the absolute-error bound is `2^-10`. For normal inputs, the relative-error
+bound is `0.0625`. A Metal page-write test covers negative zero, subnormal values, tie values, finite maximum, finite
+overflow, and infinity.
+
+The deterministic 64-token projected-GQA quality fixture compares FP8-cache output with a BF16-cache oracle. The
+fixture has no saturated values. The gate requires maximum absolute error `<= 0.025` and mean absolute error
+`<= 0.005`. The observed errors were `0.024282813` maximum and `0.0031357706` mean. SingleQ, TiledQ, BiDiBlockGQA, and
+the complete GQA owner retain their CPU-oracle parity tests.
+
+An external RPC run used the Qwen3.6-27B 4-bit checkpoint and a 3,692-token prompt. A selected-hibernation snapshot
+retained one complete logical block. A scan of all 2,048 GQA pages in that block inspected 33,554,432 K bytes and
+33,554,432 V bytes. The maximum decoded magnitudes were 22 for K and 128 for V. The scan found no `+448` or `-448`
+saturation code and no NaN code. Thus, the observed block had at least 3.5 times range headroom. This result rules out
+E4M3FN saturation in this run. It is not a bound for all models or prompts.
+
+The upstream vLLM and SGLang interfaces reviewed on 2026-09-01 are not GQA-specific. Their default KV-cache dtype is
+`auto`. A normal checkpoint therefore keeps its model dtype. SGLang can select E4M3FN under `auto` when the quantization
+configuration declares FP8. On CUDA, vLLM maps `fp8` and `fp8_e4m3` to E4M3 and maps explicit `fp8_e5m2` to E5M2.
+SGLang maps explicit `fp8_e4m3` to `torch.float8_e4m3fn` and explicit `fp8_e5m2` to `torch.float8_e5m2`. Both support a
+unit-scale path, but both recommend calibrated or checkpoint-provided scales when available. See the vLLM
+[`CacheConfig`](https://github.com/vllm-project/vllm/blob/main/vllm/config/cache.py), vLLM
+[FP8 dispatch](https://github.com/vllm-project/vllm/blob/main/csrc/attention/dtype_fp8.cuh), vLLM
+[quantized KV-cache guide](https://github.com/vllm-project/vllm/blob/main/docs/features/quantization/quantized_kvcache.md),
+SGLang [KV-cache dtype mapping](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/kv_cache_dtype.py),
+and SGLang [quantized KV-cache guide](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/quantized_kv_cache.mdx).
+
+The performance baseline was clean commit `e8f6d7f24cf9791d24ecc3cda539116772f03405`. The converted result used the
+dirty worktree at that commit before the conversion commit. Both measurements used macOS 27.0 build 26A5425a on an
+arm64 Apple M3 Max with 48 GB memory. No `PSI_*` environment variables were set. These are normal wall-clock replay
+measurements. They do not use force-sync or profile-summary mode.
+
+The backend SingleQ Criterion medians were:
+
+| Context tokens | BF16 cache | FP8 cache | Delta |
+| ---: | ---: | ---: | ---: |
+| 128 | 281.28 µs | 375.30 µs | +33.43% |
+| 4,096 | 411.82 µs | 548.53 µs | +33.20% |
+
+The production one-layer Qwen3.6-27B 4-bit replay medians were:
+
+| Tokens | Context | Variant | BF16 cache | FP8 cache | Delta |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 1 | 128 | SingleQ | 799.583 µs | 664.458 µs | -16.90% |
+| 1 | 128 | TiledQ | 642.308 µs | 1,010.942 µs | +57.39% |
+| 1 | 4,096 | SingleQ | 850.767 µs | 1,211.700 µs | +42.42% |
+| 1 | 4,096 | TiledQ | 903.567 µs | 1,244.625 µs | +37.75% |
+| 64 | 128 | SingleQ | 1,832.992 µs | 2,029.225 µs | +10.71% |
+| 64 | 128 | TiledQ | 1,697.658 µs | 1,849.308 µs | +8.93% |
+| 64 | 4,096 | SingleQ | 5,781.425 µs | 7,070.025 µs | +22.29% |
+| 64 | 4,096 | TiledQ | 2,915.542 µs | 3,786.067 µs | +29.86% |
+
+The one-layer command uses three runs and shows system noise, especially in short workloads. The backend Criterion
+result gives the more stable decoder comparison. The evidence classifies the current FP8 cache as a memory-capacity
+and traffic improvement with a measured latency regression on this device. The likely cost is software E4M3FN decode
+on hardware without native FP8 arithmetic. This cause is an inference from the implementation and measurements.
+
+The exact commands were:
+
+```text
+cargo bench -p inference-backend-metal --bench gqa_split_kv -- 'metal/gqa-split-kv/single-q/replay/ctx(128|4096)$' --warm-up-time 1 --measurement-time 2 --sample-size 20 --noplot
+cargo bench -p inference-executor-metal --bench qwen35_gqa -- --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit --gqa-model 27b --tokens 1,64 --contexts 128,4096 --num-reqs 1 --subcomponents --gqa-split-kv-variants single_q,tiled_q --iters 5 --warmup-iters 3 --runs 3
+```
 
 Shared GPU serialization, benchmark metrics, and performance-evidence rules are in
 [`executor_benchmarks.md`](executor_benchmarks.md).

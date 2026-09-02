@@ -130,7 +130,7 @@ impl ExecutionVariant {
 
         let profile = (config.head_dim, config.tokens_per_page);
         config.io_dtype == Dtype::Bfloat16
-            && matches!(profile, (128, 8) | (256, 8 | 16))
+            && matches!(profile, (128, 8 | 16) | (256, 8 | 16 | 32))
             && config.q_heads_per_kv_head() <= 8
             && matches!(map.max_q_tokens, 8 | 16)
             && matches!(map.kv_tokens_per_iteration, 8 | 16)
@@ -183,7 +183,7 @@ impl Registry {
         let mut variants = vec![single_q_variant(config)];
         if supports_tiled_q(config) {
             let full_q_heads = config.q_heads_per_kv_head().min(max_tiled_q_heads(8));
-            if (config.head_dim, config.tokens_per_page) != (128, 8) {
+            if !matches!((config.head_dim, config.tokens_per_page), (128, 8 | 16)) {
                 let half_q_heads = config.q_heads_per_kv_head().div_ceil(2).min(max_tiled_q_heads(8));
                 if half_q_heads != full_q_heads {
                     variants.push(tiled_q_variant(config, half_q_heads));
@@ -228,7 +228,7 @@ impl Registry {
 fn supports_tiled_q(config: Config) -> bool {
     let profile = (config.head_dim, config.tokens_per_page);
     config.io_dtype == Dtype::Bfloat16
-        && matches!(profile, (128, 8) | (256, 8 | 16))
+        && matches!(profile, (128, 8 | 16) | (256, 8 | 16 | 32))
         && config.q_heads_per_kv_head() <= 8
 }
 
@@ -266,16 +266,27 @@ mod tests {
 
     #[test]
     fn test_registry_filters_static_execution_capabilities() {
+        let d256_page32 = Registry::new(config(256, 6, 32));
         let d256_page16 = Registry::new(config(256, 6, 16));
         let d256_page8 = Registry::new(config(256, 6, 8));
+        let d128_page16 = Registry::new(config(128, 8, 16));
         let d128_page8 = Registry::new(config(128, 8, 8));
         let unsupported = Registry::new(config(256, 8, 4));
 
+        assert_eq!(d256_page32.variants().len(), 3);
         assert_eq!(d256_page16.variants().len(), 3);
         assert_eq!(d256_page8.variants().len(), 3);
+        assert_eq!(d128_page16.variants().len(), 2);
         assert_eq!(d128_page8.variants().len(), 2);
         assert_eq!(unsupported.variants().len(), 1);
-        for registry in [d256_page16, d256_page8, d128_page8, unsupported] {
+        for registry in [
+            d256_page32,
+            d256_page16,
+            d256_page8,
+            d128_page16,
+            d128_page8,
+            unsupported,
+        ] {
             assert!(
                 registry
                     .variants()
