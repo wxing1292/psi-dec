@@ -225,11 +225,6 @@ pub fn qwen3x_dspark_gqa_core(
     num_spec_tokens: usize,
     dspark_layer_index: usize,
 ) -> BiDiBlockGQACore {
-    assert_eq!(
-        num_spec_tokens,
-        config.num_spec_tokens().get(),
-        "Qwen3x DSpark proposal count must match the checkpoint"
-    );
     assert!(
         dspark_layer_index < config.num_hidden_layers,
         "Qwen3x DSpark attention layer index must be within the model"
@@ -350,16 +345,19 @@ mod tests {
         let config = config();
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let (core, metal) =
-            derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
-
-        assert_eq!(core.block_size, 7);
-        assert_eq!(core.attention.model_layer_index, 1);
-        assert_eq!(core.attention.hidden_dim, 32);
-        assert_eq!(core.attention.num_q_heads, 4);
-        assert_eq!(core.attention.num_kv_heads, 1);
-        assert_eq!(metal.q.group_size, 32);
-        assert_eq!(metal.q.bits, 4);
+        for num_spec_tokens in [1, 2, 3, 4, 7] {
+            let (core, metal) =
+                derive_qwen3x_dspark_gqa_configs(&config, num_spec_tokens, 1, &bindings.layers[1].gqa, 32 * 1024)
+                    .unwrap();
+            assert_eq!(core.block_size, num_spec_tokens);
+            assert_eq!(core.attention.model_layer_index, 1);
+            assert_eq!(core.attention.hidden_dim, 32);
+            assert_eq!(core.attention.num_q_heads, 4);
+            assert_eq!(core.attention.num_kv_heads, 1);
+            assert_eq!(metal.q.group_size, 32);
+            assert_eq!(metal.q.bits, 4);
+            assert_eq!(config.block_size, 7);
+        }
     }
 
     #[test]

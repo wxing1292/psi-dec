@@ -23,6 +23,13 @@ pub struct QwenSpecArgs {
         help = "Speculative checkpoint type (requires --hf-spec-model-dir)"
     )]
     pub spec_type: Option<QwenSpecType>,
+
+    #[arg(
+        long,
+        help = "Speculative tokens generated per proposal; defaults to 1 for MTP or the checkpoint block geometry for \
+                DSpark/DFlash2"
+    )]
+    pub num_spec_tokens: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Parser)]
@@ -172,12 +179,6 @@ pub struct Qwen35Args {
         help = "Executor hibernation state scope: all or selected"
     )]
     pub executor_hibernation_mode: ExecutorHibernationMode,
-
-    #[arg(
-        long,
-        help = "Number of speculative tokens per MTP proposal; defaults to 1 and requires --spec-type mtp"
-    )]
-    pub num_spec_tokens: Option<NonZeroUsize>,
 
     #[arg(
         long,

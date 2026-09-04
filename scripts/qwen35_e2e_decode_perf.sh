@@ -2,6 +2,7 @@
 set -euo pipefail
 
 RUNS=7
+BLOCK_SPEC_TOKENS=""
 PORT=50061
 BUILD=1
 REFERENCE=1
@@ -113,7 +114,10 @@ Options:
                           27b_mtp2,35b_mtp2
                         Available modes: off, mtp, dspark, dflash2.
                         The *_mtp alias runs proposal counts 1 and 2.
-                        DSpark and DFlash2 use checkpoint-defined block geometry.
+                        DSpark and DFlash2 use checkpoint defaults unless overridden.
+  --block-spec-tokens K  Generate K tokens in each DSpark/DFlash2 proposal.
+                        This changes actual draft input rows, not only verification.
+                        Does not change MTP cases. Default: checkpoint geometry.
                         Group cases: 27b_on and 35b_on select all Spec modes.
                         Missing Spec checkpoints are warned and skipped.
   --port N              Server port. Default: 50061
@@ -186,6 +190,14 @@ while [[ $# -gt 0 ]]; do
             exit 2
         }
         CASES="$2"
+        shift 2
+        ;;
+    --block-spec-tokens)
+        [[ $# -ge 2 ]] || {
+            echo "--block-spec-tokens requires a value" >&2
+            exit 2
+        }
+        BLOCK_SPEC_TOKENS="$2"
         shift 2
         ;;
     --port)
@@ -461,6 +473,9 @@ require_nonnegative_integer() {
 }
 
 require_positive_integer "--runs" "$RUNS"
+if [[ -n "$BLOCK_SPEC_TOKENS" ]]; then
+    require_positive_integer "--block-spec-tokens" "$BLOCK_SPEC_TOKENS"
+fi
 require_positive_integer "--port" "$PORT"
 require_positive_integer "--num-cache-pages" "$NUM_CACHE_PAGES"
 require_positive_integer "--max-requests" "$MAX_REQUESTS"
@@ -943,6 +958,7 @@ reference_config_mismatches() {
         mismatches="${mismatches:+$mismatches,}case_cooldown_secs"
     [[ "$LOGGING" == "$REFERENCE_LOGGING" ]] || mismatches="${mismatches:+$mismatches,}logging"
     [[ "$SEED" == "$REFERENCE_SEED" ]] || mismatches="${mismatches:+$mismatches,}seed"
+    [[ -z "$BLOCK_SPEC_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}block_spec_tokens"
     [[ "$TEMPERATURE" == "$REFERENCE_TEMPERATURE" ]] || mismatches="${mismatches:+$mismatches,}temperature"
     [[ "$TOP_K" == "$REFERENCE_TOP_K" ]] || mismatches="${mismatches:+$mismatches,}top_k"
     [[ "$TOP_P" == "$REFERENCE_TOP_P" ]] || mismatches="${mismatches:+$mismatches,}top_p"
@@ -1027,6 +1043,7 @@ print_config_table() {
         CURRENT_ARCH="$ARCH" \
         CURRENT_RUNS="$RUNS" \
         CURRENT_CASES="$CASES" \
+        CURRENT_BLOCK_SPEC_TOKENS="${BLOCK_SPEC_TOKENS:-checkpoint}" \
         CURRENT_COOLDOWN="$CASE_COOLDOWN_SECS" \
         CURRENT_CAPACITY="$NUM_CACHE_PAGES pages; $CACHE_BLOCK_TOKENS tokens/block; $MAX_REQUESTS requests; $MAX_TOKENS tokens; $MAX_TOKENS_PER_REQUEST tokens/request" \
         CURRENT_SAMPLING="seed=$SEED; temperature=$TEMPERATURE; top_k=$TOP_K; top_p=$TOP_P; thinking=on" \
@@ -1051,6 +1068,7 @@ rows = [
     ("Host", f"{os.environ['CURRENT_MACHINE']} os={os.environ['CURRENT_OS']} arch={os.environ['CURRENT_ARCH']}"),
     ("Run", f"runs={os.environ['CURRENT_RUNS']} cooldown={os.environ['CURRENT_COOLDOWN']}s"),
     ("Cases", os.environ["CURRENT_CASES"]),
+    ("Block Spec K", os.environ["CURRENT_BLOCK_SPEC_TOKENS"]),
     ("Capacity", os.environ["CURRENT_CAPACITY"]),
     ("Sampling", os.environ["CURRENT_SAMPLING"]),
     ("Prompts", os.environ["CURRENT_PROMPTS"]),
@@ -1589,11 +1607,17 @@ run_block_spec_case() {
     local tokenizer="${TOKENIZER:-$model_dir}"
 
     local label="${model_label}_${spec_mode}"
+    set --
+    if [[ -n "$BLOCK_SPEC_TOKENS" ]]; then
+        label="${label}_k${BLOCK_SPEC_TOKENS}"
+        set -- --num-spec-tokens "$BLOCK_SPEC_TOKENS"
+    fi
     run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
         --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$model_dir" \
         --hf-spec-model-dir "$spec_model_dir" \
         --spec-type "$spec_mode" \
+        "$@" \
         --num-cache-pages "$NUM_CACHE_PAGES" \
         --max-requests "$MAX_REQUESTS" \
         --max-tokens "$MAX_TOKENS" \
@@ -1664,7 +1688,7 @@ REFERENCE_CONFIG_MISMATCHES="$(
 )"
 REPORT_FILE="$(mktemp "${TMPDIR:-/tmp}/psi_dec_qwen35_perf.XXXXXX")"
 if ((SHOW_RUNS)); then
-    echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_geometry=checkpoint cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_num_spec_tokens=${BLOCK_SPEC_TOKENS:-checkpoint} cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
 fi
 print_config_table
 for case_index in "${!selected_cases[@]}"; do

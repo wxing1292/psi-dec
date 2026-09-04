@@ -360,11 +360,16 @@ pub fn init_qwen_3_5_model_with_mtp(
 pub fn init_qwen_3_5_model_with_dspark(
     model_dir: impl AsRef<Path>,
     dspark_model_dir: impl AsRef<Path>,
+    num_spec_tokens: NonZeroUsize,
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
     let dspark_model_dir = dspark_model_dir.as_ref();
     let dspark_config = init_qwen3x_dspark_config(dspark_model_dir)?;
-    let num_spec_tokens = dspark_config.num_spec_tokens();
+    if num_spec_tokens.get() >= dspark_config.max_position_embeddings {
+        return Err(ModelExecutorError::custom(
+            "DSpark num_spec_tokens must be smaller than max_position_embeddings",
+        ));
+    }
     init_qwen_3_5_model_inner(
         model_dir.as_ref(),
         Qwen35InitMode::DSpark {
@@ -379,11 +384,18 @@ pub fn init_qwen_3_5_model_with_dspark(
 pub fn init_qwen_3_5_model_with_dflash2(
     model_dir: impl AsRef<Path>,
     dflash2_model_dir: impl AsRef<Path>,
+    num_spec_tokens: NonZeroUsize,
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
     let dflash2_model_dir = dflash2_model_dir.as_ref();
     let dflash2_config = init_qwen3x_dflash2_config(dflash2_model_dir)?;
-    let num_spec_tokens = dflash2_config.num_spec_tokens();
+    if num_spec_tokens.get() >= dflash2_config.max_position_embeddings
+        || num_spec_tokens.get() >= dflash2_config.sliding_window - 1
+    {
+        return Err(ModelExecutorError::custom(
+            "DFlash2 num_spec_tokens must be smaller than max_position_embeddings and sliding_window - 1",
+        ));
+    }
     init_qwen_3_5_model_inner(
         model_dir.as_ref(),
         Qwen35InitMode::DFlash2 {
@@ -721,6 +733,7 @@ fn init_qwen_3_5_model_inner(
                 dspark_model_dir,
                 &dspark_config,
                 Qwen3xDSparkLoadConfig {
+                    num_spec_tokens,
                     page_size_bytes: QWEN35_PAGE_SIZE_BYTES,
                     max_position_embeddings: model_config.text_config.max_position_embeddings,
                     max_requests: config.max_requests,
@@ -743,6 +756,7 @@ fn init_qwen_3_5_model_inner(
                 dflash2_model_dir,
                 &dflash2_config,
                 Qwen3xDFlash2LoadConfig {
+                    num_spec_tokens,
                     page_size_bytes: QWEN35_PAGE_SIZE_BYTES,
                     max_position_embeddings: model_config.text_config.max_position_embeddings,
                     max_requests: config.max_requests,

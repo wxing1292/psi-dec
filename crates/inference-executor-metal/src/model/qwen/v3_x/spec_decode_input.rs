@@ -242,6 +242,36 @@ mod tests {
     use super::SpecDecodeInputConfig;
 
     #[test]
+    fn test_prepare_query_block_size() {
+        let device = Device::system_default();
+        for block_size in [1, 2, 3, 4, 5, 7, 8] {
+            let input = SpecDecodeInput::new(
+                &device,
+                SpecDecodeInputConfig::new(
+                    2,
+                    block_size,
+                    MapThreadBlockConstants {
+                        max_q_tokens: 2,
+                        max_q_heads: 4,
+                        kv_tokens_per_iteration: 4,
+                        required_threads: 32,
+                    },
+                    u32::MAX,
+                    128,
+                    32,
+                    0,
+                ),
+            );
+            // Previous verification widths differ from the new proposal block.
+            let metadata = input.prepare(&[1, 0], &[10, 20], &[7, 0]);
+            let expected = (17..17 + block_size).chain(20..20 + block_size).collect::<Vec<_>>();
+            assert_eq!(metadata.flat_token_indices(), expected);
+            assert_eq!(metadata.req_slots().len(), 2 * block_size as usize);
+            assert_eq!(metadata.block_size(), block_size as usize);
+        }
+    }
+
+    #[test]
     fn test_prepare_bucketing() {
         let input = SpecDecodeInput::new(
             &Device::system_default(),

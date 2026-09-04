@@ -15,7 +15,9 @@ The DSpark owner owns its checkpoint, history page table, replay caches, workspa
 Runtime core owns scheduling, request lifecycle, physical pages, and page IDs.
 
 DSpark supports ungated GQA, the `vanilla` Markov head, Markov-conditioned confidence, `default` RoPE, and Yarn RoPE.
-Checkpoint `block_size` fixes proposal length `N` at startup.
+The runtime proposal length `N` is fixed at startup.
+The service uses checkpoint `block_size` as the default. `--num-spec-tokens N` overrides this default.
+The executor keeps the checkpoint unchanged and uses `N` for query rows, scratch, replay, and draft distributions.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
 Current limits:
@@ -137,7 +139,7 @@ CONFIDENCE HEAD
                          ▼
              returned with proposal token
 
-N = block_size proposal tokens
+N = runtime proposal count (defaults to checkpoint block_size)
 ```
 
 Spec Prefill and Spec Decode use independent replay recordings.

@@ -285,12 +285,17 @@ pub fn init_qwen3_asr_model(
 pub fn init_qwen_3_model_with_dspark(
     model_dir: impl AsRef<Path>,
     dspark_model_dir: impl AsRef<Path>,
+    num_spec_tokens: NonZeroUsize,
     config: Qwen3ExecutorConfig,
 ) -> Result<Qwen3Executor, ModelExecutorError> {
     config.validate();
     let dspark_model_dir = dspark_model_dir.as_ref();
     let dspark_config = init_qwen3x_dspark_config(dspark_model_dir)?;
-    let num_spec_tokens = dspark_config.num_spec_tokens();
+    if num_spec_tokens.get() >= dspark_config.max_position_embeddings {
+        return Err(ModelExecutorError::custom(
+            "DSpark num_spec_tokens must be smaller than max_position_embeddings",
+        ));
+    }
     init_qwen_3_model_inner(
         model_dir.as_ref(),
         Qwen3InitMode::DSpark {
@@ -447,6 +452,7 @@ fn init_qwen_3_model_inner(
                 dspark_model_dir,
                 dspark_config,
                 Qwen3xDSparkLoadConfig {
+                    num_spec_tokens: *num_spec_tokens,
                     page_size_bytes: QWEN3_PAGE_SIZE_BYTES,
                     max_position_embeddings: text.max_position_embeddings,
                     max_requests: config.max_requests,

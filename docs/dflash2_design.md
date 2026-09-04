@@ -135,7 +135,7 @@ anchor x_0
     │
    ...
 
-N = block_size - 1 proposal tokens
+N = runtime proposal count (defaults to checkpoint block_size - 1)
 ```
 
 Spec Prefill and Spec Decode use independent replay recordings.
@@ -150,8 +150,13 @@ Spec Prefill borrows the active token count, request slots, and flat token indic
 
 ## Proposal block and attention
 
-The query block has one anchor row and `block_size - 1` MASK rows.
+The runtime proposal length `N` is fixed at startup.
+The service uses checkpoint `block_size - 1` as the default. `--num-spec-tokens N` overrides this default.
+The query block has one anchor row and `N` MASK rows.
 Only MASK rows produce proposals.
+The executor keeps the checkpoint unchanged and uses `N + 1` rows for attention and dynamic convolution.
+Output gathering, selection, and draft distributions use `N` proposal rows.
+The query block must be smaller than `sliding_window`.
 Each layer reduces SplitKV history partials with bidirectional local-block SDPA partials.
 
 DFlash2 stores all committed history and reads this half-open range for each query:

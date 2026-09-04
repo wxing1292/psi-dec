@@ -229,12 +229,9 @@ pub fn qwen3x_dflash2_gqa_core(
         num_spec_tokens > 0,
         "Qwen3x DFlash2 attention requires speculative tokens"
     );
-    assert_eq!(
-        num_spec_tokens,
-        config.num_spec_tokens().get(),
-        "Qwen3x DFlash2 proposal count must match the checkpoint"
-    );
-    let num_query_rows = config.block_size;
+    let num_query_rows = num_spec_tokens
+        .checked_add(1)
+        .expect("Qwen3x DFlash2 query block size must fit usize");
     assert!(
         dflash2_layer_index < config.num_hidden_layers,
         "Qwen3x DFlash2 attention layer index must be within the model"
@@ -333,17 +330,25 @@ mod tests {
         let config = config();
         let bindings = Qwen3xDFlash2WeightBindings::from_config(&config);
 
-        let (core, metal) =
-            derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024, Dtype::Bfloat16)
-                .unwrap();
-
-        assert_eq!(core.block_size, 8);
-        assert_eq!(core.attention.model_layer_index, 1);
-        assert_eq!(core.attention.hidden_dim, 32);
-        assert_eq!(core.attention.num_q_heads, 4);
-        assert_eq!(core.attention.num_kv_heads, 1);
-        assert_eq!(metal.q.group_size, 32);
-        assert_eq!(metal.q.bits, 4);
+        for num_spec_tokens in [1, 2, 3, 4, 7] {
+            let (core, metal) = derive_qwen3x_dflash2_gqa_configs(
+                &config,
+                num_spec_tokens,
+                1,
+                &bindings.layers[1].gqa,
+                32 * 1024,
+                Dtype::Bfloat16,
+            )
+            .unwrap();
+            assert_eq!(core.block_size, num_spec_tokens + 1);
+            assert_eq!(core.attention.model_layer_index, 1);
+            assert_eq!(core.attention.hidden_dim, 32);
+            assert_eq!(core.attention.num_q_heads, 4);
+            assert_eq!(core.attention.num_kv_heads, 1);
+            assert_eq!(metal.q.group_size, 32);
+            assert_eq!(metal.q.bits, 4);
+            assert_eq!(config.block_size, 8);
+        }
     }
 
     #[test]

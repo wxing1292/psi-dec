@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -25,6 +26,7 @@ use crate::sampling::sampling_params::SamplingParamsStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDSparkLoadConfig {
+    pub num_spec_tokens: NonZeroUsize,
     pub page_size_bytes: usize,
     pub max_position_embeddings: usize,
     pub max_requests: usize,
@@ -58,7 +60,7 @@ pub fn load_qwen3x_dspark(
     main_unembed: Rc<Unembed>,
     sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDSparkLoaded, ModelExecutorError> {
-    let num_spec_tokens = config.num_spec_tokens().get();
+    let num_spec_tokens = load_config.num_spec_tokens.get();
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let Qwen3xDSparkWeightBindings {
         embed: embed_bindings,

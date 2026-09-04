@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use inference_executor_core::model::ReplayableDecoderModel;
+use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_dspark;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_mtp;
@@ -60,6 +61,9 @@ fn model_state_io_27b_dspark_full_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(DSPARK_27B_DIR_ENV),
+        init_qwen3x_dspark_config(model_dir(DSPARK_27B_DIR_ENV))
+            .unwrap()
+            .num_spec_tokens(),
         executor_config(),
     )
     .expect("Qwen3.6 27B with DSpark must initialize");
@@ -72,6 +76,9 @@ fn model_state_io_27b_dspark_selected_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(DSPARK_27B_DIR_ENV),
+        init_qwen3x_dspark_config(model_dir(DSPARK_27B_DIR_ENV))
+            .unwrap()
+            .num_spec_tokens(),
         executor_config(),
     )
     .expect("Qwen3.6 27B with DSpark must initialize");
@@ -110,6 +117,9 @@ fn model_state_io_35b_dspark_full_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(DSPARK_35B_DIR_ENV),
+        init_qwen3x_dspark_config(model_dir(DSPARK_35B_DIR_ENV))
+            .unwrap()
+            .num_spec_tokens(),
         executor_config(),
     )
     .expect("Qwen3.6 35B with DSpark must initialize");
@@ -122,6 +132,9 @@ fn model_state_io_35b_dspark_selected_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(DSPARK_35B_DIR_ENV),
+        init_qwen3x_dspark_config(model_dir(DSPARK_35B_DIR_ENV))
+            .unwrap()
+            .num_spec_tokens(),
         executor_config(),
     )
     .expect("Qwen3.6 35B with DSpark must initialize");

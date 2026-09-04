@@ -44,8 +44,9 @@ impl Qwen3xDFlash2Conv {
         bindings: &Qwen3xDFlash2ConvWeightBindings,
         scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
-        assert_eq!(num_spec_tokens, config.num_spec_tokens().get());
-        let spec_block_size = config.block_size;
+        let spec_block_size = num_spec_tokens
+            .checked_add(1)
+            .expect("Qwen3x DFlash2 query block size must fit usize");
         let quantization = config
             .quantization
             .as_ref()

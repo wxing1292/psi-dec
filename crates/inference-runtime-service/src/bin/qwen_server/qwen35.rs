@@ -5,6 +5,8 @@ use clap::Parser;
 use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
+use inference_executor_core::model::qwen::v3_x::dflash2::init_qwen3x_dflash2_config;
+use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model;
@@ -233,19 +235,35 @@ fn build_model(
     executor_config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor> {
     let hf_model_dir = config.hf_model_dir();
-    let init_result = match config.model_mode() {
-        Qwen35ModelMode::Vanilla => init_qwen_3_5_model(hf_model_dir, executor_config),
-        Qwen35ModelMode::MTP {
-            model_dir,
-            num_spec_tokens,
-        } => init_qwen_3_5_model_with_mtp(hf_model_dir, model_dir, *num_spec_tokens, executor_config),
-        Qwen35ModelMode::DSpark { model_dir } => {
-            init_qwen_3_5_model_with_dspark(hf_model_dir, model_dir, executor_config)
-        },
-        Qwen35ModelMode::DFlash2 { model_dir } => {
-            init_qwen_3_5_model_with_dflash2(hf_model_dir, model_dir, executor_config)
-        },
-    };
+    let init_result = (|| {
+        match config.model_mode() {
+            Qwen35ModelMode::Vanilla => init_qwen_3_5_model(hf_model_dir, executor_config),
+            Qwen35ModelMode::MTP {
+                model_dir,
+                num_spec_tokens,
+            } => init_qwen_3_5_model_with_mtp(hf_model_dir, model_dir, *num_spec_tokens, executor_config),
+            Qwen35ModelMode::DSpark {
+                model_dir,
+                num_spec_tokens,
+            } => {
+                let num_spec_tokens = match num_spec_tokens {
+                    Some(count) => *count,
+                    None => init_qwen3x_dspark_config(model_dir)?.num_spec_tokens(),
+                };
+                init_qwen_3_5_model_with_dspark(hf_model_dir, model_dir, num_spec_tokens, executor_config)
+            },
+            Qwen35ModelMode::DFlash2 {
+                model_dir,
+                num_spec_tokens,
+            } => {
+                let num_spec_tokens = match num_spec_tokens {
+                    Some(count) => *count,
+                    None => init_qwen3x_dflash2_config(model_dir)?.num_spec_tokens(),
+                };
+                init_qwen_3_5_model_with_dflash2(hf_model_dir, model_dir, num_spec_tokens, executor_config)
+            },
+        }
+    })();
     init_result.map_err(|error| {
         log_err_internal!(
             "unable to initialize {} model from {hf_model_dir:?} in mode {:?}: {error}",

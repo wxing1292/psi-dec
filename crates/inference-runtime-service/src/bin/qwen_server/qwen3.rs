@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use inference_executor_core::model::ReplayableDecoderModel;
+use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model;
@@ -60,16 +61,29 @@ fn run_inner() -> Result<()> {
     let model = match config.model_mode() {
         Qwen3ModelMode::DSpark {
             model_dir: dspark_model_dir,
+            num_spec_tokens,
         } => {
-            init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config).map_err(
-                |error| {
-                    log_err_internal!(
-                        "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
-                        config.hf_model_dir(),
-                        dspark_model_dir,
-                    )
+            let num_spec_tokens = match num_spec_tokens {
+                Some(count) => *count,
+                None => {
+                    init_qwen3x_dspark_config(dspark_model_dir)
+                        .map_err(|error| log_err_unavailable!("unable to read DSpark config: {error}"))?
+                        .num_spec_tokens()
                 },
-            )?
+            };
+            init_qwen_3_model_with_dspark(
+                config.hf_model_dir(),
+                dspark_model_dir,
+                num_spec_tokens,
+                executor_config,
+            )
+            .map_err(|error| {
+                log_err_internal!(
+                    "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
+                    config.hf_model_dir(),
+                    dspark_model_dir,
+                )
+            })?
         },
         Qwen3ModelMode::Vanilla => {
             init_qwen_3_model(config.hf_model_dir(), executor_config).map_err(|error| {

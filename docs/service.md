@@ -333,18 +333,19 @@ Select the Spec checkpoint with these paired arguments:
 ```
 
 An MTP checkpoint enables one speculative MTP step by default.
-`--num-spec-tokens K` is an MTP-only option. It takes a positive `usize` value.
-The value is the number of speculative tokens in one MTP proposal.
+`--num-spec-tokens K` sets the generated proposal count for MTP, DSpark, or DFlash2.
+It takes a positive `usize` value and remains fixed for the server lifetime.
 The executor reuses the checkpoint's one physical MTP layer for K dependent logical steps.
 Omit `--num-spec-tokens` to use one MTP step.
 `--max-tokens-per-request` must not exceed `--max-tokens`.
 For MTP with K speculative tokens, `--max-tokens-per-request` must be at least K.
 An MTP decode request must contain at least K initial input tokens.
-DSpark gets its proposal count from the checkpoint `block_size`.
-DFlash2 gets its query-block size from the checkpoint `block_size`.
-One DFlash2 query block contains one anchor and `block_size - 1` MASK proposal rows.
-The service rejects `--num-spec-tokens` with DSpark or DFlash2.
-The checkpoint-defined block geometry is independent of `--max-tokens-per-request`.
+Without an override, DSpark generates checkpoint `block_size` proposals and DFlash2 generates `block_size - 1` proposals.
+With `--num-spec-tokens K`, DSpark executes one anchor and `K - 1` MASK rows. All K rows predict proposals.
+DFlash2 executes one anchor and K MASK rows. Only the MASK rows predict proposals.
+The override changes draft computation, scratch, replay, and sampling. It does not change weights or checkpoint files.
+K must be smaller than `max_position_embeddings`. DFlash2 also requires `K + 1 < sliding_window`.
+The proposal count is independent of `--max-tokens-per-request`.
 That option limits the Main verification batch.
 The scheduler may verify only a proposal prefix.
 
@@ -382,8 +383,8 @@ One lifecycle owner stops both listeners in these conditions:
 - A listener fails.
 - The process receives SIGINT or SIGTERM.
 
-`--num-spec-tokens` requires `--spec-type mtp`.
-The service rejects zero, use with another Spec type, or an incomplete Spec checkpoint argument pair.
+`--num-spec-tokens` requires a supported `--spec-type` and `--hf-spec-model-dir`.
+The service rejects zero or an incomplete Spec checkpoint argument pair.
 For a Main-only run, omit both Spec checkpoint arguments and `--num-spec-tokens`.
 
 Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 384K pages. The Qwen3-14B geometry stores 16
@@ -404,7 +405,7 @@ At startup, each service derives the page count for one block from the initializ
 The service classifies a model-executor initialization failure as an internal startup error.
 
 The service also derives the runtime `context_window` from the Main model's `max_position_embeddings`. Vanilla and MTP
-use the Main value. DSpark and DFlash2 subtract the checkpoint-derived proposal count because the block-Spec model
+use the Main value. DSpark and DFlash2 subtract the runtime proposal count because the block-Spec model
 applies RoPE to the Main sampled anchor and the complete proposal block. Startup configuration logs include the
 effective `context_window`.
 
@@ -434,8 +435,8 @@ Qwen3.5 wiring derives this request-local GDN slot count:
 decision_candidate_states = match mode {
   Vanilla => 1,
   MTP { num_spec_tokens } => num_spec_tokens + 1,
-  DSpark { block_size } => block_size + 1,
-  DFlash2 { block_size } => block_size,
+  DSpark { num_spec_tokens } => num_spec_tokens + 1,
+  DFlash2 { num_spec_tokens } => num_spec_tokens + 1,
 }
 block_boundary_candidates = ceil(max_tokens_per_request / num_tokens_per_block)
 candidate_states = decision_candidate_states + block_boundary_candidates
@@ -1128,7 +1129,9 @@ scripts/qwen35_e2e_decode_perf.sh \
 
 Use `27b_mtp1`, `27b_mtp2`, `35b_mtp1`, or `35b_mtp2` to select an MTP proposal count.
 The `*_mtp` aliases run MTP proposal counts 1 and 2.
-The DSpark and DFlash2 cases use checkpoint-defined block geometry.
+The DSpark and DFlash2 cases use checkpoint defaults unless `--block-spec-tokens K` overrides the generated proposal count.
+This option does not change the MTP cases.
+For example, use `--cases 27b_dspark,27b_dflash2 --block-spec-tokens 2 --runs 3` to compare actual two-token proposals.
 The default case matrix uses this order:
 
 1. `27b_off`
@@ -1158,8 +1161,8 @@ It rejects a checkpoint that contains a BF16 matrix.
 The helper stops the server after each explicit case.
 It applies the configured cooldown between runnable cases. The default cooldown is 8 seconds.
 Each MTP summary label includes its proposal count, for example, `27b_mtp2`.
-DSpark and DFlash2 summary labels identify only the model and mode because their block geometry comes from the
-checkpoint.
+Default DSpark and DFlash2 summary labels identify the model and mode.
+An explicit proposal count adds a suffix, for example, `27b_dflash2_k2`.
 
 Both helpers record these facts:
 

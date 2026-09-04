@@ -115,13 +115,10 @@ impl Qwen3xDFlash2Output {
         params: Rc<SamplingParamsStore>,
         scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
-        assert_eq!(
-            num_spec_tokens,
-            config.num_spec_tokens().get(),
-            "Qwen3x DFlash2 proposal count must match the checkpoint"
-        );
         let num_spec_tokens = to_u32("Qwen3x DFlash2 proposal count", num_spec_tokens)?;
-        let spec_block_size = to_u32("Qwen3x DFlash2 Spec block size", config.block_size)?;
+        let spec_block_size = num_spec_tokens
+            .checked_add(1)
+            .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 query block size must fit u32"))?;
         let max_requests = to_u32("Qwen3x DFlash2 request capacity", max_requests)?;
         let hidden_dim = to_u32("Qwen3x DFlash2 hidden dimension", config.hidden_size)?;
         let vocab_size = to_u32("Qwen3x DFlash2 vocabulary", config.vocab_size)?;

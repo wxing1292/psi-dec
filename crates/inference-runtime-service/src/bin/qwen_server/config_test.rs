@@ -207,6 +207,7 @@ fn test_dspark_inputs_normalize_model_mode_and_cache_lanes() {
         qwen3.model_mode(),
         &Qwen3ModelMode::DSpark {
             model_dir: "qwen3-dspark".into(),
+            num_spec_tokens: None,
         }
     );
 
@@ -221,6 +222,7 @@ fn test_dspark_inputs_normalize_model_mode_and_cache_lanes() {
         qwen35.model_mode(),
         &Qwen35ModelMode::DSpark {
             model_dir: "qwen35-dspark".into(),
+            num_spec_tokens: None,
         }
     );
     assert_eq!(qwen35.num_cache_lanes(), 1);
@@ -239,6 +241,7 @@ fn test_dflash2_inputs_normalize_model_mode_and_cache_lanes() {
         qwen35.model_mode(),
         &Qwen35ModelMode::DFlash2 {
             model_dir: "qwen35-dflash2".into(),
+            num_spec_tokens: None,
         }
     );
     assert_eq!(qwen35.num_cache_lanes(), 1);
@@ -248,7 +251,11 @@ fn test_dflash2_inputs_normalize_model_mode_and_cache_lanes() {
 fn test_spec_tokens_require_a_speculator() {
     assert!(matches!(
         Qwen35Config::from_args(parse_qwen35(&["--num-spec-tokens", "1"])),
-        Err(Error::InvalidArgument(message)) if message.contains("requires --spec-type mtp")
+        Err(Error::InvalidArgument(message)) if message.contains("requires --spec-type")
+    ));
+    assert!(matches!(
+        Qwen3Config::from_args(parse_qwen3(&["--num-spec-tokens", "1"])),
+        Err(Error::InvalidArgument(message)) if message.contains("requires --spec-type")
     ));
 }
 
@@ -281,19 +288,49 @@ fn test_mtp_spec_tokens_fit_per_request_budget() {
 }
 
 #[test]
-fn test_num_spec_tokens_rejects_checkpoint_defined_block_spec_modes() {
-    for spec_type in ["dspark", "dflash2"] {
-        assert!(matches!(
-            Qwen35Config::from_args(parse_qwen35(&[
+fn test_num_spec_tokens_overrides_block_spec_modes() {
+    for count in ["1", "2", "3", "4", "7"] {
+        let num_spec_tokens = Some(NonZeroUsize::new(count.parse().unwrap()).unwrap());
+        for spec_type in ["dspark", "dflash2"] {
+            let config = Qwen35Config::from_args(parse_qwen35(&[
                 "--hf-spec-model-dir",
                 "spec-model",
                 "--spec-type",
                 spec_type,
                 "--num-spec-tokens",
-                "7",
-            ])),
-            Err(Error::InvalidArgument(message)) if message.contains("controls MTP proposal length")
-        ));
+                count,
+            ]))
+            .unwrap();
+            let expected = if spec_type == "dspark" {
+                Qwen35ModelMode::DSpark {
+                    model_dir: "spec-model".into(),
+                    num_spec_tokens,
+                }
+            } else {
+                Qwen35ModelMode::DFlash2 {
+                    model_dir: "spec-model".into(),
+                    num_spec_tokens,
+                }
+            };
+            assert_eq!(config.model_mode(), &expected);
+            assert_eq!(config.num_cache_lanes(), 1);
+        }
+        let config = Qwen3Config::from_args(parse_qwen3(&[
+            "--hf-spec-model-dir",
+            "spec-model",
+            "--spec-type",
+            "dspark",
+            "--num-spec-tokens",
+            count,
+        ]))
+        .unwrap();
+        assert_eq!(
+            config.model_mode(),
+            &Qwen3ModelMode::DSpark {
+                model_dir: "spec-model".into(),
+                num_spec_tokens
+            }
+        );
     }
 }
 

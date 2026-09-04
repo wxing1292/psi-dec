@@ -265,7 +265,14 @@ impl MainFixture {
             num_tokens_per_block: 1024,
         };
         let model = match dspark_model_dir {
-            Some(dspark_model_dir) => init_qwen_3_model_with_dspark(model_dir, dspark_model_dir, executor_config),
+            Some(dspark_model_dir) => {
+                init_qwen_3_model_with_dspark(
+                    model_dir,
+                    dspark_model_dir,
+                    init_qwen3x_dspark_config(dspark_model_dir).unwrap().num_spec_tokens(),
+                    executor_config,
+                )
+            },
             None => init_qwen_3_model(model_dir, executor_config),
         }
         .expect("unable to initialize Main comparison executor");

@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -23,6 +24,7 @@ use crate::sampling::sampling_params::SamplingParamsStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDFlash2LoadConfig {
+    pub num_spec_tokens: NonZeroUsize,
     pub page_size_bytes: usize,
     pub max_position_embeddings: usize,
     pub max_requests: usize,
@@ -55,8 +57,8 @@ pub fn load_qwen3x_dflash2(
     main_unembed: Rc<Unembed>,
     sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDFlash2Loaded, ModelExecutorError> {
-    let num_spec_tokens = config.num_spec_tokens().get();
-    let spec_block_size = config.block_size;
+    let num_spec_tokens = load_config.num_spec_tokens.get();
+    let spec_block_size = num_spec_tokens + 1;
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let Qwen3xDFlash2WeightBindings {
         main_feature,

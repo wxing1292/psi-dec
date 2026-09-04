@@ -28,7 +28,10 @@ struct SpecCheckpoint {
 #[derive(Debug, Eq, PartialEq)]
 pub enum Qwen3ModelMode {
     Vanilla,
-    DSpark { model_dir: PathBuf },
+    DSpark {
+        model_dir: PathBuf,
+        num_spec_tokens: Option<NonZeroUsize>,
+    },
 }
 
 #[derive(Debug)]
@@ -47,6 +50,9 @@ pub struct Qwen3Config {
 impl Qwen3Config {
     pub fn from_args(args: Qwen3Args) -> Result<Self> {
         let spec_checkpoint = normalize_spec_checkpoint(args.spec.hf_spec_model_dir, args.spec.spec_type)?;
+        if args.spec.num_spec_tokens.is_some() && spec_checkpoint.is_none() {
+            return Err(log_info_invalid_argument!("--num-spec-tokens requires --spec-type"));
+        }
         validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
@@ -70,7 +76,12 @@ impl Qwen3Config {
             Some(SpecCheckpoint {
                 model_dir,
                 spec_type: QwenSpecType::DSpark,
-            }) => Qwen3ModelMode::DSpark { model_dir },
+            }) => {
+                Qwen3ModelMode::DSpark {
+                    model_dir,
+                    num_spec_tokens: args.spec.num_spec_tokens,
+                }
+            },
             Some(_) => {
                 return Err(log_info_invalid_argument!("Qwen3 supports only --spec-type dspark"));
             },
@@ -242,9 +253,11 @@ pub enum Qwen35ModelMode {
     },
     DSpark {
         model_dir: PathBuf,
+        num_spec_tokens: Option<NonZeroUsize>,
     },
     DFlash2 {
         model_dir: PathBuf,
+        num_spec_tokens: Option<NonZeroUsize>,
     },
 }
 
@@ -285,12 +298,10 @@ impl Qwen35Config {
                 ..
             })
         );
-        if args.num_spec_tokens.is_some() && !is_mtp {
-            return Err(log_info_invalid_argument!(
-                "--num-spec-tokens controls MTP proposal length and requires --spec-type mtp"
-            ));
+        if args.spec.num_spec_tokens.is_some() && spec_checkpoint.is_none() {
+            return Err(log_info_invalid_argument!("--num-spec-tokens requires --spec-type"));
         }
-        let num_mtp_tokens = is_mtp.then(|| args.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
+        let num_mtp_tokens = is_mtp.then(|| args.spec.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
         validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         validate_mtp_scheduler_capacity(num_mtp_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
@@ -324,11 +335,21 @@ impl Qwen35Config {
             Some(SpecCheckpoint {
                 model_dir,
                 spec_type: QwenSpecType::DSpark,
-            }) => Qwen35ModelMode::DSpark { model_dir },
+            }) => {
+                Qwen35ModelMode::DSpark {
+                    model_dir,
+                    num_spec_tokens: args.spec.num_spec_tokens,
+                }
+            },
             Some(SpecCheckpoint {
                 model_dir,
                 spec_type: QwenSpecType::DFlash2,
-            }) => Qwen35ModelMode::DFlash2 { model_dir },
+            }) => {
+                Qwen35ModelMode::DFlash2 {
+                    model_dir,
+                    num_spec_tokens: args.spec.num_spec_tokens,
+                }
+            },
         };
         Ok(Self {
             grpc_listen_addr: args.grpc_listen_addr,
