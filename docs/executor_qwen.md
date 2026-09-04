@@ -109,6 +109,9 @@ crates/inference-executor-metal/src/
         layer.rs            Qwen35MainLayer variants and role-specific scratch
         output.rs           Qwen35 gather/unembed component and replay key
       mtp/
+        decode_plan.rs        acceptance-aware Decode token/index plan
+        hidden_state_cache.rs per-request BF16 hidden cache and tail metadata
+        hidden_state_transfer.rs previous-hidden gather and retained-tail scatter
         mod.rs              supported one-layer Qwen35MTP owner and replay key
         embed.rs            Qwen35MTPEmbed and its replay key
         layer.rs            Qwen35MTPLayer and role-specific scratch
@@ -708,7 +711,8 @@ Production `Replay<Qwen35MTP>` supplies the stage active-token parameter.
 The recorder normally fuses the attention residual with the post-attention normalization.
 It also normally fuses the final MLP residual with the output normalization.
 The residual kernels remain correct if either fusion opportunity is unavailable.
-Every logical MTP step uses the same active token count, selected capacity, metadata shape, and recorded program.
+Logical MTP steps can use different active token counts and selected capacities.
+Each step prepares its own metadata and reuses the program for its selected topology.
 MTPEmbed, MTP body, and GatherUnembed retain separate replay parameter domains.
 
 Qwen3.5 GatherUnembed owns one output-row-capacity replay domain.
@@ -1044,6 +1048,13 @@ MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
 
 Each non-final step waits for its sampled token before the next step starts.
 The public Spec lifecycle remains one transaction.
+
+The request-local cache metadata is `Empty`, `Prefill`, or `Decode`.
+Each nonempty state stores the pending Main index and `K` cached tail token IDs, not the uncached final draft.
+Decode metadata and retained BF16 hidden rows survive turn completion.
+The next input must keep the anchor and index. A changed cached continuation prefix repairs MTP from old `x1`.
+Main does not replay tokens. Recurrent GDN keeps the same unshifted transaction contract.
+Only Decode writes the retained hidden rows. Metadata changes after the full MTP wave completes.
 
 [`mtp_design.md`](mtp_design.md) documents the complete current component contract.
 

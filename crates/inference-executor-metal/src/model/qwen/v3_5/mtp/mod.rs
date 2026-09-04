@@ -76,6 +76,7 @@ use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
+pub mod decode_plan;
 pub mod embed;
 pub mod hidden_state_cache;
 pub mod hidden_state_transfer;

@@ -20,7 +20,6 @@ use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedInput;
-use crate::model::gather::Gather;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
@@ -33,7 +32,6 @@ const QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
 
 pub struct Qwen35MTPEmbed {
     embed: Option<Rc<Embed>>,
-    input_gather: Gather,
     hidden_norm: RMSNorm,
     embedding_norm: RMSNorm,
     concat: bf16_concat_rows::Kernel,
@@ -48,8 +46,6 @@ pub struct Qwen35MTPEmbed {
 #[derive(Clone, Copy)]
 pub struct Qwen35MTPEmbedArgs<'a> {
     pub num_tokens: u32,
-    pub prev_hidden_source: &'a Buffer,
-    pub prev_hidden_indices: &'a Buffer,
     pub prev_hidden_input: &'a Buffer,
     pub token_ids: &'a Buffer,
     pub token_hidden_input: &'a Buffer,
@@ -106,12 +102,6 @@ impl Qwen35MTPEmbed {
             ReplayBucketPolicy::with_topology_boundaries(max_tokens_u32, &fc.topology_boundaries());
         Ok(Self {
             embed: Some(embed),
-            input_gather: Gather::new(
-                device,
-                hidden_dim
-                    .try_into()
-                    .expect("qwen3.5 MTP hidden dimension must fit u32"),
-            ),
             hidden_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
             embedding_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
             concat: bf16_concat_rows::Kernel::new(
@@ -281,14 +271,6 @@ impl Qwen35MTPEmbed {
                 );
             },
         }
-        self.input_gather.record(
-            recorder,
-            num_total_tokens,
-            num_active_tokens,
-            args.prev_hidden_source,
-            args.prev_hidden_indices,
-            args.prev_hidden_input,
-        );
         let _ = <Embed as ReplayLayer>::record(
             self.loaded_embed(),
             recorder,
@@ -553,8 +535,6 @@ mod tests {
     }
 
     struct TestBuffers {
-        prev_hidden_source: Buffer,
-        prev_hidden_indices: Buffer,
         prev_hidden_input: Buffer,
         token_ids: Buffer,
         token_hidden_input: Buffer,
@@ -576,10 +556,15 @@ mod tests {
                 .collect::<Vec<_>>();
             let prev_hidden_index_values = vec![7, 1, 15, 3, 20, 0, 31, 9];
             let token_id_values = vec![4, 17, 2, 29, 11, 0, 23, 8];
+            let selected_prev_hidden_bits = prev_hidden_index_values
+                .iter()
+                .flat_map(|&row_index| {
+                    let begin = row_index as usize * HIDDEN_DIM as usize;
+                    prev_hidden_bits[begin..begin + HIDDEN_DIM as usize].iter().copied()
+                })
+                .collect::<Vec<_>>();
             Self {
-                prev_hidden_source: Buffer::from_slice(device, &prev_hidden_bits),
-                prev_hidden_indices: Buffer::from_slice(device, &prev_hidden_index_values),
-                prev_hidden_input: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
+                prev_hidden_input: Buffer::from_slice(device, &selected_prev_hidden_bits),
                 token_ids: Buffer::from_slice(device, &token_id_values),
                 token_hidden_input: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
                 hidden_output: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
@@ -592,8 +577,6 @@ mod tests {
         fn input(&self, num_tokens: u32) -> Qwen35MTPEmbedArgs<'_> {
             Qwen35MTPEmbedArgs {
                 num_tokens,
-                prev_hidden_source: &self.prev_hidden_source,
-                prev_hidden_indices: &self.prev_hidden_indices,
                 prev_hidden_input: &self.prev_hidden_input,
                 token_ids: &self.token_ids,
                 token_hidden_input: &self.token_hidden_input,
@@ -738,7 +721,6 @@ mod tests {
             .collect::<Vec<_>>();
         let component = Qwen35MTPEmbed {
             embed: Some(embed),
-            input_gather: Gather::new(device, HIDDEN_DIM),
             hidden_norm,
             embedding_norm,
             concat: bf16_concat_rows::Kernel::new(

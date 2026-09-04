@@ -59,6 +59,7 @@ use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbed;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::hidden_state_cache::Qwen35MTPHiddenStateCache;
+use crate::model::qwen::v3_5::mtp::hidden_state_transfer::Qwen35MTPHiddenStateTransfer;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
 use crate::model::qwen::v3_x::dflash2::load::Qwen3xDFlash2LoadConfig;
@@ -343,8 +344,11 @@ pub fn init_qwen_3_5_model_with_mtp(
     model_dir: impl AsRef<Path>,
     mtp_model_dir: impl AsRef<Path>,
     num_spec_tokens: NonZeroUsize,
-    config: Qwen35ExecutorConfig,
+    mut config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
+    // Runtime retains the Main token budget. Shared Main/MTP workspaces must
+    // also fit a mixed batch whose Decode requests submit no drafts.
+    config.max_tokens = qwen35_mtp_token_capacity(config.max_tokens, config.max_requests, num_spec_tokens);
     let mtp_model_dir = mtp_model_dir.as_ref();
     let mtp_config = init_qwen35_model_config(mtp_model_dir)?;
     init_qwen_3_5_model_inner(
@@ -356,6 +360,19 @@ pub fn init_qwen_3_5_model_with_mtp(
         },
         config,
     )
+}
+
+fn qwen35_mtp_token_capacity(max_tokens: usize, max_requests: usize, num_spec_tokens: NonZeroUsize) -> usize {
+    // Ordinary Prefill has equal Main/MTP row counts. Decode or tail-repair
+    // Prefill can add at most K - 1 rows per request beyond the Main input.
+    // Every request consumes at least one Main row.
+    let extra_rows = max_requests
+        .min(max_tokens)
+        .checked_mul(num_spec_tokens.get() - 1)
+        .expect("qwen3.5 MTP extra token capacity must fit usize");
+    max_tokens
+        .checked_add(extra_rows)
+        .expect("qwen3.5 MTP token capacity must fit usize")
 }
 
 pub fn init_qwen_3_5_model_with_dspark(
@@ -860,7 +877,12 @@ fn init_qwen_3_5_model_inner(
                 common: speculative_resources(),
                 num_spec_tokens: num_spec_tokens.get(),
                 hidden_input: Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes())),
-                input_gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
+                previous_hidden_routes: Buffer::new_zeroed_elements(&device, config.max_tokens * 2, Dtype::Uint32),
+                hidden_state_cache_write_routes: Buffer::new_zeroed_elements(
+                    &device,
+                    config.max_tokens * 2,
+                    Dtype::Uint32,
+                ),
                 draft_distribution_indices: Buffer::new_zeroed_elements(&device, config.max_requests, Dtype::Uint32),
                 previous_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
                 hidden_state_cache: Qwen35MTPHiddenStateCache::new(
@@ -869,6 +891,14 @@ fn init_qwen_3_5_model_inner(
                     num_spec_tokens.get(),
                     layout.hidden_dim as usize,
                 ),
+                hidden_state_transfers: (0..num_spec_tokens.get())
+                    .map(|_| {
+                        Replay::new(
+                            "qwen3.5 MTP hidden-state transfer",
+                            Qwen35MTPHiddenStateTransfer::new(&device, layout.hidden_dim as usize, config.max_tokens),
+                        )
+                    })
+                    .collect(),
                 embed: Replay::new("qwen3.5 MTPEmbed", mtp_embed),
                 body: Replay::new("qwen3.5 MTP", mtp),
                 sampling: Replay::new(
@@ -959,5 +989,30 @@ mod tests {
             qwen35_gdn_state_capacity_for_num_spec_tokens(3, 16, 8),
             GDNStateCapacity::new(7, 6, 2)
         );
+    }
+
+    #[test]
+    fn test_mtp_token_capacity_covers_mixed_prefill_and_zero_draft_decode() {
+        assert_eq!(qwen35_mtp_token_capacity(128, 4, NonZeroUsize::new(1).unwrap()), 128);
+        assert_eq!(qwen35_mtp_token_capacity(128, 4, NonZeroUsize::new(3).unwrap()), 136);
+        for max_tokens in 1..16 {
+            for max_requests in 1..8 {
+                for num_spec_tokens in 1..8 {
+                    let capacity = qwen35_mtp_token_capacity(
+                        max_tokens,
+                        max_requests,
+                        NonZeroUsize::new(num_spec_tokens).unwrap(),
+                    );
+                    for num_decode_reqs in 0..=max_tokens.min(max_requests) {
+                        let prefill_rows = max_tokens - num_decode_reqs;
+                        let mtp_rows = prefill_rows + num_decode_reqs * num_spec_tokens;
+                        assert!(mtp_rows <= capacity);
+                        let max_prefill_reqs = (max_requests - num_decode_reqs).min(prefill_rows);
+                        let repaired_mtp_rows = mtp_rows + max_prefill_reqs * (num_spec_tokens - 1);
+                        assert!(repaired_mtp_rows <= capacity);
+                    }
+                }
+            }
+        }
     }
 }

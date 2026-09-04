@@ -108,10 +108,18 @@ use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbedReplayKey;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::Qwen35MTPArgs;
 use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
+use crate::model::qwen::v3_5::mtp::decode_plan::Qwen35MTPDecodePlan;
+use crate::model::qwen::v3_5::mtp::decode_plan::Qwen35MTPDecodeTokenSource;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedArgs;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
+use crate::model::qwen::v3_5::mtp::hidden_state_cache::Qwen35MTPCacheState;
 use crate::model::qwen::v3_5::mtp::hidden_state_cache::Qwen35MTPHiddenStateCache;
+use crate::model::qwen::v3_5::mtp::hidden_state_transfer::Qwen35MTPHiddenStateTransfer;
+use crate::model::qwen::v3_5::mtp::hidden_state_transfer::Qwen35MTPHiddenStateTransferArgs;
+use crate::model::qwen::v3_5::mtp::hidden_state_transfer::Qwen35MTPHiddenStateTransferPlan;
+use crate::model::qwen::v3_5::mtp::hidden_state_transfer::Qwen35MTPHiddenStateTransferReplayKey;
+use crate::model::qwen::v3_5::mtp::hidden_state_transfer::append_mtp_hidden_state_cache_write_routes;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2DecodeRecording;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2PrefillRecording;
@@ -245,10 +253,12 @@ struct Qwen35MTPSpeculator {
     common: Qwen35SpeculativeResources,
     num_spec_tokens: usize,
     hidden_input: Rc<Buffer>,
-    input_gather_flat_indices: Buffer,
+    previous_hidden_routes: Buffer,
+    hidden_state_cache_write_routes: Buffer,
     draft_distribution_indices: Buffer,
     previous_hidden: Buffer,
     hidden_state_cache: Qwen35MTPHiddenStateCache,
+    hidden_state_transfers: Vec<Replay<Qwen35MTPHiddenStateTransfer>>,
     embed: Replay<Qwen35MTPEmbed>,
     body: Replay<Qwen35MTP>,
     sampling: Replay<DraftSampling>,
@@ -261,7 +271,9 @@ struct Qwen35MTPExecution {
     draft_token_ids: Vec<i32>,
     draft_probs: Vec<f32>,
     read_elapsed: Duration,
+    build_elapsed: Duration,
     completed_steps: usize,
+    pending_hidden_state_cache_write_routes: Vec<u32>,
 }
 
 impl Qwen35MTPExecution {
@@ -274,7 +286,9 @@ impl Qwen35MTPExecution {
             draft_token_ids: Vec::with_capacity(proposal_capacity),
             draft_probs: Vec::with_capacity(proposal_capacity),
             read_elapsed: Duration::ZERO,
+            build_elapsed: Duration::ZERO,
             completed_steps: 0,
+            pending_hidden_state_cache_write_routes: Vec::with_capacity(num_spec_tokens * max_requests * 2),
         }
     }
 
@@ -283,7 +297,9 @@ impl Qwen35MTPExecution {
         self.draft_token_ids.clear();
         self.draft_probs.clear();
         self.read_elapsed = Duration::ZERO;
+        self.build_elapsed = Duration::ZERO;
         self.completed_steps = 0;
+        self.pending_hidden_state_cache_write_routes.clear();
     }
 
     fn push_step(&mut self, draft_token_ids: &[i32], draft_probs: &[f32], read_elapsed: Duration) {
@@ -437,6 +453,9 @@ impl Qwen35Speculator {
             Self::MTP(mtp) => {
                 mtp.embed.clear();
                 mtp.body.clear();
+                for transfer in &mut mtp.hidden_state_transfers {
+                    transfer.clear();
+                }
                 mtp.sampling.clear();
                 mtp.common.rejection_sampling.clear();
             },
@@ -936,6 +955,8 @@ pub struct Qwen35ModelOpsRecorder {
     rejection_prepared: Option<PreparedRejection>,
     rejection_build_elapsed: Duration,
     num_main_sample_rows: usize,
+    mtp_hidden_state_transfer_key: Option<Qwen35MTPHiddenStateTransferReplayKey>,
+    mtp_hidden_state_transfer_arguments: ReplayArguments,
     mtp_embed_key: Option<Qwen35MTPEmbedReplayKey>,
     mtp_embed_arguments: ReplayArguments,
     mtp_key: Option<Qwen35MTPReplayKey>,
@@ -972,22 +993,51 @@ impl Qwen35ModelOpsRecorder {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-
+#[derive(Clone, Debug, PartialEq)]
 struct Qwen35MTPRequest {
-    num_tokens: usize,
-    current_token_ids: Vec<i32>,
-    prefill_token_ids_by_step: Vec<Vec<i32>>,
-    next_token_id: Option<i32>,
-    decision_index: Option<usize>,
+    req_slot: RawRequestSlot,
+    block_index: usize,
+    main_hidden_flat_start: usize,
+    pending_token_index: u32,
+    next_pending_token_index: u32,
+    repair_tail: bool,
+    sampler_config: SamplerConfig,
+    kind: Qwen35MTPRequestKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Qwen35MTPRequestKind {
+    Prefill {
+        token_ids_by_module: Vec<Vec<i32>>,
+    },
+    Decode {
+        continuation_token_ids: Vec<i32>,
+        sampled_token_id: i32,
+        proposal_sample_position: u32,
+        decision_index: usize,
+    },
 }
 
 struct Qwen35MTPBatch {
     microbatch: Qwen35Microbatch,
-    input_gather_flat_indices: Vec<u32>,
+    previous_hidden_routes: Vec<u32>,
+    hidden_state_cache_write_routes: Vec<u32>,
     draft_distribution_indices: Vec<u32>,
     sampler_configs: Vec<SamplerConfig>,
     sample_positions: Vec<u32>,
+}
+
+struct Qwen35MTPRecordedStep {
+    hidden_state_transfer_key: Qwen35MTPHiddenStateTransferReplayKey,
+    hidden_state_transfer_arguments: ReplayArguments,
+    embed_key: Qwen35MTPEmbedReplayKey,
+    embed_arguments: ReplayArguments,
+    body_key: Qwen35MTPReplayKey,
+    gqa_shape: GQAReplayShape,
+    gqa_topology: crate::attn::gqa::backend::GQAReplayTopology,
+    gather_unembed: Option<(Qwen35GatherUnembedReplayKey, ReplayArguments)>,
+    sampling: Option<(TopKSamplingReplayKey, ReplayArguments)>,
+    num_sample_rows: usize,
 }
 
 fn mtp_proposal_sample_position(token_index: u32, num_tokens: u32, step_index: u32) -> u32 {
@@ -1240,6 +1290,8 @@ impl ReplayableDecoderModel for Qwen35Executor {
             rejection_prepared: None,
             rejection_build_elapsed: Duration::ZERO,
             num_main_sample_rows: num_main_output_rows(model_batch_request.microbatch()),
+            mtp_hidden_state_transfer_key: None,
+            mtp_hidden_state_transfer_arguments: ReplayArguments::new(),
             mtp_embed_key: None,
             mtp_embed_arguments: ReplayArguments::new(),
             mtp_key: None,
