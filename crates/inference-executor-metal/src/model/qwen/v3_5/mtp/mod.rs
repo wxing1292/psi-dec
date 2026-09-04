@@ -78,6 +78,7 @@ use crate::replay::ReplayComponent;
 
 pub mod embed;
 pub mod hidden_state_cache;
+pub mod hidden_state_transfer;
 pub mod layer;
 
 pub const QWEN35_MTP_GQA_LAYER_INDEX: ReplayParameterKey = ReplayParameterKey::new("qwen3.5.mtp.gqa_layer_index");

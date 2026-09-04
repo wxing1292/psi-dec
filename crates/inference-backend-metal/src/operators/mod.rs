@@ -32,4 +32,6 @@ pub mod bias_activation_bf16;
 pub mod conv2d_unfold;
 pub mod matmul_bf16;
 pub mod row_gather;
+pub mod row_route;
+pub mod row_scatter;
 pub mod softmax;
