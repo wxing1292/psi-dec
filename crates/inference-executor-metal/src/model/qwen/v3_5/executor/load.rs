@@ -58,6 +58,7 @@ use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembed;
 use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbed;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
+use crate::model::qwen::v3_5::mtp::hidden_state_cache::Qwen35MTPHiddenStateCache;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
 use crate::model::qwen::v3_x::dflash2::load::Qwen3xDFlash2LoadConfig;
@@ -862,6 +863,12 @@ fn init_qwen_3_5_model_inner(
                 input_gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
                 draft_distribution_indices: Buffer::new_zeroed_elements(&device, config.max_requests, Dtype::Uint32),
                 previous_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
+                hidden_state_cache: Qwen35MTPHiddenStateCache::new(
+                    &device,
+                    config.max_requests,
+                    num_spec_tokens.get(),
+                    layout.hidden_dim as usize,
+                ),
                 embed: Replay::new("qwen3.5 MTPEmbed", mtp_embed),
                 body: Replay::new("qwen3.5 MTP", mtp),
                 sampling: Replay::new(

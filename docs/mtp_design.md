@@ -125,6 +125,22 @@ A reset clears both page-table bindings, while runtime core retains physical-pag
 Snapshots use `mtp-gqa-request-page-table`.
 Token, hidden, logits, and sampling workspaces are ephemeral.
 
+The MTP owner allocates one reusable BF16 hidden-state cache.
+Logical module `m` stores `m + 1` rows for each request slot.
+The final module stores no rows because no later module consumes its output.
+For `R` request slots and `K` MTP modules, the cache contains this number of rows:
+
+```text
+R * K * (K - 1) / 2
+```
+
+The cache uses a module-major layout.
+Each request slot owns `Qwen35MTPCacheState`: `Empty`, `Prefill`, or `Decode`.
+Each nonempty variant stores the pending Main index and K cached tail token IDs.
+For K=3, Decode stores `[w, x1, x2]`. The final draft has no cached KV slot.
+The enum distinguishes canonical Prefill lookahead from Decode metadata with retained hidden rows.
+Request-slot reset selects `Empty`. The input preparation commit connects this metadata to execution.
+
 The next Main call replays `K - 1` verified tail tokens.
 MTP shifts the related GDN decision-candidate versions by `K - 1`.
 See [`executor_gdn.md`](executor_gdn.md) for the state-version contract.
@@ -156,6 +172,7 @@ crates/inference-executor-metal/src/model/qwen/v3_5/
   component_config.rs        Main/MTP compatibility validation
   mtp/
     embed.rs                 hidden and token input composition
+    hidden_state_cache.rs          per-request cross-step BF16 hidden-state cache
     layer.rs                 physical GQA and MLP layer
     mod.rs                   body, final norm, and replay key
   executor/

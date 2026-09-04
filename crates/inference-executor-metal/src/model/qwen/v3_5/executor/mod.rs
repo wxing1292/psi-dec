@@ -111,6 +111,7 @@ use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedArgs;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
+use crate::model::qwen::v3_5::mtp::hidden_state_cache::Qwen35MTPHiddenStateCache;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2DecodeRecording;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2PrefillRecording;
@@ -247,6 +248,7 @@ struct Qwen35MTPSpeculator {
     input_gather_flat_indices: Buffer,
     draft_distribution_indices: Buffer,
     previous_hidden: Buffer,
+    hidden_state_cache: Qwen35MTPHiddenStateCache,
     embed: Replay<Qwen35MTPEmbed>,
     body: Replay<Qwen35MTP>,
     sampling: Replay<DraftSampling>,
@@ -415,6 +417,7 @@ impl Qwen35Speculator {
             Self::Vanilla => {},
             Self::MTP(mtp) => {
                 mtp.gqa_state.reset_req_slots(request_slots);
+                mtp.hidden_state_cache.reset_req_slots(request_slots);
                 mtp.common.spec_probs.reset_req_slots(request_slots);
             },
             Self::DSpark(dspark) => {
