@@ -69,14 +69,14 @@ pub struct Qwen3Args {
 
     #[arg(
         long,
-        default_value = "393216",
+        default_value = "294912",
         help = "Total shared cache pages used by GQA KV cache and GDN state cache"
     )]
     pub num_cache_pages: NonZeroUsize,
 
     #[arg(
         long,
-        default_value = "4",
+        default_value = "2",
         help = "Maximum running requests and requests scheduled per batch"
     )]
     pub max_requests: NonZeroUsize,
@@ -182,14 +182,14 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        default_value = "393216",
+        default_value = "294912",
         help = "Total shared cache pages used by GQA KV cache and GDN state cache"
     )]
     pub num_cache_pages: NonZeroUsize,
 
     #[arg(
         long,
-        default_value = "4",
+        default_value = "2",
         help = "Maximum running requests and requests scheduled per batch"
     )]
     pub max_requests: NonZeroUsize,
@@ -241,10 +241,10 @@ mod tests {
     fn test_scheduler_defaults() {
         let args = Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model"]).unwrap();
 
-        assert_eq!(args.max_requests.get(), 4);
+        assert_eq!(args.max_requests.get(), 2);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages.get(), 384 * 1024);
+        assert_eq!(args.num_cache_pages.get(), 288 * 1024);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
         assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
@@ -255,10 +255,10 @@ mod tests {
 
         assert_eq!(args.grpc_listen_addr, "127.0.0.1:50051".parse().unwrap());
         assert_eq!(args.http_listen_addr, "127.0.0.1:8000".parse().unwrap());
-        assert_eq!(args.max_requests.get(), 4);
+        assert_eq!(args.max_requests.get(), 2);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages.get(), 384 * 1024);
+        assert_eq!(args.num_cache_pages.get(), 288 * 1024);
         assert_eq!(args.spec.hf_spec_model_dir, None);
         assert_eq!(args.spec.spec_type, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);

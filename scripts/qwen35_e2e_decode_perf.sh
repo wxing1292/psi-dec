@@ -41,8 +41,8 @@ SEED=42
 TEMPERATURE=0.7
 TOP_K=20
 TOP_P=0.8
-NUM_CACHE_PAGES=393216
-MAX_REQUESTS=4
+NUM_CACHE_PAGES=294912
+MAX_REQUESTS=2
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
 CACHE_BLOCK_TOKENS=2048
@@ -52,9 +52,7 @@ REFERENCE_COMMIT="fa5016c5ce49f4ff31dadf3464587bf4e91631a5"
 REFERENCE_DIRTY=0
 REFERENCE_OS_VERSION="27.0"
 REFERENCE_ARCH="arm64"
-REFERENCE_NUM_CACHE_PAGES=393216
 REFERENCE_CACHE_BLOCK_TOKENS=2048
-REFERENCE_MAX_REQUESTS=4
 REFERENCE_MAX_TOKENS=128
 REFERENCE_MAX_TOKENS_PER_REQUEST=64
 REFERENCE_CASE_COOLDOWN_SECS=8
@@ -126,8 +124,8 @@ Options:
   --temperature N       Sampling temperature. Default: 0.7
   --top-k N             Sampling top-k. Default: 20
   --top-p N             Sampling top-p. Default: 0.8
-  --num-cache-pages N   Shared cache pages. Default: 393216
-  --max-requests N      Scheduler request capacity. Default: 4
+  --num-cache-pages N   Shared cache pages. Default: 294912
+  --max-requests N      Scheduler request capacity. Default: 2
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
   --max-tokens-per-request N
                         Scheduler per-request token capacity. Default: 64
@@ -485,7 +483,7 @@ require_nonnegative_integer "--case-cooldown-secs" "$CASE_COOLDOWN_SECS"
 require_nonnegative_integer "--seed" "$SEED"
 require_positive_integer "--top-k" "$TOP_K"
 
-if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'; then
+if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'
 import math
 import os
 
@@ -503,6 +501,7 @@ if temperature < 0:
 if not 0 <= top_p <= 1:
     raise SystemExit("--top-p must be in [0, 1]")
 PY
+then
     exit 2
 fi
 
@@ -946,11 +945,8 @@ reference_config_mismatches() {
     [[ "$current_os" == "$REFERENCE_OS_VERSION" ]] || mismatches="${mismatches:+$mismatches,}os"
     [[ "$current_arch" == "$REFERENCE_ARCH" ]] || mismatches="${mismatches:+$mismatches,}arch"
     [[ "$current_dirty" == "$REFERENCE_DIRTY" ]] || mismatches="${mismatches:+$mismatches,}dirty"
-    [[ "$NUM_CACHE_PAGES" == "$REFERENCE_NUM_CACHE_PAGES" ]] ||
-        mismatches="${mismatches:+$mismatches,}num_cache_pages"
     [[ "$CACHE_BLOCK_TOKENS" == "$REFERENCE_CACHE_BLOCK_TOKENS" ]] ||
         mismatches="${mismatches:+$mismatches,}cache_block_tokens"
-    [[ "$MAX_REQUESTS" == "$REFERENCE_MAX_REQUESTS" ]] || mismatches="${mismatches:+$mismatches,}max_requests"
     [[ "$MAX_TOKENS" == "$REFERENCE_MAX_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}max_tokens"
     [[ "$MAX_TOKENS_PER_REQUEST" == "$REFERENCE_MAX_TOKENS_PER_REQUEST" ]] ||
         mismatches="${mismatches:+$mismatches,}max_tokens_per_request"
@@ -1225,7 +1221,7 @@ run_decode() {
         tail -n 120 "$server_log" >&2 || true
         return 1
     fi
-    if ! JSON_LINE="$json" SERVER_LOG="$server_log" SERVER_LOG_OFFSET="$server_log_offset" python3 - <<'PY'; then
+    if ! JSON_LINE="$json" SERVER_LOG="$server_log" SERVER_LOG_OFFSET="$server_log_offset" python3 - <<'PY'
 import json
 import os
 import re
@@ -1287,6 +1283,7 @@ print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f},{},{},{}"
     encode_rates(acceptance_rate_by_index),
 ))
 PY
+    then
         echo "DECODE_STATS_INVALID label=$label max_new=$tokens prompt=$prompt_id run=$run client_output=$out server_log=$server_log" >&2
         tail -n 80 "$out" >&2 || true
         tail -n 120 "$server_log" >&2 || true
@@ -1413,39 +1410,40 @@ run_server_case() {
             fi
 
             local summary
-            summary="$(VALS="$vals" \
-                INPUTS="$inputs" \
-                CHUNKS="$chunks" \
-                SAMPLES="$samples" \
-                TTFTS="$ttfts" \
-                PROMPT_RATES="$prompt_rates" \
-                INTER_CHUNK_P50S="$inter_chunk_p50s" \
-                INTER_CHUNK_P95S="$inter_chunk_p95s" \
-                PROPOSED_SPECS="$proposed_specs" \
-                VERIFIED_SPECS="$verified_specs" \
-                ACCEPTANCE_RATES="$acceptance_rates" \
-                TOKENS_PER_CHUNKS="$tokens_per_chunks" \
-                SPEC_BY_INDEX="$spec_by_index" \
-                VERIFIED_BY_INDEX="$verified_by_index" \
-                LABEL="$label" \
-                TOKENS="$tokens" \
-                PROMPT_ID="$prompt_id" \
-                REFERENCE_DECODE="$reference_decode" \
-                REFERENCE_TTFT="$reference_ttft" \
-                REFERENCE_PROMPT_RATE="$reference_prompt_rate" \
-                REFERENCE_INTER_CHUNK_P50="$reference_inter_chunk_p50" \
-                REFERENCE_INTER_CHUNK_P95="$reference_inter_chunk_p95" \
-                REFERENCE_TOKENS_PER_CHUNK="$reference_tokens_per_chunk" \
-                REFERENCE_ACCEPTANCE_RATE="$reference_acceptance_rate" \
-                REFERENCE_ACCEPTANCE_BY_INDEX="$reference_acceptance_by_index" \
-                REFERENCE_INPUT_TOKENS="$reference_input_tokens" \
-                REFERENCE_SAMPLED="$reference_sampled" \
-                REFERENCE_CHUNKS="$reference_chunks" \
-                REFERENCE_PROPOSED_SPEC="$reference_proposed_spec" \
-                REFERENCE_VERIFIED_SPEC="$reference_verified_spec" \
-                REFERENCE_STATUS="$reference_status" \
-                REFERENCE_MISMATCH="$reference_mismatch" \
-                python3 - <<'PY'
+            summary="$(
+                VALS="$vals" \
+                    INPUTS="$inputs" \
+                    CHUNKS="$chunks" \
+                    SAMPLES="$samples" \
+                    TTFTS="$ttfts" \
+                    PROMPT_RATES="$prompt_rates" \
+                    INTER_CHUNK_P50S="$inter_chunk_p50s" \
+                    INTER_CHUNK_P95S="$inter_chunk_p95s" \
+                    PROPOSED_SPECS="$proposed_specs" \
+                    VERIFIED_SPECS="$verified_specs" \
+                    ACCEPTANCE_RATES="$acceptance_rates" \
+                    TOKENS_PER_CHUNKS="$tokens_per_chunks" \
+                    SPEC_BY_INDEX="$spec_by_index" \
+                    VERIFIED_BY_INDEX="$verified_by_index" \
+                    LABEL="$label" \
+                    TOKENS="$tokens" \
+                    PROMPT_ID="$prompt_id" \
+                    REFERENCE_DECODE="$reference_decode" \
+                    REFERENCE_TTFT="$reference_ttft" \
+                    REFERENCE_PROMPT_RATE="$reference_prompt_rate" \
+                    REFERENCE_INTER_CHUNK_P50="$reference_inter_chunk_p50" \
+                    REFERENCE_INTER_CHUNK_P95="$reference_inter_chunk_p95" \
+                    REFERENCE_TOKENS_PER_CHUNK="$reference_tokens_per_chunk" \
+                    REFERENCE_ACCEPTANCE_RATE="$reference_acceptance_rate" \
+                    REFERENCE_ACCEPTANCE_BY_INDEX="$reference_acceptance_by_index" \
+                    REFERENCE_INPUT_TOKENS="$reference_input_tokens" \
+                    REFERENCE_SAMPLED="$reference_sampled" \
+                    REFERENCE_CHUNKS="$reference_chunks" \
+                    REFERENCE_PROPOSED_SPEC="$reference_proposed_spec" \
+                    REFERENCE_VERIFIED_SPEC="$reference_verified_spec" \
+                    REFERENCE_STATUS="$reference_status" \
+                    REFERENCE_MISMATCH="$reference_mismatch" \
+                    python3 - <<'PY'
 import os
 import statistics
 
@@ -1688,7 +1686,7 @@ REFERENCE_CONFIG_MISMATCHES="$(
 )"
 REPORT_FILE="$(mktemp "${TMPDIR:-/tmp}/psi_dec_qwen35_perf.XXXXXX")"
 if ((SHOW_RUNS)); then
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_num_spec_tokens=${BLOCK_SPEC_TOKENS:-checkpoint} cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
+    echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_num_spec_tokens=${BLOCK_SPEC_TOKENS:-checkpoint} cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
 fi
 print_config_table
 for case_index in "${!selected_cases[@]}"; do

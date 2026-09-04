@@ -452,16 +452,16 @@ Qwen verification calculates the shifted range. GDN commit receives one selected
 The total arena scales with `--max-requests * state_slots * full_model_state_bytes`.
 
 For the Qwen3.6-27B checkpoint, one full-model GDN state is 149.625 MiB.
-With the default `--max-requests 4`, one-step MTP uses four state slots for each request and allocates
-approximately 2.34 GiB for the arena.
-Two-step MTP uses five state slots for each request and allocates approximately 2.92 GiB.
-Four-step MTP uses seven state slots for each request and allocates approximately 4.09 GiB.
-A DSpark checkpoint with `block_size=15` uses 18 state slots for each request and allocates approximately 10.52 GiB.
+With the default `--max-requests 2`, one-step MTP uses four state slots for each request and allocates
+approximately 1.17 GiB for the arena.
+Two-step MTP uses five state slots for each request and allocates approximately 1.46 GiB.
+Four-step MTP uses seven state slots for each request and allocates approximately 2.05 GiB.
+A DSpark checkpoint with `block_size=15` uses 18 state slots for each request and allocates approximately 5.26 GiB.
 These values do not include model weights, cache pages, or other executor workspaces.
 
 One default batch has these scheduler limits:
 
-- 4 requests
+- 2 requests
 - 128 flattened tokens
 - 64 tokens for each request
 

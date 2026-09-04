@@ -16,8 +16,8 @@ TEMPERATURE=0.7
 TOP_K=20
 TOP_P=0.8
 
-NUM_CACHE_PAGES=393216
-MAX_REQUESTS=4
+NUM_CACHE_PAGES=294912
+MAX_REQUESTS=2
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
 CACHE_BLOCK_TOKENS=16
@@ -78,8 +78,8 @@ Benchmark options:
   --temperature N      Default: 0.7
   --top-k N            Default: 20
   --top-p N            Default: 0.8
-  --num-cache-pages N  Default: 393216
-  --max-requests N     Default: 4
+  --num-cache-pages N  Default: 294912
+  --max-requests N     Default: 2
   --max-tokens N       Default: 128
   --max-tokens-per-request N
                        Default: 64
@@ -336,7 +336,7 @@ if ((BUILD)); then
     require_command cargo
 fi
 
-if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'; then
+if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'
 import math
 import os
 
@@ -355,6 +355,7 @@ if temperature < 0:
 if not 0 <= top_p <= 1:
     raise SystemExit("--top-p must be in [0, 1]")
 PY
+then
     exit 2
 fi
 
