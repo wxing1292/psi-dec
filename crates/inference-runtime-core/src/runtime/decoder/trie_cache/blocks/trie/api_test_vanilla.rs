@@ -263,7 +263,7 @@ fn test_init_block_once_full_and_half_block_cache_reserved_await_vanilla() {
     assert_state(&blocks, 0, &[], &[], &[], &token_vec([1, 2, 3, 4, 5, 6]), &[]);
 
     let scheduled_tokens = random_block[0].schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    random_block[0].cache_tokens(&scheduled_tokens);
+    random_block[0].cache_tokens(scheduled_tokens.len());
     let CommitMultiLaneSemiImmutableBlockResult::Immutable {
         block_vec: random_block,
     } = block_cache.commit_semi_immutable_block(random_block)
@@ -1218,13 +1218,10 @@ fn insert_immutable_block(
     };
     for (block, block_metadata) in block_vec.iter_mut().zip(block_metadata_vec.iter()) {
         block.insert_annotations(block_metadata.annotations().iter().cloned());
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
     }
     let scheduled_tokens = block_vec[0].schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_vec[0].cache_tokens(&scheduled_tokens);
+    block_vec[0].cache_tokens(scheduled_tokens.len());
 
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec } =
         block_cache.commit_mutable_block(parent_trie_node_key_vec, block_vec)
@@ -1252,13 +1249,10 @@ fn insert_immutable_block_with_annotations(
     };
     for (block, block_metadata) in block_vec.iter_mut().zip(block_metadata_vec.iter()) {
         block.insert_annotations(block_metadata.annotations().iter().cloned());
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
     }
     let scheduled_tokens = block_vec[0].schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_vec[0].cache_tokens(&scheduled_tokens);
+    block_vec[0].cache_tokens(scheduled_tokens.len());
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec } =
         block_cache.commit_mutable_block([None], block_vec)
     else {

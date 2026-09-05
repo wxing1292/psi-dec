@@ -101,6 +101,12 @@ where
         self.spec_tokens.len()
     }
 
+    pub fn truncate_spec_tokens(&mut self, num_tokens: usize) {
+        self.spec_tokens.truncate(num_tokens);
+        self.spec_probs.truncate(num_tokens);
+        self.spec_confidences.truncate(num_tokens);
+    }
+
     pub fn spec_tokens(&self) -> impl DoubleEndedIterator<Item = Token> + Clone {
         self.spec_tokens.iter().copied()
     }

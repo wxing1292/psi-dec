@@ -114,14 +114,8 @@ impl<const N: usize> DecoderBlock for SemiImmutableBlock<N> {
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
-    fn cache_tokens(&mut self, tokens: &[Token]) {
-        let num_tokens = tokens.len();
-        let scheduled_token_index = self.scheduled_token_index;
+    fn cache_tokens(&mut self, num_tokens: usize) {
         self.scheduled_token_index += num_tokens;
-        debug_assert_eq!(
-            &self.total_tokens()[scheduled_token_index..self.scheduled_token_index],
-            tokens,
-        );
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
@@ -133,10 +127,7 @@ impl<const N: usize> DecoderBlock for SemiImmutableBlock<N> {
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
-    fn unschedule_tokens(&mut self, tokens: &[Token]) {
-        let num_tokens = tokens.len();
-        let ready_token_index = self.ready_token_index;
+    fn unschedule_tokens(&mut self, num_tokens: usize) {
         self.ready_token_index -= num_tokens;
-        debug_assert_eq!(&self.total_tokens()[self.ready_token_index..ready_token_index], tokens);
     }
 }

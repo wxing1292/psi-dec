@@ -20,6 +20,8 @@ use crate::runtime::resource::ResourceID;
 use crate::runtime::resource::ResourcePlacement;
 
 mod api;
+#[cfg(all(test, debug_assertions))]
+mod sanity_check_test;
 mod token;
 
 pub struct TrieDecoderBlocks<const N: usize, const P: usize, const L: usize, BC>
@@ -252,7 +254,13 @@ where
                 .collect::<Vec<_>>(),
         );
 
-        sanity_check_cache_lane_token_windows(&cache_lane_total_tokens, &total_tokens);
+        sanity_check_cache_lane_token_windows(
+            &cache_lane_total_tokens,
+            &total_tokens,
+            &spec_tokens,
+            (self.immutable_blocks.len() + self.semi_immutable_blocks.len()) * N,
+            cached_tokens.len(),
+        );
     }
 
     pub fn prepare_blocks(&mut self) -> DecoderSyncBlocks {
@@ -355,11 +363,50 @@ fn sanity_check_materialized_block_vec<B, const L: usize>(
 fn sanity_check_cache_lane_token_windows<const L: usize>(
     cache_lane_total_tokens: &[Vec<Token>; L],
     total_tokens: &[Token],
+    spec_tokens: &[Token],
+    num_fixed_tokens: usize,
+    num_cached_tokens: usize,
 ) {
-    for (lane, cache_tokens) in cache_lane_total_tokens.iter().enumerate() {
-        debug_assert!(cache_tokens.len() <= total_tokens.len().saturating_sub(lane));
-        if !cache_tokens.is_empty() {
-            debug_assert_eq!(cache_tokens, &total_tokens[lane..lane + cache_tokens.len()]);
+    debug_assert!(total_tokens.iter().all(|token| *token != Token::default()));
+    let source = total_tokens.iter().chain(spec_tokens).copied().collect::<Vec<_>>();
+    if num_cached_tokens > 0 && L > 1 {
+        debug_assert_eq!(
+            cache_lane_total_tokens[1][num_cached_tokens - 1],
+            total_tokens[num_cached_tokens],
+            "cached anchor changed"
+        );
+    }
+    for (lane, tokens) in cache_lane_total_tokens.iter().enumerate() {
+        // Immutable and semi-immutable token identities must not change.
+        debug_assert_eq!(&tokens[..num_fixed_tokens], &source[lane..lane + num_fixed_tokens]);
+        for (index, &token) in tokens.iter().enumerate().skip(num_fixed_tokens) {
+            if index < num_cached_tokens {
+                debug_assert_ne!(
+                    token,
+                    Token::default(),
+                    "cached lane={lane} index={index} is a placeholder"
+                );
+            } else if let Some(&expected) = source.get(index + lane)
+                && token != Token::default()
+            {
+                debug_assert_eq!(token, expected, "cache lane={lane} index={index}");
+            }
+        }
+    }
+    if num_cached_tokens > 0 {
+        debug_assert_eq!(
+            &cache_lane_total_tokens[0][..num_cached_tokens],
+            &total_tokens[..num_cached_tokens]
+        );
+        // Adjacent cached lanes must overlap by one shifted token. New canonical
+        // input may differ from the old speculative tail until commit.
+        for (lane, tokens) in cache_lane_total_tokens.windows(2).enumerate() {
+            debug_assert_eq!(
+                &tokens[0][1..num_cached_tokens],
+                &tokens[1][..num_cached_tokens - 1],
+                "cached lane={} shifted window",
+                lane + 1
+            );
         }
     }
 }
@@ -375,44 +422,5 @@ where
         for block_vec in self.semi_immutable_blocks.drain(..).rev() {
             self.block_cache.free_semi_immutable_block(block_vec);
         }
-    }
-}
-
-#[cfg(all(test, debug_assertions))]
-mod tests {
-    use super::*;
-    use crate::runtime::Token;
-
-    #[test]
-    fn test_sanity_check_cache_lane_token_windows_enough_token() {
-        let cache_lane_total_tokens = [
-            vec![Token::new(0), Token::new(1), Token::new(2)],
-            vec![Token::new(1), Token::new(2), Token::new(3)],
-            vec![Token::new(2), Token::new(3), Token::new(4)],
-            vec![Token::new(3), Token::new(4), Token::new(5)],
-        ];
-        let total_tokens = vec![
-            Token::new(0),
-            Token::new(1),
-            Token::new(2),
-            Token::new(3),
-            Token::new(4),
-            Token::new(5),
-        ];
-        sanity_check_cache_lane_token_windows(&cache_lane_total_tokens, &total_tokens);
-    }
-
-    #[test]
-    fn test_sanity_check_cache_lane_token_windows_not_enough_token() {
-        let cache_lane_total_tokens = [vec![], vec![], vec![], vec![]];
-
-        let total_tokens = vec![Token::new(0), Token::new(1), Token::new(2)];
-        sanity_check_cache_lane_token_windows(&cache_lane_total_tokens, &total_tokens);
-
-        let total_tokens = vec![Token::new(0), Token::new(1)];
-        sanity_check_cache_lane_token_windows(&cache_lane_total_tokens, &total_tokens);
-
-        let total_tokens = vec![Token::new(0)];
-        sanity_check_cache_lane_token_windows(&cache_lane_total_tokens, &total_tokens);
     }
 }

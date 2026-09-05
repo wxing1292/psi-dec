@@ -300,7 +300,7 @@ fn test_init_block_once_full_block_cache_reserved_await_w_mtp() {
 
     for block in &mut random_block_vec {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let CommitMultiLaneSemiImmutableBlockResult::Immutable {
         block_vec: random_block_vec,
@@ -635,6 +635,57 @@ fn test_uninit_block_once_immutable_block_w_mtp() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn test_write_tokens_fixed_identity_w_mtp() {
+    for cache_hit in [false, true] {
+        let total_tokens = token_vec([0, 1, 2, 3, 4, 5, 6]);
+        let block_cache = initialize_block_cache([1024; NUM_CACHE_LANE]);
+        if cache_hit {
+            insert_immutable_block(&block_cache, 0, None, total_tokens.clone());
+        }
+        let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
+        let InitBlockOnceResult::Success { .. } = blocks.init_block_once() else {
+            unreachable!()
+        };
+        let num_cached_tokens = blocks.num_cached_tokens();
+        let mut tokens = token_vec([1, 2, 3, 4, 5]);
+        blocks.write_tokens(1, 3, &tokens);
+
+        // Only MTP2's final supplied token differs. Fixed lanes must not accept it.
+        tokens[4] = Token::new(99);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            blocks.write_tokens(1, 3, &tokens);
+        }));
+        assert!(result.is_err());
+        assert_eq!(num_cached_tokens, blocks.num_cached_tokens());
+        assert_eq!(total_tokens, blocks.total_tokens().collect::<Vec<_>>());
+        blocks.sanity_check();
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn test_write_tokens_invalid_range_w_mtp() {
+    let block_cache = initialize_block_cache([1024; NUM_CACHE_LANE]);
+    let mut blocks = initialize_blocks(block_cache, token_vec([0, 1, 2, 3, 4]));
+    let InitBlockOnceResult::Success { .. } = blocks.init_block_once() else {
+        unreachable!()
+    };
+    for (token_index_start, token_index_end, tokens) in [
+        (2, 2, token_vec([2, 3, 4])),
+        (2, 1, token_vec([2, 3, 4])),
+        (0, 5, token_vec([0, 1, 2, 3, 4, 5, 6, 7])),
+        (0, 2, token_vec([0, 1])),
+    ] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            blocks.write_tokens(token_index_start, token_index_end, &tokens);
+        }));
+        assert!(result.is_err());
+        blocks.sanity_check();
+    }
+}
+
+#[test]
 fn test_prepare_cancel_commit_prefill_zero_token_index_w_mtp() {
     let total_tokens = token_vec([0, 1, 2, 3]);
     let block_cache = initialize_block_cache([1024; NUM_CACHE_LANE]);
@@ -884,29 +935,13 @@ fn test_prepare_cancel_commit_overlapping_prefill_decode_w_mtp() {
     );
     let expected_prefill_query_tokens = prefill_query_tokens.clone();
     let expected_decode_query_tokens = decode_query_tokens.clone();
-    assert_state(
-        &blocks,
-        2,
-        &[],
-        &token_vec([0, 1, 2, 3]),
-        &[],
-        &token_vec([4, 5, 6]),
-        &[],
-    );
+    assert_state(&blocks, 2, &[], &token_vec([0, 1, 2, 3, 4, 5, 6]), &[], &[], &[]);
 
     blocks.cancel_blocks(decode_sync_blocks);
     blocks.cancel(decode_query_tokens);
     blocks.cancel_blocks(prefill_sync_blocks);
     blocks.cancel(prefill_query_tokens);
-    assert_state(
-        &blocks,
-        0,
-        &[],
-        &[],
-        &token_vec([0, 1, 2, 3]),
-        &token_vec([4, 5, 6]),
-        &[],
-    );
+    assert_state(&blocks, 0, &[], &[], &token_vec([0, 1, 2, 3, 4, 5, 6]), &[], &[]);
 
     let prefill_query_tokens = blocks.prepare(4).unwrap();
     let prefill_sync_blocks = blocks.prepare_blocks();
@@ -932,19 +967,19 @@ fn test_prepare_cancel_commit_overlapping_prefill_decode_w_mtp() {
             validated_probs: vec![],
             sampled_token: Token::new(7),
             sampled_prob: NotNan::new(0.5).unwrap(),
-            spec_tokens: token_vec([]),
-            spec_probs: vec![],
-            spec_confidences: vec![],
+            spec_tokens: token_vec([8, 9, 10]),
+            spec_probs: vec![NotNan::new(0.5).unwrap(); 3],
+            spec_confidences: vec![NotNan::new(0.5).unwrap(); 3],
         },
     );
     assert_state(
         &blocks,
         3,
-        &token_vec([0, 1, 2, 3, 4]),
+        &token_vec([0, 1, 2, 3, 4, 5, 6]),
         &[],
         &[],
-        &token_vec([5, 6, 7]),
-        &[],
+        &token_vec([7]),
+        &token_vec([8, 9, 10]),
     );
 }
 
@@ -995,9 +1030,9 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_mtp_w_spec_token() {
         &blocks,
         2,
         &[],
-        &token_vec([0]),
+        &token_vec([0, 1, 2, 3]),
         &[],
-        &token_vec([1, 2, 3]),
+        &[],
         &token_vec([10, 11]),
     );
 
@@ -1008,8 +1043,8 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_mtp_w_spec_token() {
         0,
         &[],
         &[],
-        &token_vec([0]),
-        &token_vec([1, 2, 3]),
+        &token_vec([0, 1, 2, 3]),
+        &[],
         &token_vec([10, 11]),
     );
 
@@ -1021,9 +1056,9 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_mtp_w_spec_token() {
         &blocks,
         2,
         &[],
-        &token_vec([0]),
+        &token_vec([0, 1, 2, 3]),
         &[],
-        &token_vec([1, 2, 3]),
+        &[],
         &token_vec([10, 11]),
     );
 
@@ -1045,10 +1080,10 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_mtp_w_spec_token() {
     assert_state(
         &blocks,
         2,
-        &token_vec([0, 1, 2]),
+        &token_vec([0, 1, 2, 3, 10]),
         &[],
-        &token_vec([]),
-        &token_vec([3, 10, 20]),
+        &[],
+        &token_vec([20]),
         &token_vec([30, 31]),
     );
 }
@@ -1105,9 +1140,9 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_mtp_w_spec_token() {
         &blocks,
         3,
         &token_vec([0, 1, 2, 3]),
-        &token_vec([4]),
+        &token_vec([4, 5, 6, 7]),
         &[],
-        &token_vec([5, 6, 7]),
+        &[],
         &token_vec([10, 11]),
     );
 
@@ -1118,8 +1153,8 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_mtp_w_spec_token() {
         0,
         &token_vec([0, 1, 2, 3]),
         &[],
-        &token_vec([4]),
-        &token_vec([5, 6, 7]),
+        &token_vec([4, 5, 6, 7]),
+        &[],
         &token_vec([10, 11]),
     );
 
@@ -1131,9 +1166,9 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_mtp_w_spec_token() {
         &blocks,
         3,
         &token_vec([0, 1, 2, 3]),
-        &token_vec([4]),
+        &token_vec([4, 5, 6, 7]),
         &[],
-        &token_vec([5, 6, 7]),
+        &[],
         &token_vec([10, 11]),
     );
 
@@ -1155,10 +1190,10 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_mtp_w_spec_token() {
     assert_state(
         &blocks,
         3,
-        &token_vec([0, 1, 2, 3, 4, 5, 6]),
+        &token_vec([0, 1, 2, 3, 4, 5, 6, 7, 10]),
         &[],
-        &token_vec([]),
-        &token_vec([7, 10, 20]),
+        &[],
+        &token_vec([20]),
         &output_spec_tokens,
     );
 }
@@ -1398,10 +1433,10 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_mtp() {
     assert_total_tokens(
         &blocks.mutable_blocks[0],
         [
-            token_vec([0, 1, 2]),
-            token_vec([1, 2, 3]),
-            token_vec([2, 3, 4]),
-            token_vec([3, 4, 5]),
+            token_vec([0, 1, 2, 3]),
+            token_vec([1, 2, 3, 4]),
+            token_vec([2, 3, 4, 5]),
+            token_vec([3, 4, 5, u32::MAX]),
         ],
     );
     assert_mutable_annotations(&blocks.mutable_blocks[0], root_annotations([0, 1, 2]));
@@ -1409,9 +1444,9 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_mtp() {
         &blocks,
         2,
         &[],
-        &token_vec([0, 1, 2]),
+        &token_vec([0, 1, 2, 3, 4, 5]),
         &[],
-        &token_vec([3, 4, 5]),
+        &[],
         &token_vec([10]),
     );
 
@@ -1448,7 +1483,12 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_mtp() {
     assert_immutable_annotations(&blocks.immutable_blocks[0], root_annotations([0, 1, 2]));
     assert_total_tokens(
         &blocks.mutable_blocks[0],
-        [token_vec([4]), token_vec([5]), token_vec([10]), token_vec([20])],
+        [
+            token_vec([4, 5, 10]),
+            token_vec([5, 10, 20]),
+            token_vec([10, 20, 30]),
+            token_vec([20, 30, 31]),
+        ],
     );
     assert_mutable_annotations(&blocks.mutable_blocks[0], empty_annotations());
     assert_eq!(
@@ -1464,10 +1504,10 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_mtp() {
     assert_state(
         &blocks,
         2,
-        &token_vec([0, 1, 2, 3, 4]),
+        &token_vec([0, 1, 2, 3, 4, 5, 10]),
         &[],
-        &token_vec([]),
-        &token_vec([5, 10, 20]),
+        &[],
+        &token_vec([20]),
         &token_vec([30, 31]),
     );
 }
@@ -1620,12 +1660,9 @@ fn insert_immutable_block(
     };
     for (block, block_metadata) in block_vec.iter_mut().zip(block_metadata_vec.iter()) {
         block.insert_annotations(block_metadata.annotations().iter().cloned());
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
 
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec } =
@@ -1656,12 +1693,9 @@ fn insert_immutable_block_with_annotations(
     };
     for (block, block_metadata) in block_vec.iter_mut().zip(block_metadata_vec.iter()) {
         block.insert_annotations(block_metadata.annotations().iter().cloned());
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec } =
         block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec)

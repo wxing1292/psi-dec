@@ -199,7 +199,7 @@ where
         let DeviceResponse {
             req_id,
             query_tokens,
-            mut sampled_tokens,
+            sampled_tokens,
         } = dev_resp;
         assert_eq!(self.req_id, req_id, "device response request ID mismatch");
         let committed_compute = self.in_flight_computes.pop_front();
@@ -213,14 +213,17 @@ where
         let remaining_sampled_tokens =
             self.sampling_config().max_sampled_tokens - self.decoder_blocks.num_sampled_tokens();
         let remaining_context_tokens = self.context_window - self.decoder_blocks.num_total_tokens();
-        let (token_probs, completion) = prepare_commit_output(
+        let (token_probs, completion, num_spec_tokens) = prepare_commit_output(
             self.sampling_config.stop_sequences.as_slice(),
             remaining_sampled_tokens,
             remaining_context_tokens,
             self.decoder_blocks.sampled_tokens_rev(),
-            &mut sampled_tokens,
+            &sampled_tokens,
         );
+        // Cache metadata needs the complete physical proposal, even when stop or
+        // length limits permit fewer speculative tokens in the next query.
         self.decoder_blocks.commit(query_tokens, sampled_tokens);
+        self.decoder_blocks.truncate_spec_tokens(num_spec_tokens);
         if !token_probs.is_empty() {
             self.send_token_probs(token_probs);
         }

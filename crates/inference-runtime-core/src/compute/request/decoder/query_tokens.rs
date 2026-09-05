@@ -10,8 +10,11 @@ pub enum QueryTokens {
     },
     Decode {
         epoch: usize,
+        /// First Main token that has not executed in the committed Main cache.
         token_index: usize,
+        /// Canonical Main inputs. These tokens do not include a verified replay tail.
         tokens: Vec<Token>,
+        /// The actual proposal prefix selected for this query, not the configured width.
         spec_tokens: Vec<Token>,
     },
 }
@@ -71,13 +74,11 @@ impl QueryTokens {
             Self::Decode {
                 tokens, spec_tokens, ..
             } => {
-                Box::new(
-                    tokens
-                        .iter()
-                        .chain(spec_tokens.iter())
-                        .skip(lane)
-                        .map(|token| token.value()),
-                )
+                debug_assert_eq!(
+                    lane, 0,
+                    "Decode exposes Main inputs; the executor prepares MTP inputs after rejection"
+                );
+                Box::new(tokens.iter().chain(spec_tokens.iter()).map(|token| token.value()))
             },
         }
     }
@@ -125,7 +126,18 @@ mod tests {
             query_tokens.token_ids_by_lane(0).collect::<Vec<_>>(),
             vec![10, 11, 20, 21]
         );
-        assert_eq!(query_tokens.token_ids_by_lane(1).collect::<Vec<_>>(), vec![11, 20, 21]);
-        assert_eq!(query_tokens.token_ids_by_lane(2).collect::<Vec<_>>(), vec![20, 21]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the executor prepares MTP inputs after rejection")]
+    fn test_decode_does_not_expose_shifted_mtp_inputs() {
+        let query = QueryTokens::Decode {
+            epoch: 0,
+            token_index: 3,
+            tokens: vec![token(10)],
+            spec_tokens: vec![token(20)],
+        };
+        let _ = query.token_ids_by_lane(1);
     }
 }

@@ -1,5 +1,4 @@
 use std::cmp::min;
-use std::iter;
 use std::sync::Arc;
 
 use inference_runtime_macro::sanity_check;
@@ -188,34 +187,11 @@ where
         }
     }
 
-    // NOTE:
-    // * main module    -> cache lane == 0
-    // * MTP 0 module   -> cache lane == 1
-    // ...
-    // * MTP L-2 module -> cache lane == L-1
-    //
-    // prefill:
-    //  there must be >= L tokens (ready tokens + queued tokens) for main model
-    //  prefill request must have token len T >= L
-    //  * main model using tokens[0..len-L+1]
-    //  * MTP 0 using tokens[1..len-L+2]
-    //  * MTP L-2 using tokens[L..len]
-    //
-    //  there are **len-L+1** tokens applicable to each cache line, each model forward
-    //  increase cache index by **len-L+1**
-    // decode:
-    //  there must be >= 1 tokens (ready tokens + queued tokens) for main model
-    //  decode request does not necessary increase cache index
-    //  input:
-    //  * tokens with len T
-    //  * spec tokens with len S
-    //  output:
-    //  * validated tokens with len V
-    //  * sampled token with len 1
-    //
-    //  there are **min(T+V, T+V+1-L+1)** tokens applicable to each cache line, each model forward
-    //  increase cache index by **min(T+V, T+V+1-L+1)**
-
+    // Lane 0 is Main; lane m + 1 is MTP module m. Each lane starts at local index 0.
+    // Prefill forwards `window` rows per lane with L - 1 known lookahead tokens.
+    // Decode forwards only T unprocessed Main tokens and D submitted drafts.
+    // Accepting A drafts advances the cached rectangle from P to P + T + A.
+    // The executor owns the non-rectangular MTP work after rejection sampling.
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
     fn prepare(&mut self, token_budget: usize) -> Option<QueryTokens> {
         debug_assert!(0 < token_budget);
@@ -227,81 +203,55 @@ where
         let num_validated_tokens = num_ready_tokens + num_queued_tokens;
         debug_assert!(num_validated_tokens != 0);
 
-        let mut token_index = None;
-        let mut block_index = self.immutable_blocks.len();
-        let mut tokens = Vec::with_capacity(token_budget);
-        'schedule_loop: {
-            for block_vec in self.semi_immutable_blocks.iter_mut() {
-                let main_block = &mut block_vec[0];
-                let num_ready_tokens = main_block.ready_tokens().len();
-                if num_ready_tokens == 0 {
-                    block_index += 1;
-                    continue;
-                }
+        let token_index = self.num_cached_tokens() + self.num_scheduled_tokens();
+        let token_window = min(token_budget, num_validated_tokens);
+        debug_assert!(token_window == num_validated_tokens || token_window + L - 1 <= num_validated_tokens);
+        let mut tokens = self
+            .ready_tokens()
+            .chain(self.queued_tokens())
+            .take(token_window + L - 1)
+            .collect::<Vec<_>>();
+        // Each lane gets the same Main window. Unknown lookahead stays mutable
+        // until commit supplies the token identities from the executor result.
+        tokens.resize(token_window + L - 1, Token::default());
+        self.write_tokens(token_index, token_index + token_window, &tokens);
+        self.queued_tokens
+            .drain(..token_window.saturating_sub(num_ready_tokens));
 
-                let _ = token_index.get_or_insert(
-                    block_index * N + main_block.cached_tokens().len() + main_block.scheduled_tokens().len(),
-                );
-                tokens.extend_from_slice(schedule_tokens::<N, L, _>(
-                    block_vec,
-                    min(num_ready_tokens, token_budget - tokens.len()),
-                ));
-                if tokens.len() >= token_budget {
-                    debug_assert_eq!(token_budget, tokens.len());
-                    break 'schedule_loop;
-                }
-                block_index += 1;
-            }
-
-            for block_vec in self.mutable_blocks.iter_mut() {
-                let main_block = &mut block_vec[0];
-                let num_ready_tokens = main_block.ready_tokens().len();
-                if num_ready_tokens == 0 {
-                    block_index += 1;
-                    continue;
-                }
-
-                let _ = token_index.get_or_insert(
-                    block_index * N + main_block.cached_tokens().len() + main_block.scheduled_tokens().len(),
-                );
-                tokens.extend_from_slice(schedule_tokens::<N, L, _>(
-                    block_vec,
-                    min(num_ready_tokens, token_budget - tokens.len()),
-                ));
-                if tokens.len() >= token_budget {
-                    debug_assert_eq!(token_budget, tokens.len());
-                    break 'schedule_loop;
-                }
-                block_index += 1;
-            }
+        // Query-local token offsets. Lookahead does not advance scheduled progress.
+        let mut index_start = 0;
+        let mut index_end = 0;
+        for block_vec in &mut self.semi_immutable_blocks {
+            index_end = index_start + min(token_window - index_start, block_vec[0].ready_tokens().len());
+            schedule_tokens(block_vec, index_end - index_start);
+            index_start = index_end;
         }
+        for block_vec in &mut self.mutable_blocks {
+            index_end = index_start + min(token_window - index_start, block_vec[0].ready_tokens().len());
+            schedule_tokens(block_vec, index_end - index_start);
+            index_start = index_end;
+        }
+        debug_assert_eq!(token_window, index_start);
+        debug_assert_eq!(token_window, index_end);
 
         if token_budget < num_validated_tokens {
-            debug_assert_eq!(tokens.len(), token_budget);
-            debug_assert!(token_index.is_some());
-            debug_assert!(L - 1 <= self.num_queued_tokens());
-            tokens.extend(self.queued_tokens.iter().take(L - 1).copied());
             Some(QueryTokens::Prefill {
                 epoch: self.epoch,
-                token_index: token_index.unwrap(),
+                token_index,
                 tokens,
-                window: token_budget,
+                window: token_window,
             })
         } else {
-            debug_assert!(tokens.len() <= token_budget);
-            debug_assert!(self.num_queued_tokens() < L);
-            tokens.extend(&self.queued_tokens);
-            debug_assert!(tokens.len() <= token_budget);
-            let num_selected_spec_tokens = token_budget - tokens.len();
+            debug_assert!(self.queued_tokens.is_empty());
+            tokens.truncate(token_window);
+            let num_selected_spec_tokens = token_budget - token_window;
             debug_assert!(num_selected_spec_tokens <= self.spec_tokens.len());
-            self.spec_tokens.truncate(num_selected_spec_tokens);
-            self.spec_probs.truncate(num_selected_spec_tokens);
-            self.spec_confidences.truncate(num_selected_spec_tokens);
+            self.truncate_spec_tokens(num_selected_spec_tokens);
             let spec_tokens = self.spec_tokens.clone();
 
             Some(QueryTokens::Decode {
                 epoch: self.epoch,
-                token_index: token_index.unwrap_or(self.num_cached_tokens() + self.num_scheduled_tokens()),
+                token_index,
                 tokens,
                 spec_tokens,
             })
@@ -310,7 +260,8 @@ where
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
     fn cancel(&mut self, query_tokens: QueryTokens) {
-        let tokens = match query_tokens {
+        // Cancel the Main rows scheduled by prepare, not lookahead or submitted drafts.
+        let num_scheduled_tokens = match query_tokens {
             QueryTokens::Prefill {
                 epoch,
                 token_index,
@@ -323,7 +274,7 @@ where
                 debug_assert!(1 <= window);
                 debug_assert_eq!(window, tokens.len() - (L - 1));
 
-                tokens
+                window
             },
             QueryTokens::Decode {
                 epoch,
@@ -336,16 +287,17 @@ where
                 debug_assert!(!tokens.is_empty());
                 debug_assert_eq!(self.spec_tokens, spec_tokens);
 
-                tokens
+                tokens.len()
             },
         };
 
-        let mut index_end = tokens.len().saturating_sub(L - 1);
+        // Query-local token offsets, traversed from the last scheduled row.
+        let mut index_end = num_scheduled_tokens;
         let mut index_start = index_end;
         'unschedule_loop: {
             for block_vec in self.mutable_blocks.iter_mut().rev() {
                 index_start = index_end - min(index_end, block_vec[0].scheduled_tokens().len());
-                unschedule_tokens::<N, L, _>(block_vec, &tokens, index_start, index_end);
+                unschedule_tokens(block_vec, index_end - index_start);
                 index_end = index_start;
                 if index_end == 0 {
                     break 'unschedule_loop;
@@ -354,7 +306,7 @@ where
 
             for block_vec in self.semi_immutable_blocks.iter_mut().rev() {
                 index_start = index_end - min(index_end, block_vec[0].scheduled_tokens().len());
-                unschedule_tokens::<N, L, _>(block_vec, &tokens, index_start, index_end);
+                unschedule_tokens(block_vec, index_end - index_start);
                 index_end = index_start;
                 if index_end == 0 {
                     break 'unschedule_loop;
@@ -368,18 +320,72 @@ where
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
     fn commit(&mut self, query_tokens: QueryTokens, sampled_tokens: SampledTokens) {
-        let (
-            ready_to_cached_tokens,
-            ready_to_cached_token_window,
-            queued_to_cached_tokens,
-            queued_to_cached_token_window,
-        ) = match (query_tokens, sampled_tokens) {
+        debug_assert_eq!(query_tokens.token_index(), self.num_cached_tokens());
+
+        // Commit rewrites CPU token metadata only; the executor already produced KV/state.
+        // Allocation and publication operate on a complete block column, never one lane.
+        // C = cached KV (including replaceable drafts); P = pending, not yet executed.
+        // The illustrative block size is N = 2. K = 3 can cross more than one block.
+        // Before verification, P = 3:
+        // +-------+----+----+----+----+
+        // | Index | 0  | 1  | 2  | 3  |
+        // | Block | 0  | 0  | 1  | 1  |
+        // | Cache | C  | C  | C  | P  |
+        // | Main  | t0 | t1 | t2 | w  |
+        // | MTP0  | t1 | t2 | w  | x1 |
+        // | MTP1  | t2 | w  | x1 | x2 |
+        // | MTP2  | w  | x1 | x2 | x3 |
+        // +-------+----+----+----+----+
+        //
+        // Reject all; sample y and propose z1/z2/z3. P' = 4.
+        // +-------+----+----+----+----+----+
+        // | Index | 0  | 1  | 2  | 3  | 4  |
+        // | Block | 0  | 0  | 1  | 1  | 2  |
+        // | Cache | C  | C  | C  | C  | P  |
+        // | Main  | t0 | t1 | t2 | w  | y  |
+        // | MTP0  | t1 | t2 | w  | y  | z1 |
+        // | MTP1  | t2 | w  | y  | z1 | z2 |
+        // | MTP2  | w  | y  | z1 | z2 | z3 |
+        // +-------+----+----+----+----+----+
+        //
+        // Accept x1; reject x2/x3; sample y and propose z1/z2/z3. P' = 5.
+        // +-------+----+----+----+----+----+----+
+        // | Index | 0  | 1  | 2  | 3  | 4  | 5  |
+        // | Block | 0  | 0  | 1  | 1  | 2  | 2  |
+        // | Cache | C  | C  | C  | C  | C  | P  |
+        // | Main  | t0 | t1 | t2 | w  | x1 | y  |
+        // | MTP0  | t1 | t2 | w  | x1 | y  | z1 |
+        // | MTP1  | t2 | w  | x1 | y  | z1 | z2 |
+        // | MTP2  | w  | x1 | y  | z1 | z2 | z3 |
+        // +-------+----+----+----+----+----+----+
+        //
+        // Accept x1/x2/x3; sample y and propose z1/z2/z3. P' = 7.
+        // +-------+----+----+----+----+----+----+----+----+
+        // | Index | 0  | 1  | 2  | 3  | 4  | 5  | 6  | 7  |
+        // | Block | 0  | 0  | 1  | 1  | 2  | 2  | 3  | 3  |
+        // | Cache | C  | C  | C  | C  | C  | C  | C  | P  |
+        // | Main  | t0 | t1 | t2 | w  | x1 | x2 | x3 | y  |
+        // | MTP0  | t1 | t2 | w  | x1 | x2 | x3 | y  | z1 |
+        // | MTP1  | t2 | w  | x1 | x2 | x3 | y  | z1 | z2 |
+        // | MTP2  | w  | x1 | x2 | x3 | y  | z1 | z2 | z3 |
+        // +-------+----+----+----+----+----+----+----+----+
+        //
+        // Apply each lane's shifted source slice to [P.saturating_sub(K), P').
+        // Fixed blocks must match; mutable blocks copy the supplied token IDs.
+        // Split at every block boundary. The pending column is not written here.
+        // Then advance cached progress. Publish a full column ending at E only when
+        // E <= P' and E + K <= canonical token count (including y).
+        // For N=2 above: reject all publishes [0,2); accept x1 also [0,2);
+        // accept all publishes [0,2) and [2,4). Later columns remain mutable.
+        // Immutable and semi-immutable identities do not change.
+        // The source includes shifted lookahead; token_window counts Main rows only.
+        let (input_token_index, cache_source_tokens, token_window) = match (query_tokens, sampled_tokens) {
             (
                 QueryTokens::Prefill {
                     epoch: input_epoch,
                     token_index: input_token_index,
                     tokens: input_tokens,
-                    ..
+                    window: input_token_window,
                 },
                 SampledTokens::Prefill { epoch: output_epoch },
             ) => {
@@ -388,20 +394,7 @@ where
                 debug_assert!(input_token_index < self.num_total_tokens());
                 debug_assert!(!input_tokens.is_empty());
 
-                let ready_to_cached_tokens = input_tokens;
-                let ready_to_cached_token_window = ready_to_cached_tokens.len().saturating_sub(L - 1);
-                let queued_to_cached_tokens: Vec<_> = ready_to_cached_tokens
-                    .iter()
-                    .copied()
-                    .skip(ready_to_cached_tokens.len().saturating_sub(L - 1))
-                    .collect();
-                let queued_to_cached_token_window = 0;
-                (
-                    ready_to_cached_tokens,
-                    ready_to_cached_token_window,
-                    queued_to_cached_tokens,
-                    queued_to_cached_token_window,
-                )
+                (input_token_index, input_tokens, input_token_window)
             },
             (
                 QueryTokens::Decode {
@@ -415,10 +408,10 @@ where
                     validated_tokens: output_validated_tokens,
                     validated_probs: output_validated_probs,
                     sampled_token: output_sampled_token,
-                    sampled_prob: output_sampled_prob,
                     spec_tokens: output_spec_tokens,
                     spec_probs: output_spec_probs,
                     spec_confidences: output_spec_confidences,
+                    ..
                 },
             ) => {
                 debug_assert_eq!(self.epoch, input_epoch);
@@ -426,163 +419,102 @@ where
                 debug_assert!(input_token_index < self.num_total_tokens());
                 debug_assert!(!input_tokens.is_empty());
                 debug_assert!(
-                    input_tokens.ends_with(self.queued_tokens.iter().copied().collect::<Vec<_>>().as_slice())
-                );
-                assert!(
                     input_spec_tokens.starts_with(&output_validated_tokens),
                     "validated tokens must equal a prefix of the speculative input suffix"
                 );
                 debug_assert_eq!(output_validated_tokens.len(), output_validated_probs.len());
                 debug_assert_eq!(output_spec_tokens.len(), output_spec_probs.len());
                 debug_assert_eq!(output_spec_tokens.len(), output_spec_confidences.len());
+                debug_assert!(self.queued_tokens.is_empty());
 
-                let ready_to_cached_token_window = input_tokens.len().saturating_sub(L - 1);
-                let queued_to_cached_token_window = min(
-                    input_tokens.len() + output_validated_tokens.len(),
-                    (input_tokens.len() + output_validated_tokens.len() + 1).saturating_sub(L - 1),
-                ) - ready_to_cached_token_window;
-                self.queued_tokens.extend(output_validated_tokens.iter().copied());
+                let token_window = input_tokens.len() + output_validated_tokens.len();
+                let mut cache_source_tokens = input_tokens;
+                cache_source_tokens.extend(output_validated_tokens);
+                cache_source_tokens.push(output_sampled_token);
+                cache_source_tokens.extend_from_slice(&output_spec_tokens);
                 self.queued_tokens.push_back(output_sampled_token);
-                self.queued_tokens.drain(..queued_to_cached_token_window);
                 self.spec_tokens = output_spec_tokens;
                 self.spec_probs = output_spec_probs;
                 self.spec_confidences = output_spec_confidences;
-
-                let ready_to_cached_tokens = input_tokens;
-                let queued_to_cached_tokens = ready_to_cached_tokens
-                    .iter()
-                    .copied()
-                    .skip(ready_to_cached_tokens.len().saturating_sub(L - 1))
-                    .chain(output_validated_tokens)
-                    .chain(iter::once(output_sampled_token))
-                    .collect();
-                (
-                    ready_to_cached_tokens,
-                    ready_to_cached_token_window,
-                    queued_to_cached_tokens,
-                    queued_to_cached_token_window,
-                )
+                (input_token_index, cache_source_tokens, token_window)
             },
             _ => unreachable!(),
         };
 
+        let token_index_start = input_token_index.saturating_sub(L - 1);
+        let mut tokens = self
+            .cached_tokens()
+            .rev()
+            .take(input_token_index - token_index_start)
+            .collect::<Vec<_>>();
+        tokens.reverse();
+        tokens.extend_from_slice(&cache_source_tokens);
+        // Reconcile token identities before advancing cached progress.
+        self.write_tokens(token_index_start, input_token_index + token_window, &tokens);
+
+        // Query-local token offsets. The lookback is already cached and does not advance progress.
         let mut index_start = 0;
         let mut index_end = 0;
-        'commit_loop: {
-            while let Some(mut block_vec) = self.semi_immutable_blocks.pop_front() {
-                index_end = index_start
-                    + min(
-                        ready_to_cached_token_window - index_start,
-                        block_vec[0].scheduled_tokens().len(),
-                    );
-                cache_tokens::<N, L, _>(&mut block_vec, &ready_to_cached_tokens, index_start, index_end);
-                index_start = index_end;
-
-                if block_vec[0].cached_tokens().len() != N {
-                    self.semi_immutable_blocks.push_front(block_vec);
-                    break 'commit_loop;
-                } else {
-                    match self.block_cache.commit_semi_immutable_block(block_vec) {
-                        CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec } => {
-                            self.immutable_blocks.push(block_vec);
-                        },
-                        CommitMultiLaneSemiImmutableBlockResult::ImmutableCollision { block_vec } => {
-                            self.immutable_blocks.push(block_vec);
-                            self.num_in_sync_blocks = 0;
-                        },
-                    }
-                }
-            }
-
-            while let Some(mut block_vec) = self.mutable_blocks.pop_front() {
-                index_end = index_start
-                    + min(
-                        ready_to_cached_token_window - index_start,
-                        block_vec[0].scheduled_tokens().len(),
-                    );
-                cache_tokens::<N, L, _>(&mut block_vec, &ready_to_cached_tokens, index_start, index_end);
-                index_start = index_end;
-
-                if block_vec[0].cached_tokens().len() != N {
-                    self.mutable_blocks.push_front(block_vec);
-                    break 'commit_loop;
-                } else {
-                    debug_assert!(self.semi_immutable_blocks.is_empty());
-
-                    let parent_trie_node_key_vec = self.parent_trie_node_key_vec(self.immutable_blocks.len());
-                    match self
-                        .block_cache
-                        .commit_mutable_block(parent_trie_node_key_vec, block_vec)
-                    {
-                        CommitMultiLaneMutableBlockResult::Immutable { block_vec } => {
-                            debug_assert!(self.semi_immutable_blocks.is_empty());
-                            self.immutable_blocks.push(block_vec);
-                        },
-                        CommitMultiLaneMutableBlockResult::ImmutableCollision { block_vec } => {
-                            debug_assert!(self.semi_immutable_blocks.is_empty());
-                            self.immutable_blocks.push(block_vec);
-                            self.num_in_sync_blocks = 0;
-                        },
-                    }
-                }
-            }
+        for block_vec in &mut self.semi_immutable_blocks {
+            index_end = index_start + min(token_window - index_start, block_vec[0].scheduled_tokens().len());
+            cache_tokens(block_vec, &cache_source_tokens, index_start, index_end);
+            index_start = index_end;
         }
+        for block_vec in &mut self.mutable_blocks {
+            let num_tokens = min(token_window - index_start, N - block_vec[0].cached_tokens().len());
+            index_end = index_start + num_tokens;
+            // Accepted drafts were not part of the scheduled Main token metadata.
+            let num_scheduled_tokens = block_vec[0].scheduled_tokens().len();
+            schedule_tokens(block_vec, num_tokens.saturating_sub(num_scheduled_tokens));
+            cache_tokens(block_vec, &cache_source_tokens, index_start, index_end);
+            index_start = index_end;
+        }
+        debug_assert_eq!(token_window, index_start);
+        debug_assert_eq!(token_window, index_end);
 
-        let mut additional_index_start = 0;
-        let mut additional_index_end = 0;
-        'schedule_commit_loop: {
-            while let Some(mut block_vec) = self.mutable_blocks.pop_front() {
-                let num_token = min(
-                    queued_to_cached_token_window - additional_index_start,
-                    N - block_vec[0].total_tokens().len(),
-                );
-                additional_index_end = additional_index_start + num_token;
-                if additional_index_start != additional_index_end {
-                    push_tokens::<N, L>(
-                        &mut block_vec,
-                        &queued_to_cached_tokens[additional_index_start..additional_index_end + L - 1],
-                    );
-                    let _ = schedule_tokens::<N, L, _>(&mut block_vec, num_token);
-                    cache_tokens::<N, L, _>(
-                        &mut block_vec,
-                        &queued_to_cached_tokens,
-                        additional_index_start,
-                        additional_index_end,
-                    );
+        let publish_token_index_end = self.num_total_tokens().saturating_sub(L - 1);
+        'publish_loop: {
+            while let Some(block_vec) = self.semi_immutable_blocks.front() {
+                if block_vec[0].cached_tokens().len() != N
+                    || (self.immutable_blocks.len() + 1) * N > publish_token_index_end
+                {
+                    break 'publish_loop;
                 }
-                additional_index_start = additional_index_end;
-
-                if block_vec[0].cached_tokens().len() != N {
-                    self.mutable_blocks.push_front(block_vec);
-                    break 'schedule_commit_loop;
-                } else {
-                    debug_assert!(self.semi_immutable_blocks.is_empty());
-
-                    let parent_trie_node_key_vec = self.parent_trie_node_key_vec(self.immutable_blocks.len());
-                    match self
-                        .block_cache
-                        .commit_mutable_block(parent_trie_node_key_vec, block_vec)
-                    {
-                        CommitMultiLaneMutableBlockResult::Immutable { block_vec } => {
-                            debug_assert!(self.semi_immutable_blocks.is_empty());
-                            self.immutable_blocks.push(block_vec);
-                        },
-                        CommitMultiLaneMutableBlockResult::ImmutableCollision { block_vec } => {
-                            debug_assert!(self.semi_immutable_blocks.is_empty());
-                            self.immutable_blocks.push(block_vec);
-                            self.num_in_sync_blocks = 0;
-                        },
-                    }
+                let block_vec = self.semi_immutable_blocks.pop_front().unwrap();
+                match self.block_cache.commit_semi_immutable_block(block_vec) {
+                    CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec } => {
+                        self.immutable_blocks.push(block_vec);
+                    },
+                    CommitMultiLaneSemiImmutableBlockResult::ImmutableCollision { block_vec } => {
+                        self.immutable_blocks.push(block_vec);
+                        self.num_in_sync_blocks = 0;
+                    },
+                }
+            }
+            while let Some(block_vec) = self.mutable_blocks.front() {
+                if block_vec[0].cached_tokens().len() != N
+                    || (self.immutable_blocks.len() + 1) * N > publish_token_index_end
+                {
+                    break 'publish_loop;
+                }
+                let parent_trie_node_key_vec = self.parent_trie_node_key_vec(self.immutable_blocks.len());
+                let block_vec = self.mutable_blocks.pop_front().unwrap();
+                match self
+                    .block_cache
+                    .commit_mutable_block(parent_trie_node_key_vec, block_vec)
+                {
+                    CommitMultiLaneMutableBlockResult::Immutable { block_vec } => {
+                        self.immutable_blocks.push(block_vec);
+                    },
+                    CommitMultiLaneMutableBlockResult::ImmutableCollision { block_vec } => {
+                        self.immutable_blocks.push(block_vec);
+                        self.num_in_sync_blocks = 0;
+                    },
                 }
             }
         }
         self.try_mark_ready();
         self.unload_cached_resources();
-
-        debug_assert_eq!(ready_to_cached_token_window, index_start);
-        debug_assert_eq!(ready_to_cached_token_window, index_end);
-        debug_assert_eq!(queued_to_cached_token_window, additional_index_start);
-        debug_assert!(queued_to_cached_token_window <= additional_index_end);
     }
 }
 
@@ -603,6 +535,57 @@ impl<const N: usize, const P: usize, const L: usize, BC> TrieDecoderBlocks<N, P,
 where
     BC: MultiLaneBlockCache<P, L>,
 {
+    /// Sets token identities in `token_index_start..token_index_end` across all cache lanes.
+    /// `tokens[0]` has Main token index `token_index_start`.
+    /// Cache lane `l` at cache token index `i` receives `tokens[i - token_index_start + l]`.
+    /// Fixed blocks must already contain these IDs. Mutable blocks overwrite or append them.
+    /// The interval must be non-empty and fit the allocated blocks. This function does not clip it.
+    ///
+    /// The source includes L - 1 lookahead slots. Decode preparation may use
+    /// placeholders for unknown lookahead in noncached mutable MTP slots.
+    /// Commit must supply real token identities before advancing cached progress.
+    fn write_tokens(&mut self, token_index_start: usize, token_index_end: usize, tokens: &[Token]) {
+        let num_fixed_blocks = self.immutable_blocks.len() + self.semi_immutable_blocks.len();
+        debug_assert!(
+            token_index_start < token_index_end,
+            "token write interval must be non-empty and ordered"
+        );
+        debug_assert!(
+            token_index_end <= (num_fixed_blocks + self.mutable_blocks.len()) * N,
+            "token write interval exceeds allocated blocks"
+        );
+        debug_assert!(token_index_end - token_index_start + L - 1 <= tokens.len());
+        for block_index in token_index_start / N..token_index_end.div_ceil(N) {
+            let block_token_index_start = block_index * N;
+            let write_token_index_start = token_index_start.max(block_token_index_start);
+            let write_token_index_end = token_index_end.min(block_token_index_start + N);
+            let block_token_offset_start = write_token_index_start - block_token_index_start;
+            let block_token_offset_end = write_token_index_end - block_token_index_start;
+            for cache_lane_index in 0..L {
+                let lane_tokens = &tokens[write_token_index_start - token_index_start + cache_lane_index
+                    ..write_token_index_end - token_index_start + cache_lane_index];
+                if block_index < self.immutable_blocks.len() {
+                    debug_assert_eq!(
+                        &self.immutable_blocks[block_index][cache_lane_index].total_tokens()
+                            [block_token_offset_start..block_token_offset_end],
+                        lane_tokens,
+                        "immutable token identities changed"
+                    );
+                } else if block_index < num_fixed_blocks {
+                    debug_assert_eq!(
+                        &self.semi_immutable_blocks[block_index - self.immutable_blocks.len()][cache_lane_index]
+                            .total_tokens()[block_token_offset_start..block_token_offset_end],
+                        lane_tokens,
+                        "semi-immutable token identities changed"
+                    );
+                } else {
+                    self.mutable_blocks[block_index - num_fixed_blocks][cache_lane_index]
+                        .write_tokens(block_token_offset_start, lane_tokens);
+                }
+            }
+        }
+    }
+
     pub fn start_turn(&mut self, prompt_tokens: Vec<Token>) {
         assert!(!prompt_tokens.is_empty(), "a new turn must include prompt tokens");
         assert_eq!(
@@ -638,9 +621,7 @@ where
             0,
             "a turn cannot finish while tokens are scheduled"
         );
-        self.spec_tokens.clear();
-        self.spec_probs.clear();
-        self.spec_confidences.clear();
+        self.truncate_spec_tokens(0);
         self.num_history_tokens = self.num_total_tokens();
         self.num_prompt_tokens = 0;
         debug_assert_eq!(self.num_sampled_tokens(), 0);

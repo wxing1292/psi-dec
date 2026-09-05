@@ -192,9 +192,9 @@ fn test_mutable_block_alloc_mutable_commit_immutable() {
 
     for block in &mut block_vec {
         block.insert_annotations(annotations.clone());
-        assert_eq!(Vec::<Token>::new(), block.push_tokens(tokens.clone()));
+        block.write_tokens(0, &tokens);
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec);
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec } = result else {
@@ -286,9 +286,9 @@ fn test_mutable_block_alloc_mutable_commit_immutable_collision() {
 
     for block in &mut block_vec_0 {
         block.insert_annotations(annotations.clone());
-        assert_eq!(Vec::<Token>::new(), block.push_tokens(tokens.clone()));
+        block.write_tokens(0, &tokens);
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_0);
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -309,9 +309,9 @@ fn test_mutable_block_alloc_mutable_commit_immutable_collision() {
 
     for block in &mut block_vec_1 {
         block.insert_annotations(annotations.clone());
-        assert_eq!(Vec::<Token>::new(), block.push_tokens(tokens.clone()));
+        block.write_tokens(0, &tokens);
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_1);
     let CommitMultiLaneMutableBlockResult::ImmutableCollision { block_vec: block_vec_1 } = result else {
@@ -586,7 +586,7 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable() {
 
     for block in &mut block_vec {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec);
     let CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec } = result else {
@@ -683,9 +683,9 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable_collision()
 
     for block in &mut block_vec_0 {
         block.insert_annotations(annotations.clone());
-        assert_eq!(Vec::<Token>::new(), block.push_tokens(tokens.iter().copied().collect()));
+        block.write_tokens(0, &tokens);
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_0);
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -706,7 +706,7 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable_collision()
 
     for block in &mut block_vec_1 {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec_1);
     let CommitMultiLaneSemiImmutableBlockResult::ImmutableCollision { block_vec: block_vec_1 } = result else {
@@ -813,7 +813,7 @@ fn test_semi_immutable_block_reserve_immutable() {
 
     for block in &mut block_vec_0 {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec_0);
     let CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -952,7 +952,7 @@ fn test_semi_immutable_block_reserve_reservation_collision() {
 
     for block in &mut block_vec_0 {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec_0);
     let CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -1103,12 +1103,9 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_0() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     for (block, block_metadata) in block_vec_1.iter_mut().zip(block_metadata_vec_1_clone.iter()) {
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_1);
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec: block_vec_1 } = result else {
@@ -1208,7 +1205,7 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_1() {
     };
     for block in &mut block_vec_0 {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec_0);
     let CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -1276,12 +1273,9 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_1() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     for (block, block_metadata) in block_vec_1.iter_mut().zip(block_metadata_vec_1_clone.iter()) {
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_1);
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec: block_vec_1 } = result else {
@@ -1401,7 +1395,7 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_0() {
 
     for block in &mut block_vec_0 {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec_0);
     let CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -1421,12 +1415,9 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_0() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     for (block, block_metadata) in block_vec_1.iter_mut().zip(block_metadata_vec_1_clone.iter()) {
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_1);
     let CommitMultiLaneMutableBlockResult::ImmutableCollision { block_vec: block_vec_1 } = result else {
@@ -1511,7 +1502,7 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_1() {
     };
     for block in &mut block_vec_0 {
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_semi_immutable_block(block_vec_0);
     let CommitMultiLaneSemiImmutableBlockResult::Immutable { block_vec: block_vec_0 } = result else {
@@ -1564,12 +1555,9 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_1() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     for (block, block_metadata) in block_vec_1.iter_mut().zip(block_metadata_vec_1_clone.iter()) {
-        assert_eq!(
-            Vec::<Token>::new(),
-            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
-        );
+        block.write_tokens(0, block_metadata.tokens());
         let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-        block.cache_tokens(&scheduled_tokens);
+        block.cache_tokens(scheduled_tokens.len());
     }
     let result = block_cache.commit_mutable_block(std::array::from_fn(|_| None), block_vec_1);
     let CommitMultiLaneMutableBlockResult::ImmutableCollision { block_vec: block_vec_1 } = result else {

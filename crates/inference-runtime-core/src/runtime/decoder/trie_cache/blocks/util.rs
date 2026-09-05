@@ -5,25 +5,23 @@ use crate::runtime::Token;
 use crate::runtime::decoder::trie_cache::DecoderBlock;
 use crate::runtime::decoder::trie_cache::MutableBlock;
 
-pub fn cache_tokens<const N: usize, const L: usize, B>(
-    block_vec: &mut [B; L],
-    tokens: &[Token],
-    index_start: usize,
-    index_end: usize,
-) where
+pub fn cache_tokens<const L: usize, B>(block_vec: &mut [B; L], tokens: &[Token], index_start: usize, index_end: usize)
+where
     B: DecoderBlock,
 {
     if index_start == index_end {
         return;
     }
     for (lane, block) in block_vec.iter_mut().enumerate() {
-        let scheduled_tokens = block.scheduled_tokens()[..(index_end - index_start)].to_vec();
-        debug_assert_eq!(&tokens[index_start + lane..index_end + lane], &scheduled_tokens);
-        block.cache_tokens(&scheduled_tokens);
+        debug_assert_eq!(
+            &tokens[index_start + lane..index_end + lane],
+            &block.scheduled_tokens()[..index_end - index_start]
+        );
+        block.cache_tokens(index_end - index_start);
     }
 }
 
-pub fn schedule_tokens<const N: usize, const L: usize, B>(block_vec: &mut [B; L], num_tokens: usize) -> &[Token]
+pub fn schedule_tokens<const L: usize, B>(block_vec: &mut [B; L], num_tokens: usize) -> &[Token]
 where
     B: DecoderBlock,
 {
@@ -37,22 +35,12 @@ where
     main_block.schedule_tokens(num_tokens)
 }
 
-pub fn unschedule_tokens<const N: usize, const L: usize, B>(
-    block_vec: &mut [B; L],
-    tokens: &[Token],
-    index_start: usize,
-    index_end: usize,
-) where
+pub fn unschedule_tokens<const L: usize, B>(block_vec: &mut [B; L], num_tokens: usize)
+where
     B: DecoderBlock,
 {
-    if index_start == index_end {
-        return;
-    }
-    for (lane, block) in block_vec.iter_mut().enumerate() {
-        let scheduled_tokens =
-            block.scheduled_tokens()[block.scheduled_tokens().len() - (index_end - index_start)..].to_vec();
-        debug_assert_eq!(&tokens[index_start + lane..index_end + lane], &scheduled_tokens);
-        block.unschedule_tokens(&scheduled_tokens);
+    for block in block_vec {
+        block.unschedule_tokens(num_tokens);
     }
 }
 
@@ -62,8 +50,7 @@ pub fn push_tokens<const N: usize, const L: usize>(block_vec: &mut [MutableBlock
     }
     let window = tokens.len() - (L - 1);
     for (block, tokens) in block_vec.iter_mut().zip(tokens.windows(window)) {
-        let remaining = block.push_tokens(tokens.to_vec());
-        debug_assert!(remaining.is_empty());
+        block.write_tokens(block.total_tokens().len(), tokens);
     }
 }
 

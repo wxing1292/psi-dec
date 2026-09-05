@@ -11,8 +11,8 @@ pub fn prepare_commit_output<I>(
     remaining_sampled_tokens: usize,
     remaining_context_tokens: usize,
     history_rev: I,
-    sampled_tokens: &mut SampledTokens,
-) -> (TokenProbs, Option<CompletionReason>)
+    sampled_tokens: &SampledTokens,
+) -> (TokenProbs, Option<CompletionReason>, usize)
 where
     I: Iterator<Item = Token> + Clone,
 {
@@ -24,8 +24,6 @@ where
         sampled_token,
         sampled_prob,
         spec_tokens,
-        spec_probs,
-        spec_confidences,
         ..
     } = sampled_tokens
     else {
@@ -35,6 +33,7 @@ where
                 probs: Vec::new(),
             },
             None,
+            0,
         );
     };
 
@@ -87,10 +86,7 @@ where
     } else {
         0
     };
-    spec_tokens.truncate(max_spec_tokens);
-    spec_probs.truncate(max_spec_tokens);
-    spec_confidences.truncate(max_spec_tokens);
-    (token_probs, completion)
+    (token_probs, completion, max_spec_tokens.min(spec_tokens.len()))
 }
 
 #[cfg(test)]
@@ -101,101 +97,112 @@ mod tests {
 
     #[test]
     fn test_prepare_commit_output_prefill() {
-        let mut sampled_tokens = SampledTokens::Prefill { epoch: 0 };
+        let sampled_tokens = SampledTokens::Prefill { epoch: 0 };
 
-        let (token_probs, completion) = prepare_commit_output(&[], 1, 1, std::iter::empty(), &mut sampled_tokens);
+        let (token_probs, completion, num_spec_tokens) =
+            prepare_commit_output(&[], 1, 1, std::iter::empty(), &sampled_tokens);
 
         assert!(token_probs.is_empty());
         assert_eq!(completion, None);
+        assert_eq!(num_spec_tokens, 0);
     }
 
     #[test]
     fn test_prepare_commit_output_continue() {
-        let mut sampled_tokens = decode_tokens(&[10], 11, &[12, 13]);
+        let sampled_tokens = decode_tokens(&[10], 11, &[12, 13]);
 
-        let (token_probs, completion) = prepare_commit_output(&[], 10, 10, std::iter::empty(), &mut sampled_tokens);
+        let (token_probs, completion, num_spec_tokens) =
+            prepare_commit_output(&[], 10, 10, std::iter::empty(), &sampled_tokens);
 
         assert_eq!(token_probs.tokens, tokens(&[10, 11]));
         assert_eq!(token_probs.probs, probabilities(2));
         assert_eq!(completion, None);
+        assert_eq!(num_spec_tokens, 2);
         assert_eq!(sampled_tokens, decode_tokens(&[10], 11, &[12, 13]));
     }
 
     #[test]
     fn test_prepare_commit_output_length_limit() {
-        let mut sampled_tokens = decode_tokens(&[], 10, &[12]);
+        let sampled_tokens = decode_tokens(&[], 10, &[12]);
 
-        let (token_probs, completion) = prepare_commit_output(&[], 1, 10, std::iter::empty(), &mut sampled_tokens);
+        let (token_probs, completion, num_spec_tokens) =
+            prepare_commit_output(&[], 1, 10, std::iter::empty(), &sampled_tokens);
 
         assert_eq!(token_probs.tokens, tokens(&[10]));
         assert_eq!(token_probs.probs, probabilities(1));
         assert_eq!(completion, Some(CompletionReason::LengthLimit));
-        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[]));
+        assert_eq!(num_spec_tokens, 0);
+        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[12]));
     }
 
     #[test]
     fn test_prepare_commit_output_context_limit_precedence() {
         let stop_token = Token::new(10);
-        let mut sampled_tokens = decode_tokens(&[], 10, &[20]);
+        let sampled_tokens = decode_tokens(&[], 10, &[12]);
 
-        let (token_probs, completion) =
-            prepare_commit_output(&[vec![stop_token]], 1, 1, std::iter::empty(), &mut sampled_tokens);
+        let (token_probs, completion, num_spec_tokens) =
+            prepare_commit_output(&[vec![stop_token]], 1, 1, std::iter::empty(), &sampled_tokens);
 
         assert_eq!(token_probs.tokens, vec![stop_token]);
         assert_eq!(token_probs.probs, probabilities(1));
         assert_eq!(completion, Some(CompletionReason::ContextLimit));
-        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[]));
+        assert_eq!(num_spec_tokens, 0);
+        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[12]));
     }
 
     #[test]
     fn test_prepare_commit_output_stop_sequence() {
         let stop_sequence = tokens(&[9, 10]);
-        let mut sampled_tokens = decode_tokens(&[9], 10, &[12]);
+        let sampled_tokens = decode_tokens(&[9], 10, &[12]);
 
-        let (token_probs, completion) = prepare_commit_output(
+        let (token_probs, completion, num_spec_tokens) = prepare_commit_output(
             std::slice::from_ref(&stop_sequence),
             10,
             10,
             std::iter::empty(),
-            &mut sampled_tokens,
+            &sampled_tokens,
         );
 
         assert_eq!(token_probs.tokens, stop_sequence);
         assert_eq!(token_probs.probs, probabilities(2));
         assert_eq!(completion, Some(CompletionReason::StopSequence));
-        assert_eq!(sampled_tokens, decode_tokens(&[9], 10, &[]));
+        assert_eq!(num_spec_tokens, 0);
+        assert_eq!(sampled_tokens, decode_tokens(&[9], 10, &[12]));
     }
 
     #[test]
     fn test_prepare_commit_output_stop_proposal_reserves_final_token() {
-        let mut sampled_tokens = decode_tokens(&[], 8, &[9, 10, 11]);
+        let sampled_tokens = decode_tokens(&[], 8, &[9, 10, 11]);
 
-        let (token_probs, completion) =
-            prepare_commit_output(&[tokens(&[9, 10])], 10, 10, std::iter::empty(), &mut sampled_tokens);
+        let (token_probs, completion, num_spec_tokens) =
+            prepare_commit_output(&[tokens(&[9, 10])], 10, 10, std::iter::empty(), &sampled_tokens);
 
         assert_eq!(token_probs.tokens, tokens(&[8]));
         assert_eq!(completion, None);
-        assert_eq!(sampled_tokens, decode_tokens(&[], 8, &[9]));
+        assert_eq!(num_spec_tokens, 1);
+        assert_eq!(sampled_tokens, decode_tokens(&[], 8, &[9, 10, 11]));
     }
 
     #[test]
     fn test_prepare_commit_output_length_proposal_reserves_sampled_token() {
-        let mut sampled_tokens = decode_tokens(&[], 10, &[11, 12, 13]);
+        let sampled_tokens = decode_tokens(&[], 10, &[11, 12, 13]);
 
-        let (_, completion) = prepare_commit_output(&[], 3, 10, std::iter::empty(), &mut sampled_tokens);
+        let (_, completion, num_spec_tokens) = prepare_commit_output(&[], 3, 10, std::iter::empty(), &sampled_tokens);
 
         assert_eq!(completion, None);
-        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[11]));
+        assert_eq!(num_spec_tokens, 1);
+        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[11, 12, 13]));
     }
 
     #[test]
     fn test_prepare_commit_output_context_proposal_reserves_sampled_token() {
-        let mut sampled_tokens = decode_tokens(&[], 10, &[11, 12, 13]);
+        let sampled_tokens = decode_tokens(&[], 10, &[11, 12, 13]);
 
-        let (_, completion) = prepare_commit_output(&[], 10, 3, std::iter::empty(), &mut sampled_tokens);
+        let (_, completion, num_spec_tokens) = prepare_commit_output(&[], 10, 3, std::iter::empty(), &sampled_tokens);
 
         assert_eq!(completion, None);
-        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[11]));
+        assert_eq!(num_spec_tokens, 1);
+        assert_eq!(sampled_tokens, decode_tokens(&[], 10, &[11, 12, 13]));
     }
 
     fn decode_tokens(validated: &[u32], sampled: u32, spec: &[u32]) -> SampledTokens {

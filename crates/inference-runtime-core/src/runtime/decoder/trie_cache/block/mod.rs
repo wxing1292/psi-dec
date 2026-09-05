@@ -20,7 +20,7 @@ pub trait DecoderBlock {
 
     fn ready_token_slots(&self) -> usize;
 
-    fn cache_tokens(&mut self, tokens: &[Token]);
+    fn cache_tokens(&mut self, num_tokens: usize);
     fn schedule_tokens(&mut self, num_tokens: usize) -> &[Token];
-    fn unschedule_tokens(&mut self, tokens: &[Token]);
+    fn unschedule_tokens(&mut self, num_tokens: usize);
 }

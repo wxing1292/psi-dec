@@ -68,7 +68,7 @@ impl<const P: usize> DecoderBlock for ImmutableBlock<P> {
         0
     }
 
-    fn cache_tokens(&mut self, tokens: &[Token]) {
+    fn cache_tokens(&mut self, num_tokens: usize) {
         unreachable!()
     }
 
@@ -76,7 +76,7 @@ impl<const P: usize> DecoderBlock for ImmutableBlock<P> {
         unreachable!()
     }
 
-    fn unschedule_tokens(&mut self, tokens: &[Token]) {
+    fn unschedule_tokens(&mut self, num_tokens: usize) {
         unreachable!()
     }
 }

@@ -124,7 +124,7 @@ fn test_mutable_block_alloc_mutable_commit_immutable() {
         unreachable!()
     };
     block.insert_annotations(annotations.clone());
-    assert_eq!(Vec::<Token>::new(), block.push_tokens(tokens.clone()));
+    block.write_tokens(0, &tokens);
     assert_eq!(2, page_id_allocator.used());
     assert_eq!(1, block_cache.num_mutable_block());
     assert_eq!(0, block_cache.num_semi_immutable_block());
@@ -132,7 +132,7 @@ fn test_mutable_block_alloc_mutable_commit_immutable() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block.cache_tokens(&scheduled_tokens);
+    block.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_mutable_block(None, block);
     let CommitSingleLaneMutableBlockResult::Immutable { block } = result else {
         unreachable!()
@@ -178,13 +178,13 @@ fn test_mutable_block_alloc_mutable_commit_immutable_collision() {
         unreachable!()
     };
     block_0.insert_annotations(annotations.clone());
-    assert_eq!(Vec::<Token>::new(), block_0.push_tokens(tokens.clone()));
+    block_0.write_tokens(0, &tokens);
     let result = block_cache.alloc_mutable_block::<NUM_TOKEN_PER_BLOCK>();
     let AllocateSingleLaneMutableBlockResult::Mutable { block: mut block_1 } = result else {
         unreachable!()
     };
     block_1.insert_annotations(annotations.clone());
-    assert_eq!(Vec::<Token>::new(), block_1.push_tokens(tokens.clone()));
+    block_1.write_tokens(0, &tokens);
     assert_eq!(4, page_id_allocator.used());
     assert_eq!(2, block_cache.num_mutable_block());
     assert_eq!(0, block_cache.num_semi_immutable_block());
@@ -192,7 +192,7 @@ fn test_mutable_block_alloc_mutable_commit_immutable_collision() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block_0.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_0.cache_tokens(&scheduled_tokens);
+    block_0.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_mutable_block(None, block_0);
     let CommitSingleLaneMutableBlockResult::Immutable { block: block_0 } = result else {
         unreachable!()
@@ -212,7 +212,7 @@ fn test_mutable_block_alloc_mutable_commit_immutable_collision() {
     assert_eq!(1, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block_1.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_1.cache_tokens(&scheduled_tokens);
+    block_1.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_mutable_block(None, block_1);
     let CommitSingleLaneMutableBlockResult::ImmutableCollision { block: block_1 } = result else {
         unreachable!()
@@ -389,7 +389,7 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block.cache_tokens(&scheduled_tokens);
+    block.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_semi_immutable_block(block);
     let CommitSingleLaneSemiImmutableBlockResult::Immutable { block } = result else {
         unreachable!()
@@ -435,7 +435,7 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable_collision()
         unreachable!()
     };
     block_0.insert_annotations(annotations.clone());
-    assert_eq!(Vec::<Token>::new(), block_0.push_tokens(tokens.clone()));
+    block_0.write_tokens(0, &tokens);
     let tokens: Arc<[Token]> = tokens.into();
     let result = block_cache.reserve_semi_immutable_block::<NUM_TOKEN_PER_BLOCK>(BlockMetadata::new(
         None,
@@ -452,7 +452,7 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable_collision()
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block_0.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_0.cache_tokens(&scheduled_tokens);
+    block_0.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_mutable_block(None, block_0);
     let CommitSingleLaneMutableBlockResult::Immutable { block: block_0 } = result else {
         unreachable!()
@@ -464,7 +464,7 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable_collision()
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block_1.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_1.cache_tokens(&scheduled_tokens);
+    block_1.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_semi_immutable_block(block_1);
     let CommitSingleLaneSemiImmutableBlockResult::ImmutableCollision { block: block_1 } = result else {
         unreachable!()
@@ -529,7 +529,7 @@ fn test_semi_immutable_block_reserve_immutable() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block_0.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_0.cache_tokens(&scheduled_tokens);
+    block_0.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_semi_immutable_block(block_0);
     let CommitSingleLaneSemiImmutableBlockResult::Immutable { block: block_0 } = result else {
         unreachable!()
@@ -619,7 +619,7 @@ fn test_semi_immutable_block_reserve_reservation_collision() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let scheduled_tokens = block_0.schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
-    block_0.cache_tokens(&scheduled_tokens);
+    block_0.cache_tokens(scheduled_tokens.len());
     let result = block_cache.commit_semi_immutable_block(block_0);
     let CommitSingleLaneSemiImmutableBlockResult::Immutable { block: block_0 } = result else {
         unreachable!()
