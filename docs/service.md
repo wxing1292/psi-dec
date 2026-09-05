@@ -1127,23 +1127,23 @@ scripts/qwen35_e2e_decode_perf.sh \
   --runs 7
 ```
 
-Use `27b_mtp1`, `27b_mtp2`, `35b_mtp1`, or `35b_mtp2` to select an MTP proposal count.
-The `*_mtp` aliases run MTP proposal counts 1 and 2.
-The DSpark and DFlash2 cases use checkpoint defaults unless `--block-spec-tokens K` overrides the generated proposal count.
-This option does not change the MTP cases.
-For example, use `--cases 27b_dspark,27b_dflash2 --block-spec-tokens 2 --runs 3` to compare actual two-token proposals.
-The default case matrix uses this order:
+Use `27b_mtp1` through `27b_mtp4` and `35b_mtp1` through `35b_mtp4` to select an MTP proposal count.
+The `*_mtp` aliases run MTP proposal counts 1, 2, 3, and 4.
+Use `*_dspark_k1`, `*_dspark_k2`, `*_dspark_k3`, `*_dspark_k4`, or `*_dspark_k8` for DSpark.
+Use the matching `*_dflash2_kN` names for DFlash2.
+The base `*_dspark` and `*_dflash2` cases use checkpoint defaults.
+The current DSpark checkpoint has `block_size=7`: seven drafts.
+The current DFlash2 checkpoint has `dflash_config.block_size=8`: one anchor and seven drafts.
+An explicit K=8 requests eight drafts. It is not the DFlash2 checkpoint's default eight-row query block.
+Pass `--block-spec-tokens K` to override K for every block-spec case.
+The default case matrix uses MTP counts 1 through 4 and checkpoint-default block-spec counts.
+Pass explicit `_k1`, `_k2`, `_k3`, `_k4`, or `_k8` case names to compare other block-spec counts.
 
-1. `27b_off`
-2. `35b_off`
-3. `27b_mtp1`
-4. `35b_mtp1`
-5. `27b_dspark`
-6. `35b_dspark`
-7. `27b_dflash2`
-8. `35b_dflash2`
-9. `27b_mtp2`
-10. `35b_mtp2`
+1. Main-only `27b_off` and `35b_off`
+2. MTP counts 1, 2, 3, and 4 for each model
+3. Checkpoint-default DSpark and DFlash2 for each model
+
+The 27B cases use output limits 256 and 1024. The 35B cases use output limits 256 and 1024.
 
 The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
 Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
@@ -1153,6 +1153,8 @@ measurement progress, and a compact result table. The result table contains case
 decode throughput, tokens per chunk, and verified/proposed speculative tokens. Use `--show-runs` to also print
 machine-readable `CONFIG`, `RUN`, and `SUMMARY` rows. Each `RUN` and `SUMMARY` row contains the stable prompt ID. The
 configuration output contains the prompt-set name, prompt IDs, prompt count, and prompt-set SHA-256.
+For each case, prompt, and output limit, the helper hashes the generated output bytes before the performance footer.
+It stops with `DETERMINISM_FAILED` if repeated runs with the fixed sampling configuration and seed have different hashes.
 Use `--prompt <text>` to replace the set with one custom prompt.
 If an MTP, DSpark, or DFlash2 checkpoint is absent and no download repository is configured, the helper prints a
 warning and skips that case. A missing Main checkpoint remains an error.
@@ -1160,9 +1162,9 @@ Before it starts a DFlash2 case, the helper validates the affine config and safe
 It rejects a checkpoint that contains a BF16 matrix.
 The helper stops the server after each explicit case.
 It applies the configured cooldown between runnable cases. The default cooldown is 8 seconds.
-Each MTP summary label includes its proposal count, for example, `27b_mtp2`.
-Default DSpark and DFlash2 summary labels identify the model and mode.
-An explicit proposal count adds a suffix, for example, `27b_dflash2_k2`.
+Each Spec summary label includes its actual proposal count, including checkpoint defaults.
+Examples are `27b_mtp4`, `27b_dspark_k7`, and `27b_dflash2_k8`.
+A global override replaces explicit case counts before deduplication.
 
 Both helpers record these facts:
 
@@ -1177,13 +1179,19 @@ Both helpers record these facts:
 
 Both helpers also record cooldown and speculative-acceptance fields.
 
-The Qwen3.5/3.6/3.8 helper contains one observed reference run for its exact `representative2` workload. This reference
-is not a pass/fail threshold. The helper reports a throughput delta only when the machine, OS, architecture, clean
-state, model names, prompt hash, sampling configuration, scheduler capacities, and cooldown match. The run must contain
-at least as many samples as the reference. The input-token, sampled-token, chunk, proposal, verified-token, and
-conditional-acceptance trajectory must also match. A `SUMMARY` row reports the mismatch instead of a delta when one of
-these conditions does not match. The final output reports the reference-status counts. Use `--show-runs` for each
-reference delta and mismatch. Use `--no-reference` to disable this comparison.
+The Qwen3.5/3.6/3.8 helper contains the user-supplied result table received on 2026-09-05.
+Its reference tip is `14e8e714`, with `dirty=1`. The user confirmed that the uncommitted changes were performance-neutral.
+The table provides throughput, output counts, tokens per chunk, and accepted/proposed counts.
+It does not provide raw CONFIG/SUMMARY rows, run count, variance, output hashes, TTFT, or inter-chunk latency.
+The script does not invent these fields. Its configuration checks use the producing script's defaults.
+The obsolete 27B 384-token rows are removed. New 27B 1024-token cases and unmeasured K values have no reference row.
+
+A matching configuration and matching reported work counts produce `reference_status=summary-only`.
+The `observed_decode_delta_pct` field is a descriptive ratio, not a controlled performance verdict.
+A mismatch or missing row suppresses the delta. The reference is not a pass/fail threshold.
+Clean and dirty states remain visible as provenance. Their difference alone does not suppress this user-approved comparison.
+Use `--show-runs` for per-row deltas and mismatches. Use `--no-reference` to disable the comparison.
+Run `python3 scripts/qwen35_e2e_decode_perf_test.py` for CPU-only script contract tests.
 
 The Qwen3 helper does not contain a checked-in reference run. Record its comparison results outside the script with the
 complete provenance required by [`executor_benchmarks.md`](executor_benchmarks.md).
