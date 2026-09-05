@@ -18,7 +18,7 @@ kernel void gdn_compute_short_conv_bf16(
     device const bfloat16_t* conv_state [[buffer(3)]],
     device const bfloat16_t* conv_weight [[buffer(4)]],
     device const uint* src_conv_state_slots [[buffer(5)]],
-    device const uint* flat_materialized_conv_state_slots [[buffer(6)]],
+    device const uint* flat_conv_state_write_slots [[buffer(6)]],
     device const uint* cu_tokens [[buffer(7)]],
     constant uint& num_active_reqs [[buffer(8)]],
     constant uint& num_active_tokens [[buffer(9)]],
@@ -75,7 +75,7 @@ kernel void gdn_compute_short_conv_bf16(
         const uint num_req_tokens = flat_token_end - flat_token_begin;
         const uint src_state_slot = src_conv_state_slots[req_index];
         // An invalid slot keeps the row output but does not materialize its state.
-        const uint state_slot = flat_materialized_conv_state_slots[flat_token_end - 1];
+        const uint state_slot = flat_conv_state_write_slots[flat_token_end - 1];
         const long sequence_index = (long)num_req_tokens + (long)state_index - (long)conv_state_len;
         float x = 0.0f;
         if (sequence_index < 0) {
@@ -99,7 +99,7 @@ kernel void gdn_compute_candidate_conv_state_bf16(
     device const bfloat16_t* qkv [[buffer(1)]],
     device const bfloat16_t* conv_state [[buffer(2)]],
     device const uint* src_conv_state_slots [[buffer(3)]],
-    device const uint* flat_materialized_conv_state_slots [[buffer(4)]],
+    device const uint* flat_conv_state_write_slots [[buffer(4)]],
     device const uint* cu_tokens [[buffer(5)]],
     constant uint& num_active_reqs [[buffer(6)]],
     constant uint& num_active_tokens [[buffer(7)]],
@@ -128,7 +128,7 @@ kernel void gdn_compute_candidate_conv_state_bf16(
     const uint flat_token_begin = cu_tokens[req_index];
     const uint num_verified_req_tokens = flat_token_index - flat_token_begin + 1;
     const uint src_state_slot = src_conv_state_slots[req_index];
-    const uint state_slot = flat_materialized_conv_state_slots[flat_token_index];
+    const uint state_slot = flat_conv_state_write_slots[flat_token_index];
     if (state_slot == GDN_INVALID_STATE_SLOT_ID) {
         return;
     }
@@ -169,7 +169,7 @@ kernel void gdn_compute_final_recurrent_state_bf16(
     device const bfloat16_t* a_log [[buffer(5)]],
     device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_recurrent_state_slots [[buffer(7)]],
-    device const uint* flat_materialized_recurrent_state_slots [[buffer(8)]],
+    device const uint* flat_recurrent_state_write_slots [[buffer(8)]],
     device const uint* cu_tokens [[buffer(9)]],
     constant float& q_scale [[buffer(10)]],
     constant uint& num_active_reqs [[buffer(11)]],
@@ -202,7 +202,7 @@ kernel void gdn_compute_final_recurrent_state_bf16(
     const uint recurrent_state_stride = num_v_heads * v_head_dim * qk_head_dim;
     const uint src_state_slot = src_recurrent_state_slots[req_index];
     // An invalid slot keeps the row output but does not materialize its state.
-    const uint state_slot = flat_materialized_recurrent_state_slots[flat_token_end - 1];
+    const uint state_slot = flat_recurrent_state_write_slots[flat_token_end - 1];
 
     threadgroup float q_inv_norm_shared;
     threadgroup float k_inv_norm_shared;
@@ -325,7 +325,7 @@ kernel void gdn_compute_candidate_recurrent_state_bf16(
     device const bfloat16_t* a_log [[buffer(5)]],
     device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_recurrent_state_slots [[buffer(7)]],
-    device const uint* flat_materialized_recurrent_state_slots [[buffer(8)]],
+    device const uint* flat_recurrent_state_write_slots [[buffer(8)]],
     device const uint* cu_tokens [[buffer(9)]],
     constant float& q_scale [[buffer(10)]],
     constant uint& num_active_reqs [[buffer(11)]],
@@ -447,7 +447,7 @@ kernel void gdn_compute_candidate_recurrent_state_bf16(
             v_lane = conv_qkv[(ulong)flat_token_index * qkv_dim + v_base
                 + (ulong)v_head_index * v_head_dim + v_dim_index];
         }
-        const uint candidate_state_slot = flat_materialized_recurrent_state_slots[flat_token_index];
+        const uint candidate_state_slot = flat_recurrent_state_write_slots[flat_token_index];
         for (uint v_row_index_in_range = 0;
              v_row_index_in_range < candidate_recurrent_state_num_v_rows_per_simdgroup;
              ++v_row_index_in_range) {

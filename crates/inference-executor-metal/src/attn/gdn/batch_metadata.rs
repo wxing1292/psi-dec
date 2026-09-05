@@ -40,8 +40,8 @@ pub struct GDNMetadataBuffers {
     cu_tokens: Buffer,
     src_recurrent_state_slots: Buffer,
     src_conv_state_slots: Buffer,
-    flat_materialized_recurrent_state_slots: Buffer,
-    flat_materialized_conv_state_slots: Buffer,
+    flat_recurrent_state_write_slots: Buffer,
+    flat_conv_state_write_slots: Buffer,
     replay_shape: Cell<Option<GDNReplayShape>>,
 }
 
@@ -61,8 +61,8 @@ impl GDNMetadataBuffers {
             ),
             src_recurrent_state_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
             src_conv_state_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
-            flat_materialized_recurrent_state_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
-            flat_materialized_conv_state_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
+            flat_recurrent_state_write_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
+            flat_conv_state_write_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
             replay_shape: Cell::new(None),
         }
     }
@@ -76,7 +76,7 @@ impl GDNMetadataBuffers {
     }
 
     pub fn max_tokens(&self) -> usize {
-        self.flat_materialized_recurrent_state_slots.len_bytes() / size_of::<u32>()
+        self.flat_recurrent_state_write_slots.len_bytes() / size_of::<u32>()
     }
 
     pub fn src_recurrent_state_slots(&self) -> &Buffer {
@@ -87,12 +87,12 @@ impl GDNMetadataBuffers {
         &self.src_conv_state_slots
     }
 
-    pub fn flat_materialized_recurrent_state_slots(&self) -> &Buffer {
-        &self.flat_materialized_recurrent_state_slots
+    pub fn flat_recurrent_state_write_slots(&self) -> &Buffer {
+        &self.flat_recurrent_state_write_slots
     }
 
-    pub fn flat_materialized_conv_state_slots(&self) -> &Buffer {
-        &self.flat_materialized_conv_state_slots
+    pub fn flat_conv_state_write_slots(&self) -> &Buffer {
+        &self.flat_conv_state_write_slots
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -101,8 +101,8 @@ impl GDNMetadataBuffers {
         cu_tokens: &[u32],
         src_recurrent_state_slots: &[u32],
         src_conv_state_slots: &[u32],
-        flat_materialized_recurrent_state_slots: &[u32],
-        flat_materialized_conv_state_slots: &[u32],
+        flat_recurrent_state_write_slots: &[u32],
+        flat_conv_state_write_slots: &[u32],
         num_total_requests: u32,
         num_total_tokens: u32,
     ) -> GDNReplayShape {
@@ -120,9 +120,9 @@ impl GDNMetadataBuffers {
         );
         let num_tokens = cu_tokens[cu_tokens.len() - 1];
         let num_tokens_usize = num_tokens as usize;
-        assert_eq!(flat_materialized_recurrent_state_slots.len(), num_tokens_usize);
-        assert_eq!(flat_materialized_conv_state_slots.len(), num_tokens_usize);
-        assert!(num_tokens_usize <= self.flat_materialized_recurrent_state_slots.len_bytes() / size_of::<u32>());
+        assert_eq!(flat_recurrent_state_write_slots.len(), num_tokens_usize);
+        assert_eq!(flat_conv_state_write_slots.len(), num_tokens_usize);
+        assert!(num_tokens_usize <= self.flat_recurrent_state_write_slots.len_bytes() / size_of::<u32>());
         let num_reqs = src_recurrent_state_slots.len() as u32;
         assert!(
             num_reqs <= num_total_requests,
@@ -137,7 +137,7 @@ impl GDNMetadataBuffers {
             "GDN active token count must not exceed the total token count"
         );
         assert!(
-            num_total_tokens as usize <= self.flat_materialized_recurrent_state_slots.len_bytes() / size_of::<u32>(),
+            num_total_tokens as usize <= self.flat_recurrent_state_write_slots.len_bytes() / size_of::<u32>(),
             "GDN total token count must not exceed the metadata capacity"
         );
         let replay_shape = GDNReplayShape::new(num_reqs, num_total_requests, num_tokens, num_total_tokens);
@@ -145,10 +145,10 @@ impl GDNMetadataBuffers {
         self.cu_tokens.write_typed(0, cu_tokens);
         self.src_recurrent_state_slots.write_typed(0, src_recurrent_state_slots);
         self.src_conv_state_slots.write_typed(0, src_conv_state_slots);
-        self.flat_materialized_recurrent_state_slots
-            .write_typed(0, flat_materialized_recurrent_state_slots);
-        self.flat_materialized_conv_state_slots
-            .write_typed(0, flat_materialized_conv_state_slots);
+        self.flat_recurrent_state_write_slots
+            .write_typed(0, flat_recurrent_state_write_slots);
+        self.flat_conv_state_write_slots
+            .write_typed(0, flat_conv_state_write_slots);
         self.replay_shape.set(Some(replay_shape));
         replay_shape
     }
@@ -173,15 +173,15 @@ mod tests {
         let cu_tokens = [0, 1, 3, 7];
         let src_recurrent_state_slots = [10, 11, 12];
         let src_conv_state_slots = [20, 21, 22];
-        let flat_materialized_recurrent_state_slots = [u32::MAX, 30, 31, u32::MAX, 32, 33, 34];
-        let flat_materialized_conv_state_slots = [u32::MAX, 40, 41, u32::MAX, 42, 43, 44];
+        let flat_recurrent_state_write_slots = [u32::MAX, 30, 31, u32::MAX, 32, 33, 34];
+        let flat_conv_state_write_slots = [u32::MAX, 40, 41, u32::MAX, 42, 43, 44];
 
         let exact = metadata.update(
             &cu_tokens,
             &src_recurrent_state_slots,
             &src_conv_state_slots,
-            &flat_materialized_recurrent_state_slots,
-            &flat_materialized_conv_state_slots,
+            &flat_recurrent_state_write_slots,
+            &flat_conv_state_write_slots,
             3,
             7,
         );
@@ -191,8 +191,8 @@ mod tests {
             &cu_tokens,
             &src_recurrent_state_slots,
             &src_conv_state_slots,
-            &flat_materialized_recurrent_state_slots,
-            &flat_materialized_conv_state_slots,
+            &flat_recurrent_state_write_slots,
+            &flat_conv_state_write_slots,
             4,
             8,
         );
@@ -202,8 +202,8 @@ mod tests {
             &cu_tokens,
             &src_recurrent_state_slots,
             &src_conv_state_slots,
-            &flat_materialized_recurrent_state_slots,
-            &flat_materialized_conv_state_slots,
+            &flat_recurrent_state_write_slots,
+            &flat_conv_state_write_slots,
             4,
             7,
         );
@@ -219,14 +219,12 @@ mod tests {
             src_conv_state_slots
         );
         assert_eq!(
-            metadata
-                .flat_materialized_recurrent_state_slots()
-                .read_typed::<u32>(0, 7),
-            flat_materialized_recurrent_state_slots
+            metadata.flat_recurrent_state_write_slots().read_typed::<u32>(0, 7),
+            flat_recurrent_state_write_slots
         );
         assert_eq!(
-            metadata.flat_materialized_conv_state_slots().read_typed::<u32>(0, 7),
-            flat_materialized_conv_state_slots
+            metadata.flat_conv_state_write_slots().read_typed::<u32>(0, 7),
+            flat_conv_state_write_slots
         );
     }
 

@@ -1011,20 +1011,15 @@ MTP keeps the GDN current version aligned with the Main runtime cache frontier.
 For one request, Main calculates `num_fixed_tokens = num_total_tokens - num_spec_tokens`.
 It commits `input_state_version + num_fixed_tokens + num_accepted_tokens`.
 `num_spec_tokens` does not directly adjust this state version.
-MTP decode replays K - 1 verified tail tokens in the next Main call.
-Qwen verification keeps the verified state version unchanged and calculates
-`replay_source_state_version = verified_state_version - (K - 1)`. It passes this physical source to GDN commit as the
-state version that becomes current.
-The transaction shifts both ends of the complete decision-candidate range by `K - 1`.
-It keeps `S + 1` candidates for a request that verifies `S` speculative tokens.
-DSpark, DFlash2, and MTP therefore use the same candidate count. Only the physical MTP state versions shift.
+The next Main call starts at that selected state version. It does not replay verified tail tokens.
+The transaction keeps `S + 1` candidates for a request that verifies `S` speculative tokens.
+DSpark, DFlash2, and MTP use the same unshifted Main state-version domain.
 Cache-boundary versions are an independent materialization requirement.
-If the Main forward end is neither a decision candidate nor a cache boundary, GDN produces the row output and discards
-that final recurrent/convolution state.
+The final Main state is always a candidate. Rejection can select an earlier candidate and discard later states.
 The next newly sampled token index remains the verified state version.
 Runtime can represent a full prompt as `QueryTokens::Decode` when the prompt fits the token budget, so this rule also
 applies to that zero-spec warm-up.
-`QueryTokens::Prefill` commits its full window without the replay shift.
+`QueryTokens::Prefill` commits its full window.
 
 Runtime core can receive the response while publish continues.
 The next prepare or reset waits before it reuses shared page-I/O or live-state resources.
@@ -1091,8 +1086,8 @@ Proposal-local Q/K/V and attention partials remain in executor-owned `BiDiBlockG
 Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
 For DSpark, `num_spec_tokens` is the checkpoint `block_size`.
 For DFlash2, `num_spec_tokens` is the checkpoint `block_size - 1`.
-MTP uses the same decision-candidate count and shifts their physical state versions by `num_spec_tokens - 1`.
-Both modes also reserve cache-block boundary candidates.
+MTP uses the same decision-candidate count without a state-version shift.
+Each mode also reserves cache-block boundary state slots.
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, DSpark, and DFlash2.
 These state buffers remain allocated and reusable while model state is loaded.
 `unload_state` writes persistent cache state to SSD and releases its loaded resources.

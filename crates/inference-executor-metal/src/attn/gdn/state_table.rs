@@ -10,8 +10,6 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
-use inference_executor_core::attn::gdn::state::to_candidate_state_version;
-use inference_executor_core::attn::gdn::state::to_state_version;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_runtime_core::runtime::RawRequestSlot;
 
@@ -106,12 +104,12 @@ pub struct GDNPreparedRequestState {
     ///
     /// `u32::MAX` means that the row produces its normal output, but its recurrent state
     /// must not be written to the persistent recurrent state arena.
-    pub flat_materialized_recurrent_state_slots: Vec<u32>,
+    pub flat_recurrent_state_write_slots: Vec<u32>,
     /// Persistent convolution state slot for each forward row.
     ///
     /// `u32::MAX` means that the row produces its normal output, but its convolution state
     /// must not be written to the persistent convolution state arena.
-    pub flat_materialized_conv_state_slots: Vec<u32>,
+    pub flat_conv_state_write_slots: Vec<u32>,
 }
 
 struct GDNPrepareOutput {
@@ -468,17 +466,9 @@ impl GDNRequestStateTable {
         for (request_txn, &dst_state_version) in pending_request_txns.iter().zip(dst_state_versions) {
             assert!(
                 request_txn.txn.contains_dst_state_version(dst_state_version),
-                "GDN commit state version must select the transaction's destination range"
+                "GDN commit state version must select a recorded candidate"
             );
-            let candidate_state_version =
-                to_candidate_state_version(dst_state_version, request_txn.txn.candidate_state_version_shift());
-            assert!(
-                request_txn
-                    .txn
-                    .contains_candidate_state_version(candidate_state_version),
-                "GDN shifted commit state version must select a recorded candidate"
-            );
-            let publishes = request_table.commit_txn(request_txn.req_slot, candidate_state_version);
+            let publishes = request_table.commit_txn(request_txn.req_slot, dst_state_version);
             assert!(
                 publishes.len() <= self.max_publish_jobs_per_req,
                 "GDN publishes exceed per-request capacity"
@@ -564,11 +554,14 @@ impl GDNRequestStateTable {
                 .checked_sub(cu_tokens[req_index])
                 .expect("GDN state batch cu_tokens must be nondecreasing");
             assert!(num_tokens > 0, "GDN state batch requires tokens for every request");
+            assert!(txn.dst_start_state_version() >= token_indices[req_index]);
             assert_eq!(
-                txn.dst_start_state_version(),
-                to_state_version(token_indices[req_index])
+                txn.dst_end_state_version(),
+                token_indices[req_index]
+                    .checked_add(num_tokens)
+                    .and_then(|version| version.checked_add(1))
+                    .expect("GDN forward state range must fit u32")
             );
-            assert_eq!(txn.num_forward_tokens(), num_tokens);
             assert!(
                 txn.num_candidate_states() as usize <= self.max_materialized_states_per_req,
                 "GDN candidate range exceeds per-request capacity"
@@ -845,8 +838,8 @@ impl GDNPrepareInput {
     /// Resolves candidate states and cache-boundary snapshots into one ordered
     /// set of materialized state versions.
     ///
-    /// The transaction keeps the complete destination range separate from the
-    /// shifted candidate range. A cache boundary can precede the candidate range:
+    /// The batch supplies forward row positions. The transaction supplies only
+    /// selectable candidates. A cache boundary can precede that range:
     ///
     /// ```text
     /// destination states   11   12   13   14
@@ -933,10 +926,10 @@ impl GDNPrepareInput {
                 self.request_table.txn_publish_state_versions(req_slot),
                 pending_publish_pages[req_index].iter().map(|pages| pages.state_version),
             )
-            .take_while(|&state_version| state_version < txn.candidate_end_state_version())
+            .take_while(|&state_version| state_version < txn.dst_end_state_version())
             .peekable();
             let mut materialized_versions = Vec::with_capacity(self.max_materialized_states_per_req);
-            for candidate_state_version in txn.candidate_state_versions() {
+            for candidate_state_version in txn.dst_state_versions() {
                 while publish_versions
                     .peek()
                     .is_some_and(|&publish_state_version| publish_state_version <= candidate_state_version)
@@ -981,21 +974,16 @@ impl GDNPrepareInput {
             .iter()
             .map(|&req_slot| self.request_table.current_conv_state_slot(req_slot))
             .collect::<Vec<_>>();
-        let num_tokens = self.cu_tokens.last().copied().unwrap_or_default() as usize;
-        let mut flat_materialized_recurrent_state_slots = Vec::with_capacity(num_tokens);
-        let mut flat_materialized_conv_state_slots = Vec::with_capacity(num_tokens);
+        let num_tokens = self.cu_tokens[self.req_slots.len()] as usize;
+        let mut flat_recurrent_state_write_slots = Vec::with_capacity(num_tokens);
+        let mut flat_conv_state_write_slots = Vec::with_capacity(num_tokens);
         for (req_index, materialized_versions) in materialized_versions_by_req.iter().enumerate() {
-            let txn = self.state_txns[req_index];
             let req_slot = self.req_slots[req_index];
             let flat_start = self.cu_tokens[req_index];
             let flat_end = self.cu_tokens[req_index + 1];
             let mut materialized_versions = materialized_versions.iter().copied().peekable();
-            for (flat_index, dst_state_version) in (flat_start..flat_end).zip(txn.dst_state_versions()) {
-                debug_assert_eq!(
-                    flat_index - flat_start,
-                    dst_state_version - txn.dst_start_state_version(),
-                    "GDN flat token and destination state offsets must match"
-                );
+            for flat_index in flat_start..flat_end {
+                let dst_state_version = self.token_indices[req_index] + (flat_index - flat_start) + 1;
                 while materialized_versions
                     .peek()
                     .is_some_and(|&materialized_state_version| materialized_state_version < dst_state_version)
@@ -1004,17 +992,17 @@ impl GDNPrepareInput {
                 }
                 if materialized_versions.peek().copied() == Some(dst_state_version) {
                     materialized_versions.next();
-                    flat_materialized_recurrent_state_slots.push(
+                    flat_recurrent_state_write_slots.push(
                         self.request_table
                             .candidate_recurrent_state_slot(req_slot, dst_state_version),
                     );
-                    flat_materialized_conv_state_slots.push(
+                    flat_conv_state_write_slots.push(
                         self.request_table
                             .candidate_conv_state_slot(req_slot, dst_state_version),
                     );
                 } else {
-                    flat_materialized_recurrent_state_slots.push(u32::MAX);
-                    flat_materialized_conv_state_slots.push(u32::MAX);
+                    flat_recurrent_state_write_slots.push(u32::MAX);
+                    flat_conv_state_write_slots.push(u32::MAX);
                 }
             }
         }
@@ -1022,8 +1010,8 @@ impl GDNPrepareInput {
             prepared: GDNPreparedRequestState {
                 src_recurrent_state_slots,
                 src_conv_state_slots,
-                flat_materialized_recurrent_state_slots,
-                flat_materialized_conv_state_slots,
+                flat_recurrent_state_write_slots,
+                flat_conv_state_write_slots,
             },
             request_table: self.request_table,
             restores,

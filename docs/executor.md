@@ -656,7 +656,7 @@ force the same lifecycle on components that have different ownership contracts.
 
 - GDN metadata tests exercise exact, bucketed, and caller-owned token-capacity APIs. The GDN numerical replay test
   sweeps all active counts for a total capacity of `8` and checks persistent state.
-- GDN state tests exercise mixed commit modes, MTP state-version shifts, deferred publish, restore, and selective reset.
+- GDN state tests exercise mixed commit modes, unshifted MTP candidate selection, deferred publish, restore, and selective reset.
 - GQA metadata tests exercise single-query and tiled-query paths with exact, bucketed, and caller-owned capacity APIs.
 - GQA page-table tests exercise selected state I/O and selective reset without reproducing KV-kernel math.
 - MoE component tests protect execution-variant selection. Isolated replay tests compare token-major, expert-major,

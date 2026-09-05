@@ -205,7 +205,7 @@ fn test_transaction_lifecycle_handles_mixed_commit_modes_and_deferred_publish() 
         &device,
         &[core(0), core(1)],
         3,
-        GDNStateCapacity::new(5, 4, 2),
+        GDNStateCapacity::new(6, 5, 2),
         2,
         TEST_NUM_CACHE_PAGES,
         LIFECYCLE_PAGE_BYTES,
@@ -223,9 +223,9 @@ fn test_transaction_lifecycle_handles_mixed_commit_modes_and_deferred_publish() 
         &[0, 0, 0],
         &[0, 4, 8, 12],
         &[
-            GDNStateTxn::from_state_versions(1, 5, 1, 0),
-            GDNStateTxn::from_state_versions(1, 5, 3, 1),
-            GDNStateTxn::from_state_versions(1, 5, 4, 1),
+            GDNStateTxn::from_state_versions(4, 5),
+            GDNStateTxn::from_state_versions(2, 5),
+            GDNStateTxn::from_state_versions(0, 5),
         ],
         &[
             vec![
@@ -243,68 +243,68 @@ fn test_transaction_lifecycle_handles_mixed_commit_modes_and_deferred_publish() 
     let req_0_recurrent_state_4 = table.candidate_recurrent_state_slot(0, 4);
     let req_0_conv_state_2 = table.candidate_conv_state_slot(0, 2);
     let req_0_conv_state_4 = table.candidate_conv_state_slot(0, 4);
-    let req_1_recurrent_state_1 = table.candidate_recurrent_state_slot(1, 1);
     let req_1_recurrent_state_2 = table.candidate_recurrent_state_slot(1, 2);
     let req_1_recurrent_state_3 = table.candidate_recurrent_state_slot(1, 3);
-    let req_1_conv_state_1 = table.candidate_conv_state_slot(1, 1);
+    let req_1_recurrent_state_4 = table.candidate_recurrent_state_slot(1, 4);
     let req_1_conv_state_2 = table.candidate_conv_state_slot(1, 2);
     let req_1_conv_state_3 = table.candidate_conv_state_slot(1, 3);
+    let req_1_conv_state_4 = table.candidate_conv_state_slot(1, 4);
     let req_2_current_recurrent = table.current_recurrent_state_slot(2);
     let req_2_current_conv = table.current_conv_state_slot(2);
     let req_2_recurrent_state_1 = table.candidate_recurrent_state_slot(2, 1);
     let req_2_recurrent_state_2 = table.candidate_recurrent_state_slot(2, 2);
     let req_2_recurrent_state_3 = table.candidate_recurrent_state_slot(2, 3);
+    let req_2_recurrent_state_4 = table.candidate_recurrent_state_slot(2, 4);
     let req_2_conv_state_1 = table.candidate_conv_state_slot(2, 1);
     let req_2_conv_state_2 = table.candidate_conv_state_slot(2, 2);
     let req_2_conv_state_3 = table.candidate_conv_state_slot(2, 3);
+    let req_2_conv_state_4 = table.candidate_conv_state_slot(2, 4);
     drop(table);
     assert_eq!(
         batch_metadata
-            .flat_materialized_recurrent_state_slots()
+            .flat_recurrent_state_write_slots()
             .read_typed::<u32>(0, 12),
         vec![
             u32::MAX,
             req_0_recurrent_state_2,
             u32::MAX,
             req_0_recurrent_state_4,
-            req_1_recurrent_state_1,
+            u32::MAX,
             req_1_recurrent_state_2,
             req_1_recurrent_state_3,
-            u32::MAX,
+            req_1_recurrent_state_4,
             req_2_recurrent_state_1,
             req_2_recurrent_state_2,
             req_2_recurrent_state_3,
-            u32::MAX,
+            req_2_recurrent_state_4,
         ]
     );
     assert_eq!(
-        batch_metadata
-            .flat_materialized_conv_state_slots()
-            .read_typed::<u32>(0, 12),
+        batch_metadata.flat_conv_state_write_slots().read_typed::<u32>(0, 12),
         vec![
             u32::MAX,
             req_0_conv_state_2,
             u32::MAX,
             req_0_conv_state_4,
-            req_1_conv_state_1,
+            u32::MAX,
             req_1_conv_state_2,
             req_1_conv_state_3,
-            u32::MAX,
+            req_1_conv_state_4,
             req_2_conv_state_1,
             req_2_conv_state_2,
             req_2_conv_state_3,
-            u32::MAX,
+            req_2_conv_state_4,
         ]
     );
 
-    state.commit(&[4, 3, 1]);
+    state.commit(&[4, 3, 0]);
     let table = state.request_table().borrow();
     assert_eq!(table.current_state_version(0), 4);
     assert_eq!(table.current_recurrent_state_slot(0), req_0_recurrent_state_4);
     assert_eq!(table.current_conv_state_slot(0), req_0_conv_state_4);
-    assert_eq!(table.current_state_version(1), 2);
-    assert_eq!(table.current_recurrent_state_slot(1), req_1_recurrent_state_2);
-    assert_eq!(table.current_conv_state_slot(1), req_1_conv_state_2);
+    assert_eq!(table.current_state_version(1), 3);
+    assert_eq!(table.current_recurrent_state_slot(1), req_1_recurrent_state_3);
+    assert_eq!(table.current_conv_state_slot(1), req_1_conv_state_3);
     assert_eq!(table.current_state_version(2), 0);
     assert_eq!(table.current_recurrent_state_slot(2), req_2_current_recurrent);
     assert_eq!(table.current_conv_state_slot(2), req_2_current_conv);
@@ -477,6 +477,80 @@ fn test_prepare_requires_source_state_for_first_input_token() {
         &[GDNStateTxn::new(2, 1, 0)],
         &[Vec::new()],
     );
+}
+
+#[test]
+fn test_decode_commit_selects_next_main_source_and_saves_crossed_boundary() {
+    let device = Device::system_default();
+    for num_accepted_tokens in 0..=3 {
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0)],
+            1,
+            GDNStateCapacity::new(7, 6, 2),
+            4,
+            TEST_NUM_CACHE_PAGES,
+            LIFECYCLE_PAGE_BYTES,
+        );
+        let metadata = GDNMetadataBuffers::new(&device, 1, 4);
+        prepare_state(
+            &state,
+            &metadata,
+            &[0],
+            &[0],
+            &[0],
+            &[0, 3],
+            &[GDNStateTxn::new(0, 3, 0)],
+            &[Vec::new()],
+        );
+        state.commit(&[3]);
+        state.finish_publish();
+
+        let page_ids = (0..state.num_pages_per_state_slot() as u32).collect::<Vec<_>>();
+        // S3 --w--> S4 --x1--> S5 --x2--> S6 --x3--> S7.
+        // The Main block ending at S4 is stable for every rejection outcome.
+        prepare_state(
+            &state,
+            &metadata,
+            &[0],
+            &[0],
+            &[3],
+            &[0, 4],
+            &[GDNStateTxn::new(3, 4, 3)],
+            &[vec![page_ids.clone()]],
+        );
+        let selected_version = 4 + num_accepted_tokens;
+        let (recurrent_slot, conv_slot) = {
+            let table = state.request_table().borrow();
+            (
+                table.candidate_recurrent_state_slot(0, selected_version),
+                table.candidate_conv_state_slot(0, selected_version),
+            )
+        };
+        state.commit(&[selected_version]);
+        assert_eq!(state.publishes().len(), 1);
+        assert_eq!(state.publishes()[0].state_version, 4);
+        assert_eq!(state.publishes()[0].page_ids, page_ids);
+        state.finish_publish();
+
+        // y is pending. Its forward must read the selected state, without replaying w/x1.
+        prepare_state(
+            &state,
+            &metadata,
+            &[0],
+            &[0],
+            &[selected_version],
+            &[0, 1],
+            &[GDNStateTxn::new(selected_version, 1, 0)],
+            &[Vec::new()],
+        );
+        assert_eq!(
+            metadata.src_recurrent_state_slots().read_typed::<u32>(0, 1),
+            [recurrent_slot]
+        );
+        assert_eq!(metadata.src_conv_state_slots().read_typed::<u32>(0, 1), [conv_slot]);
+        state.commit(&[selected_version + 1]);
+    }
 }
 
 fn assert_unload_load(name: &str, device: &Device, state: &mut GDNRequestStateTable, reference: GDNStateReference) {
@@ -696,8 +770,8 @@ fn prepare_state(
         cu_tokens,
         &prepared.src_recurrent_state_slots,
         &prepared.src_conv_state_slots,
-        &prepared.flat_materialized_recurrent_state_slots,
-        &prepared.flat_materialized_conv_state_slots,
+        &prepared.flat_recurrent_state_write_slots,
+        &prepared.flat_conv_state_write_slots,
         prepared.src_recurrent_state_slots.len() as u32,
         cu_tokens.last().copied().unwrap(),
     )

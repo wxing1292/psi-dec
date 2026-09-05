@@ -81,8 +81,8 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
         let prepared = GDNPreparedRequestState {
             src_recurrent_state_slots: source_slots.clone(),
             src_conv_state_slots: source_slots,
-            flat_materialized_recurrent_state_slots: candidate_slots.clone(),
-            flat_materialized_conv_state_slots: candidate_slots,
+            flat_recurrent_state_write_slots: candidate_slots.clone(),
+            flat_conv_state_write_slots: candidate_slots,
         };
         let shape = replay
             .component()

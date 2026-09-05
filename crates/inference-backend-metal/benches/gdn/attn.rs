@@ -144,8 +144,8 @@ impl GDNFixture {
             cu_tokens: &cu_tokens,
             src_recurrent_state_slots: &src_state_slots,
             src_conv_state_slots: &src_state_slots,
-            flat_materialized_recurrent_state_slots: &flat_final_state_slots,
-            flat_materialized_conv_state_slots: &flat_final_state_slots,
+            flat_recurrent_state_write_slots: &flat_final_state_slots,
+            flat_conv_state_write_slots: &flat_final_state_slots,
             conv_state: &conv_state,
             conv_state_offset_bytes: 0,
             next_conv_state: &next_conv_state,
@@ -162,8 +162,8 @@ impl GDNFixture {
             &kernels,
             shape,
             backend_compute::Buffers {
-                flat_materialized_recurrent_state_slots: &candidate_dst_slot_ids,
-                flat_materialized_conv_state_slots: &candidate_dst_slot_ids,
+                flat_recurrent_state_write_slots: &candidate_dst_slot_ids,
+                flat_conv_state_write_slots: &candidate_dst_slot_ids,
                 ..buffers
             },
         );

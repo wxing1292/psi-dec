@@ -420,11 +420,11 @@ pub struct Buffers<'a> {
     /// Persistent recurrent state slot for each forward row.
     ///
     /// `u32::MAX` keeps the row output but discards the row's recurrent state.
-    pub flat_materialized_recurrent_state_slots: &'a Buffer,
+    pub flat_recurrent_state_write_slots: &'a Buffer,
     /// Persistent convolution state slot for each forward row.
     ///
     /// `u32::MAX` keeps the row output but discards the row's convolution state.
-    pub flat_materialized_conv_state_slots: &'a Buffer,
+    pub flat_conv_state_write_slots: &'a Buffer,
     pub conv_state: &'a Buffer,
     pub conv_state_offset_bytes: u64,
     pub next_conv_state: &'a Buffer,
@@ -568,7 +568,7 @@ impl Variant {
         recorder.set_buffer_read(3, buffers.conv_state, 0);
         recorder.set_buffer_read(4, buffers.conv_weight, 0);
         recorder.set_buffer_read(5, buffers.src_conv_state_slots, 0);
-        recorder.set_buffer_read(6, buffers.flat_materialized_conv_state_slots, 0);
+        recorder.set_buffer_read(6, buffers.flat_conv_state_write_slots, 0);
         recorder.set_buffer_read(7, buffers.cu_tokens, 0);
         set_batch_args(recorder, shape, 8, num_active_reqs, num_active_tokens);
         recorder.set_u64(10, buffers.conv_state_offset_bytes);
@@ -599,7 +599,7 @@ impl Variant {
         recorder.set_buffer_read(1, buffers.qkv, 0);
         recorder.set_buffer_read(2, buffers.conv_state, 0);
         recorder.set_buffer_read(3, buffers.src_conv_state_slots, 0);
-        recorder.set_buffer_read(4, buffers.flat_materialized_conv_state_slots, 0);
+        recorder.set_buffer_read(4, buffers.flat_conv_state_write_slots, 0);
         recorder.set_buffer_read(5, buffers.cu_tokens, 0);
         set_batch_args(recorder, shape, 6, num_active_reqs, num_active_tokens);
         recorder.set_u64(8, buffers.conv_state_offset_bytes);
@@ -649,7 +649,7 @@ impl Variant {
         recorder.set_buffer_read(5, buffers.a_log, 0);
         recorder.set_buffer_read(6, buffers.dt_bias, 0);
         recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
-        recorder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
+        recorder.set_buffer_read(8, buffers.flat_recurrent_state_write_slots, 0);
         recorder.set_buffer_read(9, buffers.cu_tokens, 0);
         recorder.set_f32(10, self.q_scale);
         set_replay_u32(
@@ -707,7 +707,7 @@ impl Variant {
         recorder.set_buffer_read(5, buffers.a_log, 0);
         recorder.set_buffer_read(6, buffers.dt_bias, 0);
         recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
-        recorder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
+        recorder.set_buffer_read(8, buffers.flat_recurrent_state_write_slots, 0);
         recorder.set_buffer_read(9, buffers.cu_tokens, 0);
         recorder.set_f32(10, self.q_scale);
         set_replay_u32(
@@ -931,13 +931,12 @@ fn validate_buffers(constants: VariantConstants, shape: Shape, buffers: &Buffers
         "GDN src_conv_state_slots buffer is too small"
     );
     assert!(
-        buffers.flat_materialized_recurrent_state_slots.len_bytes()
-            >= shape.num_total_tokens as usize * size_of::<u32>(),
-        "GDN flat_materialized_recurrent_state_slots buffer is too small"
+        buffers.flat_recurrent_state_write_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>(),
+        "GDN flat_recurrent_state_write_slots buffer is too small"
     );
     assert!(
-        buffers.flat_materialized_conv_state_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>(),
-        "GDN flat_materialized_conv_state_slots buffer is too small"
+        buffers.flat_conv_state_write_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>(),
+        "GDN flat_conv_state_write_slots buffer is too small"
     );
     let conv_state_region_bytes = (model.num_conv_state_values(shape) as u64)
         .checked_mul(bf16_bytes)

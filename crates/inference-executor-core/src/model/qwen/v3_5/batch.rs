@@ -10,7 +10,6 @@ use inference_runtime_core::runtime::Token;
 use ordered_float::NotNan;
 
 use crate::attn::gdn::state::GDNStateTxn;
-use crate::attn::gdn::state::to_state_version;
 use crate::sampling::SamplerConfig;
 use crate::sampling::SpecMicrobatch;
 
@@ -215,13 +214,7 @@ impl Qwen35Microbatch {
             req_slots.push(request.req_slot);
             block_indices.push(request.decoder_sync_blocks.block_index());
             token_indices.push(token_index);
-            gdn_state_txns.push(gdn_state_txn(
-                token_index,
-                num_total_tokens,
-                num_req_spec_tokens,
-                num_lanes,
-                matches!(request.decoder_query_tokens, QueryTokens::Prefill { .. }),
-            ));
+            gdn_state_txns.push(GDNStateTxn::new(token_index, num_total_tokens, num_req_spec_tokens));
             gdn_state_page_ids_by_req.push(gdn_state_page_ids);
         }
 
@@ -369,95 +362,6 @@ impl Qwen35ModelBatchRequest {
     }
 }
 
-/// Maps one Qwen3.5 Main forward to its GDN destination and candidate ranges.
-///
-/// Both ranges are half-open. `V` is the expected index of the first input token,
-/// `L` is the cache-lane count, and `S` is the speculative suffix in this request.
-/// MTP has `L - 1` fixed/replayed rows and shifts the complete `S + 1` decision
-/// range left by `L - 2` versions. Vanilla and DSpark have one cache lane and no
-/// shift.
-///
-/// ```text
-/// DSpark/no shift, S = 3, shift = 0
-///
-/// Forward mapping:
-///
-/// source state version          V       V+1       V+2       V+3
-/// forward row               fixed     spec0     spec1     spec2
-/// destination state version   V+1       V+2       V+3       V+4
-/// candidate state version     V+1       V+2       V+3       V+4
-///
-/// Commit mapping:
-///
-/// accepted count                0         1         2         3
-/// destination state version   V+1       V+2       V+3       V+4
-/// candidate state version     V+1       V+2       V+3       V+4
-///
-/// destination range         [V+1, V+5)
-/// selectable dst range      [V+1, V+5)
-/// candidate range           [V+1, V+5)
-///
-/// MTP/shift, L = 4, S = 3, shift = L - 2 = 2
-///
-/// Forward mapping:
-///
-/// source state version          V       V+1       V+2       V+3       V+4       V+5
-/// forward row              fixed0    fixed1    fixed2     spec0     spec1     spec2
-/// destination state version   V+1       V+2       V+3       V+4       V+5       V+6
-/// candidate state version     V+1       V+2       V+3       V+4         -         -
-///
-/// Commit mapping:
-///
-/// accepted count                0         1         2         3
-/// destination state version   V+3       V+4       V+5       V+6
-/// candidate state version     V+1       V+2       V+3       V+4
-///
-/// destination range         [V+1, V+7)
-/// selectable dst range      [V+3, V+7)
-/// candidate range           [V+1, V+5)
-/// ```
-///
-/// Cache-boundary materialization is independent of the candidate ranges.
-///
-/// The candidate count is `S + 1` for both modes. MTP shifts the candidate
-/// range earlier. It does not add candidates. Prefill commits its full window
-/// and does not shift candidate versions.
-fn gdn_state_txn(
-    token_index: u32,
-    num_total_tokens: u32,
-    num_req_spec_tokens: u32,
-    num_cache_lanes: usize,
-    is_prefill: bool,
-) -> GDNStateTxn {
-    let dst_start_state_version = to_state_version(token_index);
-    let dst_end_state_version = dst_start_state_version
-        .checked_add(num_total_tokens)
-        .expect("qwen3.5 GDN destination state range must fit u32");
-    let num_candidate_states = if is_prefill {
-        1
-    } else {
-        num_req_spec_tokens
-            .checked_add(1)
-            .expect("qwen3.5 GDN candidate state count must fit u32")
-    };
-    let candidate_state_version_shift = if is_prefill {
-        0
-    } else {
-        candidate_state_version_shift(num_cache_lanes)
-    };
-    GDNStateTxn::from_state_versions(
-        dst_start_state_version,
-        dst_end_state_version,
-        num_candidate_states,
-        candidate_state_version_shift,
-    )
-}
-
-fn candidate_state_version_shift(num_cache_lanes: usize) -> u32 {
-    assert!(num_cache_lanes > 0, "qwen3.5 GDN requires at least one cache lane");
-    u32::try_from(num_cache_lanes.saturating_sub(2)).expect("qwen3.5 GDN candidate state version shift must fit u32")
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen35SampledTokens {
     token_ids: Vec<i32>,
@@ -603,10 +507,6 @@ pub fn verified_state_versions_for_decisions(
     microbatch: &Qwen35Microbatch,
     decisions: &[Qwen35DecodeDecision],
 ) -> Vec<u32> {
-    state_versions_for_decisions(microbatch, decisions)
-}
-
-fn state_versions_for_decisions(microbatch: &Qwen35Microbatch, decisions: &[Qwen35DecodeDecision]) -> Vec<u32> {
     let mut decision_iter = decisions.iter();
     let mut state_versions = Vec::with_capacity(microbatch.num_reqs());
     for req_index in 0..microbatch.num_reqs() {
@@ -760,15 +660,17 @@ fn validate_gdn_state_txns(token_indices: &[u32], cu_tokens: &[u32], gdn_state_t
     for req_index in 0..token_indices.len() {
         let txn = gdn_state_txns[req_index];
         let num_total_tokens = cu_tokens[req_index + 1] - cu_tokens[req_index];
-        assert_eq!(
-            txn.dst_start_state_version(),
-            to_state_version(token_indices[req_index]),
-            "qwen3.5 GDN destination start must follow the request token_index"
+        assert!(
+            txn.dst_start_state_version() >= token_indices[req_index],
+            "qwen3.5 GDN candidate start must not precede the source state"
         );
         assert_eq!(
-            txn.num_forward_tokens(),
-            num_total_tokens,
-            "qwen3.5 GDN state txn forward width must match request tokens"
+            txn.dst_end_state_version(),
+            token_indices[req_index]
+                .checked_add(num_total_tokens)
+                .and_then(|version| version.checked_add(1))
+                .expect("qwen3.5 GDN state range must fit u32"),
+            "qwen3.5 GDN candidate end must follow the final forward state"
         );
     }
 }
@@ -917,14 +819,14 @@ mod tests {
     }
 
     #[test]
-    fn test_mtp_gdn_transaction_shifts_the_complete_candidate_range() {
+    fn test_mtp_gdn_transaction_uses_the_unshifted_candidate_suffix() {
         let requests = vec![device_request(
             10,
             0,
             QueryTokens::Decode {
                 epoch: 1,
                 token_index: 10,
-                tokens: tokens(&[100, 101]),
+                tokens: tokens(&[100]),
                 spec_tokens: tokens(&[200, 201]),
             },
             4,
@@ -934,9 +836,7 @@ mod tests {
         let txn = batch.gdn_state_txns()[0];
 
         assert_eq!(txn.dst_start_state_version(), 11);
-        assert_eq!(txn.dst_end_state_version(), 15);
-        assert_eq!(txn.candidate_start_state_version(), 11);
-        assert_eq!(txn.candidate_end_state_version(), 14);
+        assert_eq!(txn.dst_end_state_version(), 14);
         assert_eq!(txn.num_candidate_states(), 3);
     }
 
@@ -959,7 +859,7 @@ mod tests {
             QueryTokens::Decode {
                 epoch: 1,
                 token_index: 10,
-                tokens: tokens(&[100, 101]),
+                tokens: tokens(&[100]),
                 spec_tokens: tokens(&[200, 201]),
             },
             4,
@@ -971,8 +871,8 @@ mod tests {
 
         assert_eq!(dspark.gdn_state_txns()[0].num_candidate_states(), 3);
         assert_eq!(mtp.gdn_state_txns()[0].num_candidate_states(), 3);
-        assert_eq!(dspark.gdn_state_txns()[0].candidate_state_versions(), 11..14);
-        assert_eq!(mtp.gdn_state_txns()[0].candidate_state_versions(), 11..14);
+        assert_eq!(dspark.gdn_state_txns()[0].dst_state_versions(), 11..14);
+        assert_eq!(mtp.gdn_state_txns()[0].dst_state_versions(), 11..14);
     }
 
     #[test]
@@ -992,22 +892,20 @@ mod tests {
         let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
         let txn = batch.gdn_state_txns()[0];
 
-        assert_eq!(txn.dst_start_state_version(), 11);
+        assert_eq!(txn.dst_start_state_version(), 14);
         assert_eq!(txn.dst_end_state_version(), 15);
-        assert_eq!(txn.candidate_start_state_version(), 14);
-        assert_eq!(txn.candidate_end_state_version(), 15);
         assert_eq!(verified_state_versions(&batch), vec![14]);
     }
 
     #[test]
-    fn test_mtp_zero_spec_decode_selects_state_before_uncommitted_lookahead() {
+    fn test_mtp_zero_spec_decode_commits_its_full_input() {
         let requests = vec![device_request(
             10,
             0,
             QueryTokens::Decode {
                 epoch: 1,
                 token_index: 10,
-                tokens: tokens(&[100, 101, 102, 103]),
+                tokens: tokens(&[100]),
                 spec_tokens: Vec::new(),
             },
             4,
@@ -1022,12 +920,10 @@ mod tests {
         let txn = batch.gdn_state_txns()[0];
 
         assert_eq!(txn.dst_start_state_version(), 11);
-        assert_eq!(txn.dst_end_state_version(), 15);
-        assert_eq!(txn.candidate_start_state_version(), 13);
-        assert_eq!(txn.candidate_end_state_version(), 14);
+        assert_eq!(txn.dst_end_state_version(), 12);
         assert_eq!(
             verified_state_versions_for_decisions(&batch, std::slice::from_ref(&decision)),
-            vec![14]
+            vec![11]
         );
     }
 
