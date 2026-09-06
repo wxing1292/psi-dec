@@ -7,11 +7,11 @@ PORT=50061
 BUILD=1
 REFERENCE=1
 SHOW_RUNS=0
-# One fixed GSM8K prompt and the original Beijing prompt.
+# One fixed GSM8K prompt and one chat prompt.
 PROMPT_SET="representative2"
 PROMPT_IDS=(
     "gsm8k_typing_average"
-    "beijing_travel"
+    "chat"
 )
 PROMPTS=(
     "Jared is trying to increase his typing speed. He starts with 47 words per minute (WPM). After some lessons the next time he tests his typing speed it has increased to 52 WPM. If he continues to increase his typing speed once more by 5 words, what will be the average of the three measurements?
@@ -48,13 +48,15 @@ MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
 CACHE_BLOCK_TOKENS=2048
 # User-supplied compact results received on REFERENCE_DATE.
-# The user identified this workspace tip and confirmed performance-neutral dirty changes.
+# The user identified main tip. The commit below is HEAD at receipt, before history cleanup.
+# This reference precedes the TiledQ pipeline-capacity fix. Dirty state was not supplied.
 # Config checks below use the producing script's defaults, not recovered raw CONFIG rows.
 # Run count, variance, TTFT, and exact token hashes were not supplied.
 REFERENCE_MACHINE="apple_m3_max_40_gpu_cores"
-REFERENCE_DATE="2026-09-05"
-REFERENCE_COMMIT="14e8e714"
-REFERENCE_DIRTY=1
+REFERENCE_DATE="2026-09-19"
+REFERENCE_COMMIT="d6dc5da7e6a4cbfea6a2b9654f577a22aa23415e"
+REFERENCE_SOURCE_TREE="38f972e038150ee351c16dba6ae33bde7242670f"
+REFERENCE_DIRTY="unknown"
 REFERENCE_OS_VERSION="27.0"
 REFERENCE_ARCH="arm64"
 REFERENCE_NUM_CACHE_PAGES=393216
@@ -69,9 +71,9 @@ REFERENCE_TEMPERATURE=0.7
 REFERENCE_TOP_K=20
 REFERENCE_TOP_P=0.8
 REFERENCE_RUNS="unknown"
-REFERENCE_CASES="27b_off,35b_off,27b_mtp1,27b_dspark_k7,27b_dflash2_k7,27b_mtp2,27b_mtp3,35b_mtp1,35b_mtp2,35b_mtp3"
+REFERENCE_CASES="27b_off,27b_mtp1,27b_mtp2,27b_mtp3,27b_mtp4,27b_dspark_k7,27b_dflash2_k7,35b_off,35b_mtp1,35b_mtp2,35b_mtp3,35b_mtp4"
 REFERENCE_PROMPT_SET="representative2"
-REFERENCE_PROMPT_SET_SHA256="1e842b94e2f61518333df4682093921e5be3b2a8909a45157e7f7fc1fd27cffc"
+REFERENCE_PROMPT_SET_SHA256="1821fb9bef6c6a310635c0eb99e8bd0dc305db33fcaedb8ca707b225b6e9b254"
 REFERENCE_MODEL_27B_DIR_NAME="Qwen3.8-27B-4bit"
 REFERENCE_MTP_27B_DIR_NAME="Qwen3.8-27B-MTP-4bit"
 REFERENCE_DSPARK_27B_DIR_NAME="Qwen3.8-27B-DSpark-affine"
@@ -493,7 +495,7 @@ require_nonnegative_integer "--case-cooldown-secs" "$CASE_COOLDOWN_SECS"
 require_nonnegative_integer "--seed" "$SEED"
 require_positive_integer "--top-k" "$TOP_K"
 
-if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'; then
+if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'
 import math
 import os
 
@@ -511,6 +513,7 @@ if temperature < 0:
 if not 0 <= top_p <= 1:
     raise SystemExit("--top-p must be in [0, 1]")
 PY
+then
     exit 2
 fi
 
@@ -574,7 +577,6 @@ append_case() {
     fi
     selected_cases+=("$candidate")
 }
-
 
 for case_name in "${requested_cases[@]}"; do
     case "$case_name" in
@@ -1026,34 +1028,54 @@ reference_row() {
     # Reported fields only: decode tokens/s, tokens/chunk, output, proposed, verified.
     # K7 labels preserve the checkpoint-default geometry of the measured runs.
     case "$1:$2:$3:$4" in
-    apple_m3_max_40_gpu_cores:27b_off:256:gsm8k_typing_average) echo "22.913|1.000|256|0|0" ;;
-    apple_m3_max_40_gpu_cores:27b_off:256:beijing_travel) echo "23.001|1.000|256|0|0" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp1:256:gsm8k_typing_average) echo "39.151|1.869|256|135|119" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp1:256:beijing_travel) echo "35.744|1.695|256|149|105" ;;
-    apple_m3_max_40_gpu_cores:27b_dspark_k7:256:gsm8k_typing_average) echo "44.925|4.571|256|379|200" ;;
-    apple_m3_max_40_gpu_cores:27b_dspark_k7:256:beijing_travel) echo "15.344|1.580|256|1107|94" ;;
-    apple_m3_max_40_gpu_cores:27b_dflash2_k7:256:gsm8k_typing_average) echo "57.306|5.818|256|299|212" ;;
-    apple_m3_max_40_gpu_cores:27b_dflash2_k7:256:beijing_travel) echo "17.141|1.766|256|1003|111" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp2:256:gsm8k_typing_average) echo "44.254|2.862|249|172|162" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp2:256:beijing_travel) echo "30.033|1.939|256|259|124" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp3:256:gsm8k_typing_average) echo "38.054|3.122|256|241|174" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp3:256:beijing_travel) echo "24.409|2.000|256|376|128" ;;
-    apple_m3_max_40_gpu_cores:35b_off:256:gsm8k_typing_average) echo "96.562|1.000|256|0|0" ;;
-    apple_m3_max_40_gpu_cores:35b_off:1024:gsm8k_typing_average) echo "95.017|1.000|1008|0|0" ;;
-    apple_m3_max_40_gpu_cores:35b_off:256:beijing_travel) echo "98.266|1.000|256|0|0" ;;
-    apple_m3_max_40_gpu_cores:35b_off:1024:beijing_travel) echo "95.631|1.000|1024|0|0" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:256:gsm8k_typing_average) echo "155.979|1.969|256|129|126" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:1024:gsm8k_typing_average) echo "148.016|1.975|956|482|472" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:256:beijing_travel) echo "150.415|1.882|256|134|120" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:1024:beijing_travel) echo "134.742|1.787|1024|571|451" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp2:256:gsm8k_typing_average) echo "163.432|2.723|256|185|162" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp2:1024:gsm8k_typing_average) echo "153.434|2.717|1019|746|644" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp2:256:beijing_travel) echo "150.586|2.485|256|202|153" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp2:1024:beijing_travel) echo "121.864|2.129|1024|959|543" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp3:256:gsm8k_typing_average) echo "168.006|3.413|256|217|181" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp3:1024:gsm8k_typing_average) echo "162.542|3.472|979|843|697" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp3:256:beijing_travel) echo "151.022|3.048|256|244|172" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp3:1024:beijing_travel) echo "119.637|2.522|1024|1215|618" ;;
+    apple_m3_max_40_gpu_cores:27b_off:256:gsm8k_typing_average) echo "22.770|1.000|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_off:1024:gsm8k_typing_average) echo "22.761|1.000|260|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_off:256:chat) echo "22.832|1.000|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_off:1024:chat) echo "22.554|1.000|1024|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:256:gsm8k_typing_average) echo "39.398|1.869|256|136|119" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:1024:gsm8k_typing_average) echo "39.110|1.881|299|157|140" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:256:chat) echo "35.024|1.673|256|151|103" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:1024:chat) echo "33.988|1.665|1024|614|409" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:256:gsm8k_typing_average) echo "41.780|2.747|239|172|152" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:1024:gsm8k_typing_average) echo "39.618|2.747|239|172|152" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:256:chat) echo "29.436|1.984|256|254|127" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:1024:chat) echo "30.503|2.147|1024|950|547" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp3:256:gsm8k_typing_average) echo "38.978|3.241|256|229|177" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp3:1024:gsm8k_typing_average) echo "38.399|3.284|266|239|185" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp3:256:chat) echo "24.053|2.032|256|375|130" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp3:1024:chat) echo "22.353|2.111|1024|1447|539" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp4:256:gsm8k_typing_average) echo "36.724|3.821|256|263|189" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp4:1024:gsm8k_typing_average) echo "36.361|3.843|269|273|199" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp4:256:chat) echo "19.214|2.000|256|503|128" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp4:1024:chat) echo "18.693|2.197|1024|1853|558" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark_k7:256:gsm8k_typing_average) echo "40.670|4.197|256|413|195" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark_k7:1024:gsm8k_typing_average) echo "43.603|4.537|304|458|237" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark_k7:256:chat) echo "16.363|1.707|256|1020|106" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark_k7:1024:chat) echo "15.790|1.721|1024|4145|429" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2_k7:256:gsm8k_typing_average) echo "44.196|4.571|256|385|200" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2_k7:1024:gsm8k_typing_average) echo "47.769|4.963|397|548|317" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2_k7:256:chat) echo "18.280|1.896|256|919|121" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2_k7:1024:chat) echo "21.303|2.246|1024|3178|568" ;;
+    apple_m3_max_40_gpu_cores:35b_off:256:gsm8k_typing_average) echo "94.962|1.000|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:1024:gsm8k_typing_average) echo "93.701|1.000|1024|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:256:chat) echo "96.103|1.000|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:1024:chat) echo "93.952|1.000|1024|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:256:gsm8k_typing_average) echo "155.132|1.925|256|131|123" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:1024:gsm8k_typing_average) echo "148.439|1.956|1021|521|499" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:256:chat) echo "153.694|1.896|256|134|121" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:1024:chat) echo "135.227|1.756|1024|581|441" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:256:gsm8k_typing_average) echo "168.074|2.753|256|183|163" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:1024:gsm8k_typing_average) echo "154.959|2.688|1024|758|643" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:256:chat) echo "156.309|2.535|256|199|155" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:1024:chat) echo "128.282|2.193|1024|932|557" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp3:256:gsm8k_typing_average) echo "175.555|3.507|256|213|183" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp3:1024:gsm8k_typing_average) echo "163.067|3.402|1024|898|723" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp3:256:chat) echo "151.519|3.012|256|251|171" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp3:1024:chat) echo "117.661|2.421|1024|1266|601" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp4:256:gsm8k_typing_average) echo "153.677|3.710|256|269|187" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp4:1024:gsm8k_typing_average) echo "148.795|3.724|1024|1094|749" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp4:256:chat) echo "139.548|3.325|256|300|179" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp4:1024:chat) echo "105.720|2.592|1024|1573|629" ;;
     *) return 1 ;;
     esac
 }
@@ -1144,7 +1166,6 @@ with open(os.environ["REPORT_FILE"], encoding="utf-8") as report:
         acceptance = "-" if proposed == "0" else f"{verified}/{proposed}"
         prompt = {
             "gsm8k_typing_average": "gsm8k",
-            "beijing_travel": "beijing",
         }.get(fields["prompt"], fields["prompt"])
         rows.append(
             [
@@ -1249,7 +1270,7 @@ run_decode() {
         return 1
     fi
     if ! CLIENT_OUTPUT="$out" JSON_LINE="$json" SERVER_LOG="$server_log" SERVER_LOG_OFFSET="$server_log_offset" \
-        python3 - <<'PY'; then
+        python3 - <<'PY'
 import hashlib
 import json
 import os
@@ -1320,6 +1341,7 @@ print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f},{},{},{},
     output_sha256,
 ))
 PY
+    then
         echo "DECODE_STATS_INVALID label=$label max_new=$tokens prompt=$prompt_id run=$run client_output=$out server_log=$server_log" >&2
         tail -n 80 "$out" >&2 || true
         tail -n 120 "$server_log" >&2 || true
@@ -1443,32 +1465,33 @@ run_server_case() {
             fi
 
             local summary
-            summary="$(VALS="$vals" \
-                INPUTS="$inputs" \
-                CHUNKS="$chunks" \
-                SAMPLES="$samples" \
-                TTFTS="$ttfts" \
-                PROMPT_RATES="$prompt_rates" \
-                INTER_CHUNK_P50S="$inter_chunk_p50s" \
-                INTER_CHUNK_P95S="$inter_chunk_p95s" \
-                PROPOSED_SPECS="$proposed_specs" \
-                VERIFIED_SPECS="$verified_specs" \
-                ACCEPTANCE_RATES="$acceptance_rates" \
-                TOKENS_PER_CHUNKS="$tokens_per_chunks" \
-                SPEC_BY_INDEX="$spec_by_index" \
-                VERIFIED_BY_INDEX="$verified_by_index" \
-                LABEL="$label" \
-                TOKENS="$tokens" \
-                PROMPT_ID="$prompt_id" \
-                OUTPUT_SHA256="$expected_output_sha256" \
-                REFERENCE_DECODE="$reference_decode" \
-                REFERENCE_TOKENS_PER_CHUNK="$reference_tokens_per_chunk" \
-                REFERENCE_SAMPLED="$reference_sampled" \
-                REFERENCE_PROPOSED_SPEC="$reference_proposed_spec" \
-                REFERENCE_VERIFIED_SPEC="$reference_verified_spec" \
-                REFERENCE_STATUS="$reference_status" \
-                REFERENCE_MISMATCH="$reference_mismatch" \
-                python3 - <<'PY'
+            summary="$(
+                VALS="$vals" \
+                    INPUTS="$inputs" \
+                    CHUNKS="$chunks" \
+                    SAMPLES="$samples" \
+                    TTFTS="$ttfts" \
+                    PROMPT_RATES="$prompt_rates" \
+                    INTER_CHUNK_P50S="$inter_chunk_p50s" \
+                    INTER_CHUNK_P95S="$inter_chunk_p95s" \
+                    PROPOSED_SPECS="$proposed_specs" \
+                    VERIFIED_SPECS="$verified_specs" \
+                    ACCEPTANCE_RATES="$acceptance_rates" \
+                    TOKENS_PER_CHUNKS="$tokens_per_chunks" \
+                    SPEC_BY_INDEX="$spec_by_index" \
+                    VERIFIED_BY_INDEX="$verified_by_index" \
+                    LABEL="$label" \
+                    TOKENS="$tokens" \
+                    PROMPT_ID="$prompt_id" \
+                    OUTPUT_SHA256="$expected_output_sha256" \
+                    REFERENCE_DECODE="$reference_decode" \
+                    REFERENCE_TOKENS_PER_CHUNK="$reference_tokens_per_chunk" \
+                    REFERENCE_SAMPLED="$reference_sampled" \
+                    REFERENCE_PROPOSED_SPEC="$reference_proposed_spec" \
+                    REFERENCE_VERIFIED_SPEC="$reference_verified_spec" \
+                    REFERENCE_STATUS="$reference_status" \
+                    REFERENCE_MISMATCH="$reference_mismatch" \
+                    python3 - <<'PY'
 import os
 import statistics
 
@@ -1617,7 +1640,8 @@ run_block_spec_case() {
     local tokenizer="${TOKENIZER:-$model_dir}"
 
     if [[ -z "$num_spec_tokens" ]]; then
-        num_spec_tokens="$(python3 - "$spec_mode" "$spec_model_dir/config.json" <<'PY'
+        num_spec_tokens="$(
+            python3 - "$spec_mode" "$spec_model_dir/config.json" <<'PY'
 import json
 import sys
 
@@ -1708,7 +1732,7 @@ REFERENCE_CONFIG_MISMATCHES="$(
 )"
 REPORT_FILE="$(mktemp "${TMPDIR:-/tmp}/psi_dec_qwen35_perf.XXXXXX")"
 if ((SHOW_RUNS)); then
-    echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_tokens=${BLOCK_SPEC_TOKENS:-checkpoint-or-case} cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_scope=user-table reference_config_source=script-defaults reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
+    echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_tokens=${BLOCK_SPEC_TOKENS:-checkpoint-or-case} cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_source_tree=$REFERENCE_SOURCE_TREE reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_scope=user-table reference_config_source=script-defaults reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
 fi
 print_config_table
 for case_index in "${!selected_cases[@]}"; do
