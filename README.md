@@ -156,52 +156,24 @@ The [service guide](docs/service.md) also covers Main-only startup, Qwen3-ASR, g
 
 ## Reference performance
 
-The following results are observed medians from the checked-in Qwen decode reference.
-They are not performance thresholds.
-The run used clean commit `43d55f4e5df2edf9b29d1bba15dca31007f76c72` on an Apple M3 Max with 40 GPU
-cores, macOS 27.0, and arm64.
-It used three runs, an 8-second case cooldown, seed 42, temperature 0.7, top-k 20, top-p 0.8, and thinking mode.
-The tables select the `max_new=384` results for Qwen3.8-27B.
+Decode throughput in tokens/s at an output limit of 1024 tokens, from the reference supplied on 2026-09-05.
+The reference profile is Apple M3 Max (40 GPU cores), macOS 27.0, arm64.
+`27B` is Qwen3.8-27B. `35B` is Qwen3.6-35B-A3B.
 
-GSM8K typing-average prompt:
+| Mode      | 27B GSM8K | 27B Chat | 35B GSM8K | 35B Chat |
+| --------- | --------: | -------: | --------: | -------: |
+| Vanilla   |    22.945 |   22.843 |    95.438 |   95.845 |
+| MTP=1     |    39.712 |   35.782 |   148.661 |  135.356 |
+| MTP=2     |    44.159 |   30.340 |   154.331 |  122.635 |
+| MTP=3     |    38.845 |   24.564 |   162.583 |  119.719 |
+| MTP=4     |    34.226 |   21.043 |   149.558 |  105.510 |
+| DSpark=7  |    47.824 |   17.848 |         — |        — |
+| DFlash2=7 |    58.082 |   19.250 |         — |        — |
 
-| Mode             | Output | Decode tok/s | vs Vanilla | Tokens/chunk | Spec acceptance |
-| ---------------- | -----: | -----------: | ---------: | -----------: | --------------: |
-| Vanilla          |    290 |       22.804 |     1.000x |        1.000 |               — |
-| MTP, 1 proposal  |    302 |       38.180 |     1.674x |        1.899 | 143/158 (90.5%) |
-| MTP, 2 proposals |    293 |       33.912 |     1.487x |        2.688 | 184/216 (85.2%) |
-| DSpark           |    331 |       44.508 |     1.952x |        4.597 | 261/497 (52.5%) |
-| DFlash2          |    350 |       56.047 |     2.458x |        5.738 | 290/420 (69.0%) |
-
-Chat prompt:
-
-| Mode             | Output | Decode tok/s | vs Vanilla | Tokens/chunk |  Spec acceptance |
-| ---------------- | -----: | -----------: | ---------: | -----------: | ---------------: |
-| Vanilla          |    384 |       22.800 |     1.000x |        1.000 |                — |
-| MTP, 1 proposal  |    384 |       33.332 |     1.462x |        1.634 |  149/234 (63.7%) |
-| MTP, 2 proposals |    384 |       24.641 |     1.081x |        1.959 |  190/390 (48.7%) |
-| DSpark           |    384 |       15.942 |     0.699x |        1.655 |  153/1617 (9.5%) |
-| DFlash2          |    384 |       18.364 |     0.805x |        1.892 | 181/1414 (12.8%) |
-
-`vs Vanilla` is the decode-throughput ratio for the same prompt.
-It is not a pure executor speedup when the output lengths differ.
-`Tokens/chunk` includes the target token.
-`Spec acceptance` is verified proposal tokens divided by proposed tokens.
-It is not the published average-acceptance-length metric.
-The prompt-dependent difference between the two tables is part of the result.
-
-Reproduce this 27B subset with:
-
-```sh
-./scripts/qwen35_e2e_decode_perf.sh \
-  --cases 27b_off,27b_mtp1,27b_mtp2,27b_dspark,27b_dflash2 \
-  --runs 3
-```
-
-The DFlash2 reference row used the F32 affine-parameter checkpoint format from that commit.
-The current converter stores DFlash2 affine parameters as BF16.
-Treat the row as historical workload evidence until a matched current-format run replaces it.
-See [Executor Tests, Benchmarks, and Profiling](docs/executor_benchmarks.md) for metric and provenance requirements.
+Output lengths and acceptance trajectories vary by case. These results are not performance thresholds.
+The producing commit, dirty state, run count, and variance were not supplied. A dash means no reference result.
+See the [perf script](scripts/qwen35_e2e_decode_perf.sh) for all 48 rows, output counts, and acceptance metrics.
+See the [performance helper guide](docs/service.md#end-to-end-performance-helper) for commands, configuration, and comparison limits.
 
 ## Workspace map
 

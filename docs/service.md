@@ -1147,7 +1147,7 @@ The 27B cases use output limits 256 and 1024. The 35B cases use output limits 25
 
 The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
 Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
-The default `representative2` workload contains one fixed GSM8K prompt and the original Beijing travel prompt.
+The default `representative2` workload contains one fixed GSM8K prompt and the Chinese travel prompt (`chat`).
 The helper repeats and summarizes each prompt independently. The default output contains a configuration table,
 measurement progress, and a compact result table. The result table contains case, prompt, output limit, sampled tokens,
 decode throughput, tokens per chunk, and verified/proposed speculative tokens. Use `--show-runs` to also print
@@ -1180,16 +1180,17 @@ Both helpers record these facts:
 Both helpers also record cooldown and speculative-acceptance fields.
 
 The Qwen3.5/3.6/3.8 helper contains the user-supplied result table received on 2026-09-05.
-Its reference tip is `14e8e714`, with `dirty=1`. The user confirmed that the uncommitted changes were performance-neutral.
+The producing commit and dirty state are unknown. The helper retains the existing machine and configuration profile.
 The table provides throughput, output counts, tokens per chunk, and accepted/proposed counts.
 It does not provide raw CONFIG/SUMMARY rows, run count, variance, output hashes, TTFT, or inter-chunk latency.
 The script does not invent these fields. Its configuration checks use the producing script's defaults.
-The obsolete 27B 384-token rows are removed. New 27B 1024-token cases and unmeasured K values have no reference row.
+The reference contains 48 rows at output limits of 256 and 1024 tokens.
+It covers Main-only and MTP1 through MTP4 for both models, plus 27B DSpark K7 and DFlash2 K7.
 
 A matching configuration and matching reported work counts produce `reference_status=summary-only`.
 The `observed_decode_delta_pct` field is a descriptive ratio, not a controlled performance verdict.
 A mismatch or missing row suppresses the delta. The reference is not a pass/fail threshold.
-Clean and dirty states remain visible as provenance. Their difference alone does not suppress this user-approved comparison.
+The reference records unknown provenance explicitly. The summary-only comparison does not establish a controlled performance verdict.
 Use `--show-runs` for per-row deltas and mismatches. Use `--no-reference` to disable the comparison.
 Run `python3 scripts/qwen35_e2e_decode_perf_test.py` for CPU-only script contract tests.
 
