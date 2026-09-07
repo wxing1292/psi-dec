@@ -454,27 +454,44 @@ where
                 }
             }
             let spec_replay_start = Instant::now();
-            {
+            let submission = {
                 let _span = profiling::span("model.submit_spec.wait");
                 let submission = self.model.submit_spec(&recorder);
                 submission.wait();
-            }
+                submission
+            };
             let spec_replay_elapsed = spec_replay_start.elapsed();
+            let spec_gpu_timestamp_durations = submission.gpu_timestamp_durations();
+            drop(submission);
             if run_spec || run_spec_decode {
                 let _span = profiling::span("model.read_spec");
-                sampled_output = self
-                    .model
-                    .read_spec(&recorder, &model_batch_req, sampled_output, spec_replay_elapsed);
+                sampled_output = self.model.read_spec(
+                    &recorder,
+                    &model_batch_req,
+                    sampled_output,
+                    spec_replay_elapsed,
+                    spec_gpu_timestamp_durations.as_deref(),
+                );
             }
             spec_elapsed = spec_start.elapsed();
         }
         drop(recorder);
         let model_output_timing = self.model.sampled_output_timing(&sampled_output).unwrap_or_default();
 
-        let batch_resp = {
+        let mut batch_resp = {
             let _span = profiling::span("commit_batch");
             self.model.commit_batch(batch_req, sampled_output)
         };
+        let mode = self.model.model_mode();
+        let main_gpu = model_output_timing
+            .main_gpu_elapsed
+            .map(|main| main + model_output_timing.rejection_gpu_elapsed.unwrap_or_default());
+        batch_resp.execution_timings = vec![("main".into(), main_gpu)];
+        if mode != "vanilla" {
+            batch_resp
+                .execution_timings
+                .push((mode.into(), model_output_timing.spec_gpu_elapsed()));
+        }
         let response_summary = summarize_batch_device_response(&batch_resp);
         drop(_executor_batch_span);
 
@@ -858,6 +875,10 @@ mod tests {
         fn wait(&self) {
             self.events.borrow_mut().push(self.wait_event);
         }
+
+        fn gpu_timestamp_durations(&self) -> Option<Vec<Duration>> {
+            Some(vec![Duration::from_micros(123)])
+        }
     }
 
     struct SpecLifecycleModel {
@@ -1079,7 +1100,9 @@ mod tests {
             _model_batch_req: &Self::ModelBatchRequest,
             sampled_output: Self::SampledOutput,
             _replay_elapsed: Duration,
+            gpu_timestamp_durations: Option<&[Duration]>,
         ) -> Self::SampledOutput {
+            assert_eq!(gpu_timestamp_durations, Some([Duration::from_micros(123)].as_slice()));
             self.push(SpecLifecycleEvent::ReadSpec);
             sampled_output
         }
@@ -1088,6 +1111,18 @@ mod tests {
 
         fn sampled_output_len(&self, _sampled_output: &Self::SampledOutput) -> usize {
             0
+        }
+
+        fn sampled_output_timing(
+            &self,
+            _sampled_output: &Self::SampledOutput,
+        ) -> Option<inference_executor_core::model::ModelOutputTiming> {
+            Some(inference_executor_core::model::ModelOutputTiming {
+                main_gpu_elapsed: Some(Duration::from_micros(2)),
+                rejection_gpu_elapsed: Some(Duration::from_micros(3)),
+                spec_replay_gpu_elapsed: Some(Duration::from_micros(7)),
+                ..Default::default()
+            })
         }
     }
 
@@ -1337,7 +1372,7 @@ mod tests {
             ),
             std::env::temp_dir().join("psi-dec-spec-lifecycle-test.state"),
         );
-        executor.execute(BatchDeviceRequest::new(
+        let response = executor.execute(BatchDeviceRequest::new(
             1,
             [DeviceRequest::new(
                 1,
@@ -1354,6 +1389,13 @@ mod tests {
                 Default::default(),
             )],
         ));
+        assert_eq!(
+            response.execution_timings,
+            vec![
+                ("main".into(), Some(Duration::from_micros(5))),
+                ("test".into(), Some(Duration::from_micros(7)))
+            ]
+        );
         let recorded = events.borrow().clone();
         drop(executor);
         recorded

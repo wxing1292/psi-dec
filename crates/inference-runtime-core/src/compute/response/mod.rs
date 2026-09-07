@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::compute::QueryTokens;
 use crate::compute::SampledTokens;
 use crate::runtime::RawComputeSlotSeq;
@@ -17,6 +19,11 @@ where
 
     fn spec_stats(&self, num_spec_tokens: usize) -> SpecStats {
         SpecStats::new(num_spec_tokens)
+    }
+
+    /// Executor-owned stage labels and GPU durations. `None` means timing is unavailable.
+    fn execution_timings(&self) -> &[(String, Option<Duration>)] {
+        &[]
     }
 
     fn from_parts(seq: RawComputeSlotSeq, dev_resps: Vec<DeviceResp>) -> Self;
@@ -97,6 +104,7 @@ impl DevResp for DeviceResponse {
 pub struct BatchDeviceResponse {
     pub seq: RawComputeSlotSeq,
     pub dev_resps: Vec<DeviceResponse>,
+    pub execution_timings: Vec<(String, Option<Duration>)>,
 }
 
 impl BatchDeviceResponse {
@@ -107,6 +115,7 @@ impl BatchDeviceResponse {
         Self {
             seq,
             dev_resps: dev_resps.into_iter().collect(),
+            execution_timings: Vec::new(),
         }
     }
 }
@@ -129,8 +138,12 @@ impl BatchDevResp<DeviceResponse> for BatchDeviceResponse {
         stats
     }
 
+    fn execution_timings(&self) -> &[(String, Option<Duration>)] {
+        &self.execution_timings
+    }
+
     fn from_parts(seq: RawComputeSlotSeq, dev_resps: Vec<DeviceResponse>) -> Self {
-        Self { seq, dev_resps }
+        Self::new(seq, dev_resps)
     }
 
     fn into_inner(self) -> (RawComputeSlotSeq, Vec<DeviceResponse>) {

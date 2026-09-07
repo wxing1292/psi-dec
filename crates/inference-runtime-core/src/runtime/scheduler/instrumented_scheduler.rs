@@ -1,4 +1,5 @@
 use std::cmp::max;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use ahash::AHashMap;
@@ -48,9 +49,10 @@ impl<Sch> InstrumentedScheduler<Sch> {
             target: "inference-runtime-core::scheduler",
             phase = "scheduler.stats.periodical",
             scheduler_stats = %format_args!(
-                "\nScheduler APIs\n{}\n\nSpec Acceptance\n{}",
+                "\nScheduler APIs\n{}\n\nSpec Acceptance\n{}\n\nGPU Execution Latency\n{}",
                 self.periodical.api.table(),
-                self.periodical.spec.table()
+                self.periodical.spec.table(),
+                self.periodical.execution_table()
             ),
             "scheduler periodical stats"
         );
@@ -62,9 +64,10 @@ impl<Sch> InstrumentedScheduler<Sch> {
             target: "inference-runtime-core::scheduler",
             phase = "scheduler.stats.lifetime",
             scheduler_stats = %format_args!(
-                "\nScheduler APIs\n{}\n\nSpec Acceptance\n{}",
+                "\nScheduler APIs\n{}\n\nSpec Acceptance\n{}\n\nGPU Execution Latency\n{}",
                 self.lifetime.api.table(),
-                self.lifetime.spec.table()
+                self.lifetime.spec.table(),
+                self.lifetime.execution_table()
             ),
             "scheduler lifetime stats"
         );
@@ -183,6 +186,7 @@ impl SpecStats {
 struct SchedulerStats {
     api: SchedulerAPIStats,
     spec: SpecStats,
+    execution: BTreeMap<String, Histogram<u64>>,
 }
 
 impl SchedulerStats {
@@ -190,16 +194,32 @@ impl SchedulerStats {
         Self {
             api: SchedulerAPIStats::new(),
             spec: SpecStats::new(num_spec_tokens),
+            execution: BTreeMap::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.api.is_empty() && self.spec.is_empty()
+        self.api.is_empty() && self.spec.is_empty() && self.execution.values().all(Histogram::is_empty)
     }
 
     fn reset(&mut self) {
         self.api.reset();
         self.spec.reset();
+        self.execution.clear();
+    }
+
+    fn execution_table(&self) -> Table {
+        let mut table = Table::new();
+        table.load_style(UTF8_FULL.with_rounded_corners());
+        let mut header = vec![Cell::new("GPU stage"), Cell::new("count")];
+        header.extend(COLUMNS.iter().map(|(name, _)| Cell::new(*name)));
+        table.set_header(header);
+        for (stage, histogram) in &self.execution {
+            let mut row = vec![Cell::new(stage), Cell::new(histogram.len())];
+            row.extend(COLUMNS.iter().map(|(_, col)| Cell::new(cell(histogram, *col))));
+            table.add_row(row);
+        }
+        table
     }
 }
 
@@ -267,6 +287,18 @@ where
         let batch_execution = max(1, batch_execution.as_micros() as u64);
         let _ = self.periodical.api.hist_batch_execution.record(batch_execution);
         let _ = self.lifetime.api.hist_batch_execution.record(batch_execution);
+
+        for (stage, elapsed) in batch_dev_resp.execution_timings() {
+            for stats in [&mut self.periodical, &mut self.lifetime] {
+                let histogram = stats
+                    .execution
+                    .entry(stage.clone())
+                    .or_insert_with(|| Histogram::new(4).unwrap());
+                if let Some(elapsed) = elapsed {
+                    let _ = histogram.record(elapsed.as_micros() as u64);
+                }
+            }
+        }
 
         let num_spec_tokens = self.lifetime.spec.len();
         if num_spec_tokens != 0 {
@@ -383,6 +415,20 @@ mod tests {
         assert_eq!(scheduler.periodical.api.hist_batch_execution.len(), 1);
         assert_eq!(scheduler.lifetime.api.hist_batch_execution.len(), 1);
         assert!(scheduler.batch_execution_starts.is_empty());
+        for stats in [&scheduler.periodical, &scheduler.lifetime] {
+            assert_eq!(stats.execution["main"].len(), 1);
+            assert_eq!(stats.execution["main"].min(), 1250);
+            assert_eq!(stats.execution["dspark"].len(), 1);
+            assert_eq!(stats.execution["dspark"].min(), 0);
+            assert!(stats.execution["mtp"].is_empty());
+            let table = stats.execution_table().to_string();
+            assert!(table.contains("1.250ms"));
+            assert!(table.contains("0us"));
+        }
+        scheduler.print_periodical();
+        assert!(scheduler.periodical.is_empty());
+        assert!(scheduler.periodical.execution.is_empty());
+        assert_eq!(scheduler.lifetime.execution["main"].len(), 1);
     }
 
     #[test]
@@ -411,6 +457,11 @@ mod tests {
     fn batch_dev_resp(seq: u64) -> MockBatchDevResp<MockDevResp> {
         let mut batch_dev_resp = MockBatchDevResp::new();
         batch_dev_resp.expect_seq().return_const(seq);
+        batch_dev_resp.expect_execution_timings().return_const(vec![
+            ("main".into(), Some(std::time::Duration::from_micros(1250))),
+            ("dspark".into(), Some(std::time::Duration::ZERO)),
+            ("mtp".into(), None),
+        ]);
         batch_dev_resp
     }
 }

@@ -69,7 +69,7 @@ pub struct Qwen3Args {
 
     #[arg(
         long,
-        default_value = "294912",
+        default_value = "327680",
         help = "Total shared cache pages used by GQA KV cache and GDN state cache"
     )]
     pub num_cache_pages: NonZeroUsize,
@@ -182,7 +182,7 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        default_value = "294912",
+        default_value = "327680",
         help = "Total shared cache pages used by GQA KV cache and GDN state cache"
     )]
     pub num_cache_pages: NonZeroUsize,
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(args.max_requests.get(), 2);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages.get(), 288 * 1024);
+        assert_eq!(args.num_cache_pages.get(), 320 * 1024);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
         assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(args.max_requests.get(), 2);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages.get(), 288 * 1024);
+        assert_eq!(args.num_cache_pages.get(), 320 * 1024);
         assert_eq!(args.spec.hf_spec_model_dir, None);
         assert_eq!(args.spec.spec_type, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);

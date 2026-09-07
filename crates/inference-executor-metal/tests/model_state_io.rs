@@ -353,9 +353,17 @@ fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::execu
             let spec_output = model.unembed_spec(&mut recorder, &model_batch, &spec_hidden);
             model.sample_spec(&mut recorder, &model_batch, &spec_output);
         }
-        model.submit_spec(&recorder).wait();
+        let submission = model.submit_spec(&recorder);
+        submission.wait();
+        let gpu_timestamp_durations = submission.gpu_timestamp_durations();
         if run_spec || run_spec_decode {
-            sampled = model.read_spec(&recorder, &model_batch, sampled, Duration::ZERO);
+            sampled = model.read_spec(
+                &recorder,
+                &model_batch,
+                sampled,
+                Duration::ZERO,
+                gpu_timestamp_durations.as_deref(),
+            );
         }
     }
     drop(recorder);

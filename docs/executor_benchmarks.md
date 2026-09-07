@@ -396,11 +396,11 @@ The service uses static `profiling::span(...)` names for its coarse CPU tree. Pu
 structured logs.
 
 The `--profile component|operation` modes currently produce the same CPU tree.
-Set `PSI_DEC_METAL_GPU_TIMESTAMPS=relaxed` separately to report low-overhead Metal 4 GPU stage timestamps.
-Use `precise` only for an explicit diagnostic because it can change execution performance.
+`MetalRuntime` enables relaxed Metal 4 GPU stage timestamps by default.
+The backend Stream API supports precise timestamps for explicit diagnostics. Precise timestamps can change execution performance.
 Use service `executor_cpu_ms`, not `main_cpu_ms`, to compare a split Main-to-Spec lifecycle with an integrated
 lifecycle.
-[`service.md`](service.md) documents the GPU timing fields and control.
+[`service.md`](service.md) documents the GPU timing fields and defaults.
 
 ## Performance evidence
 
