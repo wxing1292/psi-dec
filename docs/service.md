@@ -961,10 +961,8 @@ old `main_cpu_ms` directly with integrated `main_cpu_ms` because the integrated 
 `spec_passes` counts Spec Decode forwards. The `*_cpu_ms` fields are CPU-observed wall latencies. They include GPU
 wait time and do not measure CPU active execution. The `*_gpu_ms` fields are GPU-observed Metal timestamp durations.
 
-Set `PSI_DEC_METAL_GPU_TIMESTAMPS=relaxed` to add Metal 4 GPU timestamp boundaries to Main submissions.
-The default is off. The off path does not allocate a counter heap or encode timestamp writes.
-Use `PSI_DEC_METAL_GPU_TIMESTAMPS=precise` only for an explicit diagnostic. Precise timestamps can split command
-encoders and change performance.
+`MetalRuntime` enables relaxed Metal 4 GPU timestamps for Main and MTP submissions by default.
+No environment variable is required. The runtime reuses its timestamp counter heap.
 
 The GPU timing fields have these meanings:
 
@@ -974,11 +972,13 @@ The GPU timing fields have these meanings:
 - `spec_prepare_gpu_ms` covers Spec Decode prepare.
 - `spec_prefill_gpu_ms` covers DSpark or DFlash2 Spec Prefill.
 - `spec_decode_gpu_ms` covers Spec Decode and proposal sampling.
-- `spec_gpu_ms` is `spec_prepare_gpu_ms + spec_prefill_gpu_ms + spec_decode_gpu_ms`.
+- `spec_gpu_ms` is `spec_prepare_gpu_ms + spec_prefill_gpu_ms + spec_decode_gpu_ms` for DSpark and DFlash2.
+  For MTP, it sums all logical MTP submission durations. It excludes host recording, readback, and gaps between submissions.
 
-The fixed-block Spec fields apply to the integrated DSpark and DFlash2 submission. They are `unavailable` for MTP.
+The Spec prepare, Prefill, and Decode fields apply to the integrated DSpark and DFlash2 submission.
+They are `unavailable` for MTP. The MTP total is `unavailable` if any logical submission lacks valid GPU timestamps.
 An absent stage in an enabled integrated submission reports `0.0000`. All GPU fields report `unavailable` when the
-instrumentation is off or when Metal does not return a valid ordered timestamp sequence. This fallback does not change
+Metal timestamps are unavailable or Metal does not return a valid ordered timestamp sequence. This fallback does not change
 submission completion or output readback.
 
 `--logging info` does not emit the executor batch performance event. `--logging debug` also emits request and response
@@ -1014,8 +1014,9 @@ It does not run DSpark Decode because no sampled anchor exists.
 The runtime emits non-empty periodical scheduler stats every 30 seconds. It resets these stats after each output.
 Runtime shutdown always emits separate lifetime scheduler stats. It does not reset the lifetime stats.
 
-Each scheduler stats output contains two tables. The scheduler API table contains enqueue and swap-in counts. It also
-contains prepare, cancel, and commit counts and latency percentiles. The Speculative acceptance table uses proposal
+Each scheduler stats output contains three tables. The scheduler API table contains enqueue and async-task counts.
+It also contains prepare, cancel, commit, and execution counts and latency percentiles.
+The Speculative acceptance table uses proposal
 indexes as columns:
 
 ```text
@@ -1033,6 +1034,22 @@ has rate `N/A`.
 This rate differs from the conditional `acceptance_rate_by_index` in the executor batch performance event. The
 scheduler denominator includes every produced proposal at the index. The executor event includes an index only when
 all earlier proposal tokens passed verification.
+
+The `GPU Execution Latency` table follows `Spec Acceptance`.
+It reports GPU stage labels, measured batch counts, latency percentiles, and average latency.
+It uses the same periodical and lifetime windows. It does not include CPU timings.
+Runtime core transports and aggregates executor-owned labels and durations.
+
+- `main` covers embed, all Main layers, gather/unembed, and sampling or rejection sampling.
+  It sums the existing `main_gpu_ms` and `rejection_gpu_ms` boundaries when rejection sampling runs.
+- `mtp` sums the GPU durations of all logical MTP submissions in the batch.
+  Each submission includes hidden-state transfer, embed, all module layers, gather/unembed, and sampling.
+- `dspark` or `dflash2` uses the existing `spec_gpu_ms` total for Spec prepare, Prefill, Decode, and proposal sampling.
+
+The runtime collects these durations by default.
+Unavailable GPU durations do not enter the histogram. A row with no measurements has count `0` and latency `-`.
+A measured zero GPU duration remains a sample.
+The scheduler emits this table at INFO even when executor batch DEBUG events are disabled.
 
 Long-running service and runtime components use these spans:
 

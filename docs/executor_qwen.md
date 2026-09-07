@@ -869,7 +869,7 @@ It does not read either result before the combined wait completes.
 `main_spec_replay_elapsed` reports the combined Main and Spec submission duration.
 It does not report Main-only duration.
 
-Optional Metal 4 GPU timestamps split this sequence at five low-cardinality stages:
+Relaxed Metal 4 GPU timestamps are enabled by default and split this sequence at five stages:
 
 ```text
 Main

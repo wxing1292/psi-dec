@@ -21,7 +21,7 @@ impl MetalRuntime {
 
     pub fn new(device: Device) -> Self {
         let buffer_io = BufferIO::new(&device);
-        let stream = Stream::new_with_gpu_timestamps(&device, GpuTimestampGranularity::from_environment());
+        let stream = Stream::new_with_gpu_timestamps(&device, Some(GpuTimestampGranularity::Relaxed));
         Self {
             device,
             buffer_io,

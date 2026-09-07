@@ -942,6 +942,7 @@ impl ReplayableDecoderModel for Qwen3Executor {
         _model_batch_req: &Self::ModelBatchRequest,
         _sampled_output: Self::SampledOutput,
         _replay_elapsed: Duration,
+        _gpu_timestamp_durations: Option<&[Duration]>,
     ) -> Self::SampledOutput {
         panic!("Qwen3 DSpark Spec results must be read with Main")
     }

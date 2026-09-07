@@ -64,12 +64,13 @@ See [Execution Resources](#execution-resources) for retention and residency, and
 
 ### GPU timestamps
 
-When `PSI_DEC_METAL_GPU_TIMESTAMPS` is `relaxed` or `precise`, the Stream also owns one reusable Metal 4 timestamp
-counter heap.
+`MetalRuntime` enables relaxed GPU timestamps by default.
+Its Stream owns one reusable Metal 4 timestamp counter heap.
 An instrumented replay sequence writes one initial timestamp and one timestamp after each caller-supplied stage end.
 `ReplaySubmission::wait()` first proves GPU completion.
 It then resolves the opaque heap on the CPU timeline and converts GPU ticks with `MTLDevice::queryTimestampFrequency()`.
-The unset or `off` configuration does not create the heap or encode timestamp commands.
+The low-level `Stream::new` constructor keeps timestamps disabled.
+`Stream::new_with_gpu_timestamps` supports explicit diagnostic settings.
 
 If the device cannot create the heap or Metal returns zero, unordered, or incomplete data, the submission returns no
 GPU intervals and preserves the normal completion path.

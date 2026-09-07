@@ -230,13 +230,19 @@ impl Fixture {
             spec_record = spec_record_start.elapsed();
 
             let spec_submit_start = Instant::now();
-            self.model.submit_spec(&recorder).wait();
+            let submission = self.model.submit_spec(&recorder);
+            submission.wait();
             spec_submit = spec_submit_start.elapsed();
+            let gpu_timestamp_durations = submission.gpu_timestamp_durations();
             if run_spec_decode {
                 let spec_read_start = Instant::now();
-                sampled_output = self
-                    .model
-                    .read_spec(&recorder, &model_batch_request, sampled_output, spec_submit);
+                sampled_output = self.model.read_spec(
+                    &recorder,
+                    &model_batch_request,
+                    sampled_output,
+                    spec_submit,
+                    gpu_timestamp_durations.as_deref(),
+                );
                 spec_read = spec_read_start.elapsed();
             }
         }

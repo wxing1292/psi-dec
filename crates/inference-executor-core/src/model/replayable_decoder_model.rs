@@ -217,6 +217,7 @@ pub trait ReplayableDecoderModel {
         _model_batch_req: &Self::ModelBatchRequest,
         sampled_output: Self::SampledOutput,
         _replay_elapsed: Duration,
+        _gpu_timestamp_durations: Option<&[Duration]>,
     ) -> Self::SampledOutput {
         sampled_output
     }
@@ -247,6 +248,8 @@ pub struct ModelOutputTiming {
     pub spec_replay_elapsed: Duration,
     pub spec_read_elapsed: Duration,
     pub spec_passes: usize,
+    /// Total GPU duration across separate Spec submissions.
+    pub spec_replay_gpu_elapsed: Option<Duration>,
     pub main_gpu_elapsed: Option<Duration>,
     pub rejection_gpu_elapsed: Option<Duration>,
     pub spec_prepare_gpu_elapsed: Option<Duration>,
@@ -266,6 +269,8 @@ impl ModelOutputTiming {
         self.spec_replay_elapsed += other.spec_replay_elapsed;
         self.spec_read_elapsed += other.spec_read_elapsed;
         self.spec_passes += other.spec_passes;
+        self.spec_replay_gpu_elapsed =
+            add_optional_duration(self.spec_replay_gpu_elapsed, other.spec_replay_gpu_elapsed);
         self.main_gpu_elapsed = add_optional_duration(self.main_gpu_elapsed, other.main_gpu_elapsed);
         self.rejection_gpu_elapsed = add_optional_duration(self.rejection_gpu_elapsed, other.rejection_gpu_elapsed);
         self.spec_prepare_gpu_elapsed =
@@ -281,7 +286,9 @@ impl ModelOutputTiming {
     }
 
     pub fn spec_gpu_elapsed(self) -> Option<Duration> {
-        Some(self.spec_prepare_gpu_elapsed? + self.spec_prefill_gpu_elapsed? + self.spec_decode_gpu_elapsed?)
+        self.spec_replay_gpu_elapsed.or_else(|| {
+            Some(self.spec_prepare_gpu_elapsed? + self.spec_prefill_gpu_elapsed? + self.spec_decode_gpu_elapsed?)
+        })
     }
 }
 
@@ -330,6 +337,19 @@ mod tests {
     use std::time::Duration;
 
     use super::ModelOutputTiming;
+
+    #[test]
+    fn test_spec_gpu_elapsed_separate_submissions() {
+        let mut timing = ModelOutputTiming::default();
+        timing.add_assign(ModelOutputTiming {
+            spec_replay_gpu_elapsed: Some(Duration::from_millis(7)),
+            ..ModelOutputTiming::default()
+        });
+        assert_eq!(timing.spec_gpu_elapsed(), Some(Duration::from_millis(7)));
+        assert_eq!(timing.spec_prepare_gpu_elapsed, None);
+        assert_eq!(timing.spec_prefill_gpu_elapsed, None);
+        assert_eq!(timing.spec_decode_gpu_elapsed, None);
+    }
 
     #[test]
     fn test_spec_gpu_elapsed_incomplete() {

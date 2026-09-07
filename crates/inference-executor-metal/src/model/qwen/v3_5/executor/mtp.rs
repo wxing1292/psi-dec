@@ -538,6 +538,15 @@ impl Qwen35Executor {
         recorder.mtp_sampling_arguments = mtp_sampling_arguments;
     }
 
+    fn submit_mtp_sequence(&self, executions: &[ReplayExecution<'_>]) -> MetalReplaySubmission {
+        let runtime = self.replay_runtime();
+        if runtime.gpu_timestamps_enabled() {
+            runtime.submit_replay_sequence_with_gpu_timestamps(executions, &[executions.len()])
+        } else {
+            runtime.submit_replay_sequence(executions)
+        }
+    }
+
     fn submit_mtp_step(&self, recorder: &Qwen35ModelOpsRecorder, step_index: usize) -> MetalReplaySubmission {
         let mtp_hidden_state_transfer_key = recorder
             .mtp_hidden_state_transfer_key
@@ -566,7 +575,7 @@ impl Qwen35Executor {
             gqa_layer_index,
         );
         if recorder.num_mtp_sample_rows() == 0 {
-            return self.replay_runtime().submit_replay_sequence(&[
+            return self.submit_mtp_sequence(&[
                 ReplayExecution::new(
                     mtp_hidden_state_transfer_replay,
                     &recorder.mtp_hidden_state_transfer_arguments,
@@ -583,7 +592,7 @@ impl Qwen35Executor {
             .mtp_sampling_key
             .as_ref()
             .expect("qwen3.5 MTP sampled output requires Sampling replay");
-        self.replay_runtime().submit_replay_sequence(&[
+        self.submit_mtp_sequence(&[
             ReplayExecution::new(
                 mtp_hidden_state_transfer_replay,
                 &recorder.mtp_hidden_state_transfer_arguments,
@@ -769,7 +778,7 @@ impl Qwen35Executor {
                 sampling_arguments,
             ));
         }
-        self.replay_runtime().submit_replay_sequence(&executions)
+        self.submit_mtp_sequence(&executions)
     }
 
     fn read_mtp_step(&self, num_sample_rows: usize) -> (Vec<i32>, Vec<f32>, Duration) {
@@ -784,11 +793,12 @@ impl Qwen35Executor {
         let mut submission = self.submit_mtp_step(recorder, 0);
         for module_index in 1..num_spec_tokens {
             submission.wait();
+            let gpu_elapsed = submission.gpu_timestamp_durations().map(|durations| durations[0]);
             let (draft_token_ids, draft_probs, read_elapsed) = self.read_mtp_step(recorder.num_mtp_sample_rows());
             self.speculator
                 .mtp_mut()
                 .execution
-                .push_step(&draft_token_ids, &draft_probs, read_elapsed);
+                .push_step(&draft_token_ids, &draft_probs, read_elapsed, gpu_elapsed);
             let next_step = self.record_next_mtp_step(module_index);
             submission = self.submit_recorded_mtp_step(module_index, &next_step);
         }
@@ -800,6 +810,7 @@ impl Qwen35Executor {
         recorder: &Qwen35ModelOpsRecorder,
         decisions: &mut [Qwen35DecodeDecision],
         replay_elapsed: Duration,
+        gpu_timestamp_durations: Option<&[Duration]>,
     ) -> ModelOutputTiming {
         let mut timing = ModelOutputTiming {
             spec_build_elapsed: recorder.mtp_build_elapsed,
@@ -815,7 +826,13 @@ impl Qwen35Executor {
         );
         let (draft_token_ids, draft_probs, read_elapsed) = self.read_mtp_step(num_mtp_sample_rows);
         let mtp = self.speculator.mtp_mut();
-        mtp.execution.push_step(&draft_token_ids, &draft_probs, read_elapsed);
+        mtp.execution.push_step(
+            &draft_token_ids,
+            &draft_probs,
+            read_elapsed,
+            gpu_timestamp_durations.map(|durations| durations[0]),
+        );
+        timing.spec_replay_gpu_elapsed = mtp.execution.gpu_elapsed;
         assert_eq!(mtp.execution.completed_steps, mtp.num_spec_tokens);
         timing.spec_build_elapsed += mtp.execution.build_elapsed;
         timing.spec_read_elapsed += mtp.execution.read_elapsed;

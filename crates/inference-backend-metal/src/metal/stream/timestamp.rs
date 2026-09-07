@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::ffi::OsStr;
 use std::ptr::NonNull;
 use std::time::Duration;
 
@@ -15,8 +14,6 @@ use objc2_metal::MTL4TimestampGranularity;
 use objc2_metal::MTL4TimestampHeapEntry;
 use objc2_metal::MTLDevice;
 
-const GPU_TIMESTAMPS_ENV: &str = "PSI_DEC_METAL_GPU_TIMESTAMPS";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpuTimestampGranularity {
     Relaxed,
@@ -24,19 +21,6 @@ pub enum GpuTimestampGranularity {
 }
 
 impl GpuTimestampGranularity {
-    pub(crate) fn from_environment() -> Option<Self> {
-        Self::parse(std::env::var_os(GPU_TIMESTAMPS_ENV).as_deref())
-    }
-
-    fn parse(value: Option<&OsStr>) -> Option<Self> {
-        match value.and_then(OsStr::to_str) {
-            None | Some("") | Some("0" | "off" | "OFF") => None,
-            Some("1" | "relaxed" | "RELAXED") => Some(Self::Relaxed),
-            Some("precise" | "PRECISE") => Some(Self::Precise),
-            Some(value) => panic!("{GPU_TIMESTAMPS_ENV} must be one of off, relaxed, or precise; got {value:?}"),
-        }
-    }
-
     fn metal(self) -> MTL4TimestampGranularity {
         match self {
             Self::Relaxed => MTL4TimestampGranularity::Relaxed,
@@ -197,10 +181,8 @@ fn duration_from_ticks(ticks: u64, frequency_hz: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::time::Duration;
 
-    use super::GpuTimestampGranularity;
     use super::durations_from_timestamps;
 
     #[test]
@@ -211,19 +193,5 @@ mod tests {
         );
         assert_eq!(durations_from_timestamps(&[10, 9], 1_000), None);
         assert_eq!(durations_from_timestamps(&[0, 10], 1_000), None);
-    }
-
-    #[test]
-    fn test_parse_success() {
-        assert_eq!(GpuTimestampGranularity::parse(None), None);
-        assert_eq!(GpuTimestampGranularity::parse(Some(OsStr::new("off"))), None);
-        assert_eq!(
-            GpuTimestampGranularity::parse(Some(OsStr::new("relaxed"))),
-            Some(GpuTimestampGranularity::Relaxed)
-        );
-        assert_eq!(
-            GpuTimestampGranularity::parse(Some(OsStr::new("precise"))),
-            Some(GpuTimestampGranularity::Precise)
-        );
     }
 }

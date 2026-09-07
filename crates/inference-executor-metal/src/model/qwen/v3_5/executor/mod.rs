@@ -273,6 +273,7 @@ struct Qwen35MTPExecution {
     read_elapsed: Duration,
     build_elapsed: Duration,
     completed_steps: usize,
+    gpu_elapsed: Option<Duration>,
     pending_hidden_state_cache_write_routes: Vec<u32>,
 }
 
@@ -288,6 +289,7 @@ impl Qwen35MTPExecution {
             read_elapsed: Duration::ZERO,
             build_elapsed: Duration::ZERO,
             completed_steps: 0,
+            gpu_elapsed: Some(Duration::ZERO),
             pending_hidden_state_cache_write_routes: Vec::with_capacity(num_spec_tokens * max_requests * 2),
         }
     }
@@ -299,14 +301,25 @@ impl Qwen35MTPExecution {
         self.read_elapsed = Duration::ZERO;
         self.build_elapsed = Duration::ZERO;
         self.completed_steps = 0;
+        self.gpu_elapsed = Some(Duration::ZERO);
         self.pending_hidden_state_cache_write_routes.clear();
     }
 
-    fn push_step(&mut self, draft_token_ids: &[i32], draft_probs: &[f32], read_elapsed: Duration) {
+    fn push_step(
+        &mut self,
+        draft_token_ids: &[i32],
+        draft_probs: &[f32],
+        read_elapsed: Duration,
+        gpu_elapsed: Option<Duration>,
+    ) {
         assert_eq!(draft_token_ids.len(), draft_probs.len());
         self.draft_token_ids.extend_from_slice(draft_token_ids);
         self.draft_probs.extend_from_slice(draft_probs);
         self.read_elapsed += read_elapsed;
+        self.gpu_elapsed = self
+            .gpu_elapsed
+            .zip(gpu_elapsed)
+            .map(|(total, elapsed)| total + elapsed);
         self.completed_steps += 1;
     }
 }
@@ -1649,12 +1662,18 @@ impl ReplayableDecoderModel for Qwen35Executor {
         _model_batch_req: &Self::ModelBatchRequest,
         mut sampled_output: Self::SampledOutput,
         replay_elapsed: Duration,
+        gpu_timestamp_durations: Option<&[Duration]>,
     ) -> Self::SampledOutput {
         assert!(
             self.speculator.is_mtp(),
             "qwen3.5 DSpark/DFlash2 Spec is read with Main"
         );
-        let timing = self.read_mtp_proposal(recorder, &mut sampled_output.decisions, replay_elapsed);
+        let timing = self.read_mtp_proposal(
+            recorder,
+            &mut sampled_output.decisions,
+            replay_elapsed,
+            gpu_timestamp_durations,
+        );
         sampled_output.timing.add_assign(timing);
         sampled_output
     }
@@ -1705,7 +1724,27 @@ fn trace_decisions(event: &str, decisions: &[Qwen35DecodeDecision]) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::Qwen35MTPExecution;
     use super::mtp_proposal_sample_position;
+
+    #[test]
+    fn test_mtp_gpu_timing_reset_and_missing_sample() {
+        let mut execution = Qwen35MTPExecution::new(1, 3);
+        for (samples, expected) in [
+            ([Some(2), Some(3), Some(4)], Some(9)),
+            ([Some(2), None, Some(4)], None),
+            ([Some(0), Some(0), Some(0)], Some(0)),
+        ] {
+            execution.begin(Vec::new());
+            for elapsed in samples {
+                execution.push_step(&[], &[], Duration::ZERO, elapsed.map(Duration::from_micros));
+            }
+            assert_eq!(execution.gpu_elapsed, expected.map(Duration::from_micros));
+            assert_eq!(execution.completed_steps, 3);
+        }
+    }
 
     #[test]
     fn test_mtp_proposal_sample_position_advances_per_step() {

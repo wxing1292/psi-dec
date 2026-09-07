@@ -15,6 +15,18 @@ Use these sections for specific questions:
 | Which checkpoint, replay, and workspace contracts apply? | [Execution and checkpoint contract](#execution-and-checkpoint-contract) |
 | Where are the implementation and verification paths? | [Source and verification](#source-and-verification) |
 | How does runtime core commit CPU token metadata? | [Scheduler cache commit](#scheduler-cache-commit) |
+| How is MTP GPU latency measured? | [GPU timing](#gpu-timing) |
+
+## GPU timing
+
+Each logical MTP submission has one GPU interval. `MetalRuntime` enables relaxed timestamps by default.
+The interval includes hidden-state transfer, embed, all module layers, gather/unembed, and sampling.
+`Qwen35MTPExecution` sums these intervals after the existing submission waits. It adds no synchronization.
+Host recording, proposal readback, and gaps between submissions do not enter the total.
+If any interval is unavailable, the complete batch total is unavailable.
+`ModelOutputTiming::spec_replay_gpu_elapsed` carries this total to the existing `spec_gpu_ms` metric.
+The scheduler reports one `mtp` row in `GPU Execution Latency`.
+[Service logging](service.md) defines the controls, histogram windows, and Main boundaries.
 
 After Main completes, rejection decisions fix the accepted GDN prefix.
 Before MTP embedding, the executor submits [GDN state commit](executor_gdn.md#state-data-flow) on a separate Metal stream.
