@@ -1,5 +1,5 @@
-use std::cell::Cell;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -27,7 +27,6 @@ pub struct CommandRecorder<'a> {
     parameters: &'a CommandParameterLayoutBuilder,
     active: RefCell<Option<CommandMetadataBuilder>>,
     completed: RefCell<Vec<CommandMetadata>>,
-    command_count: Cell<usize>,
 }
 
 impl<'a> CommandRecorder<'a> {
@@ -36,7 +35,6 @@ impl<'a> CommandRecorder<'a> {
             parameters,
             active: RefCell::new(None),
             completed: RefCell::new(Vec::new()),
-            command_count: Cell::new(0),
         }
     }
 
@@ -62,13 +60,54 @@ impl<'a> CommandRecorder<'a> {
             self.active.borrow().is_none(),
             "cannot record a barrier consumer while another Metal command is active"
         );
-        let first_command_index = self.command_count.get();
+        let first_command_index = self.completed.borrow().len();
         operator.record(self);
         assert!(
-            self.command_count.get() > first_command_index,
+            self.completed.borrow().len() > first_command_index,
             "Metal barrier consumer must record at least one command"
         );
         self.completed.borrow_mut()[first_command_index].barrier_before = true;
+    }
+
+    /// Declares disjoint accesses to the selected buffers across the recorded commands.
+    ///
+    /// For every submission, an element written by one command must not be read
+    /// or written by another command in this scope. The regions may be dynamic
+    /// or scattered. Other buffers and explicit barriers retain their dependencies.
+    /// The declaration does not extend to commands outside this recording scope.
+    pub fn record_disjoint_buffers(&self, buffers: &[&Buffer], record: impl FnOnce()) {
+        assert!(
+            self.active.borrow().is_none(),
+            "disjoint buffer recording must start between commands"
+        );
+        let first_command_index = self.completed.borrow().len();
+        record();
+        assert!(
+            self.active.borrow().is_none(),
+            "disjoint buffer recording must finish between commands"
+        );
+
+        let scope = Rc::new(());
+        for (command_index, command) in self.completed.borrow_mut()[first_command_index..]
+            .iter_mut()
+            .enumerate()
+        {
+            for binding in command.bindings.iter_mut().flatten() {
+                let CommandBinding::Buffer { buffer, partition, .. } = binding else {
+                    continue;
+                };
+                if buffers
+                    .iter()
+                    .any(|selected| std::ptr::eq(&**buffer, selected.as_raw()))
+                {
+                    assert!(partition.is_none(), "disjoint buffer recording scopes must not overlap");
+                    *partition = Some(BufferAccessPartition {
+                        scope: scope.clone(),
+                        command_index,
+                    });
+                }
+            }
+        }
     }
 
     /// Makes the active consumer command wait for all earlier buffer accesses.
@@ -129,6 +168,7 @@ impl<'a> CommandRecorder<'a> {
                 buffer: buffer.as_raw_retained(),
                 offset_bytes,
                 usage,
+                partition: None,
             },
         );
     }
@@ -152,6 +192,7 @@ impl<'a> CommandRecorder<'a> {
                 buffer: buffer.clone(),
                 offset_bytes,
                 usage,
+                partition: None,
             },
         );
     }
@@ -288,7 +329,6 @@ impl<'a> CommandRecorder<'a> {
             .borrow_mut()
             .take()
             .expect("Metal command must be active before finishing");
-        self.command_count.set(self.command_count.get() + 1);
         self.completed.borrow_mut().push(active.build());
     }
 
@@ -393,11 +433,33 @@ pub enum CommandBinding {
         buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
         offset_bytes: usize,
         usage: MTLResourceUsage,
+        partition: Option<BufferAccessPartition>,
     },
     Parameter {
         offset_bytes: usize,
     },
 }
+
+/// A command's access domain within one disjoint-buffer recording scope.
+#[derive(Clone, Debug)]
+pub struct BufferAccessPartition {
+    scope: Rc<()>,
+    command_index: usize,
+}
+
+impl BufferAccessPartition {
+    pub fn is_disjoint_from(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.scope, &other.scope) && self.command_index != other.command_index
+    }
+}
+
+impl PartialEq for BufferAccessPartition {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.scope, &other.scope) && self.command_index == other.command_index
+    }
+}
+
+impl Eq for BufferAccessPartition {}
 
 #[derive(Clone, Copy, Debug)]
 pub enum CommandDispatch {

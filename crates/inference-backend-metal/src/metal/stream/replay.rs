@@ -188,6 +188,9 @@ impl ReplayProgram {
                     command.setThreadgroupMemoryLength_atIndex(*len_bytes, index);
                 }
             }
+            if dependencies.barrier_before(command_metadata) {
+                command.setBarrier();
+            }
             match command_metadata.dispatch {
                 CommandDispatch::Threads {
                     num_total_threads,
@@ -223,9 +226,6 @@ impl ReplayProgram {
                         },
                     )
                 },
-            }
-            if dependencies.barrier_before(command_metadata) {
-                command.setBarrier();
             }
         }
 
