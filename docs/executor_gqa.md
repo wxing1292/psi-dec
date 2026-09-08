@@ -3,6 +3,16 @@
 This document describes the current GQA implementation. It covers tensor geometry, batch metadata, Metal replay,
 KV-page interpretation, and correctness tests.
 
+Use these sections for common tasks:
+
+| Task | Section |
+| --- | --- |
+| Locate implementation files and resource owners | [Source layout](#source-layout) and [Ownership](#ownership) |
+| Understand kernel selection and replay capacity | [Backend constants and variants](#backend-constants-and-variants) and [Replay contract](#replay-contract) |
+| Trace tensors and page bindings | [Data flow and bindings](#data-flow-and-bindings) |
+| Select correctness checks and benchmarks | [Tests and benches](#tests-and-benches) |
+| Review measured FP8 conversion results | [FP8 KV-cache conversion evidence](#fp8-kv-cache-conversion-evidence) |
+
 ## Source layout
 
 ```text

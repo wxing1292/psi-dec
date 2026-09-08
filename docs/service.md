@@ -9,6 +9,18 @@ Both adapters use the same `decode` operation.
 
 [`core.md`](core.md) defines runtime scheduling and page ownership. The executor documents define model execution.
 
+Use these sections for common tasks:
+
+| Task | Section |
+| --- | --- |
+| Download or convert a checkpoint and start a server | [Binaries and checkpoints](#binaries-and-checkpoints) |
+| Submit an audio transcription | [HTTP audio transcription](#http-audio-transcription) |
+| Generate text through gRPC | [gRPC generation](#grpc-generation) |
+| Use collected or streaming chat responses | [HTTP Chat Completions](#http-chat-completions) |
+| Inspect logging, timing, and lifecycle events | [Operational notes](#operational-notes) |
+| Check correctness or measure end-to-end performance | [Correctness and long decode](#correctness-and-long-decode) and [End-to-end performance helper](#end-to-end-performance-helper) |
+| Change service boundaries or tool-state handling | [Source ownership](#source-ownership) and [Tool state](#tool-state) |
+
 ## Source ownership
 
 `crates/inference-runtime-service/src/api/` owns these functions:
@@ -165,10 +177,13 @@ The inference server does not own these controls:
 ## Binaries and checkpoints
 
 The service provides Qwen3, Qwen3-ASR, and Qwen3.5 binaries.
+The Qwen3.5 binary names also apply to compatible Qwen3.6 and Qwen3.8 MLX checkpoints.
 The text-generation binaries can use optional speculative models.
+
 DSpark and DFlash2 support is experimental.
 Their checkpoint contracts, CLI, cache sizing, and proposal policies may change.
-It also provides Qwen3.5 binaries that retain their names for compatible Qwen3.6 and Qwen3.8 MLX checkpoints:
+
+The following table maps model families to binaries and checkpoints:
 
 | Model                  | Binary           | Main checkpoint                      | Optional Spec checkpoint                  |
 | ---------------------- | ---------------- | ------------------------------------ | ----------------------------------------- |
@@ -1050,7 +1065,7 @@ http-server
 
 Each component emits one INFO `started` event and one INFO `stopped` event in its span. Normal shutdown receipt does not
 emit a separate INFO event. The `runtime` span belongs to the runtime-core event loop in
-`runtime/scheduler/event_loop.rs`; it is not a second service-level wrapper.
+`runtime/scheduler/event_loop.rs`. It is not a second service-level wrapper.
 
 Enqueue and swap-in operations report request counts. Prepare, cancel, and commit operations report counts and latency
 percentiles.

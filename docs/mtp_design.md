@@ -4,6 +4,18 @@ This document defines the current scheduler/executor protocol.
 Examples use three logical MTP modules, `K = 3`, and two tokens per cache block, `N = 2`.
 The block size is illustrative, not a production default.
 
+Use these sections for specific questions:
+
+| Question | Section |
+| --- | --- |
+| What do runtime core and the model executor exchange? | [Scheduler/executor protocol](#schedulerexecutor-protocol) |
+| Which hidden outputs survive a step? | [Hidden-state buffer](#hidden-state-buffer) |
+| How do Prefill and Decode transitions work? | [Request transitions](#request-transitions) |
+| Which formulas determine tokens and retained rows? | [Calculation summary](#calculation-summary) |
+| Which checkpoint, replay, and workspace contracts apply? | [Execution and checkpoint contract](#execution-and-checkpoint-contract) |
+| Where are the implementation and verification paths? | [Source and verification](#source-and-verification) |
+| How does runtime core commit CPU token metadata? | [Scheduler cache commit](#scheduler-cache-commit) |
+
 ## Hidden-state buffer
 
 After Decode, the executor retains these BF16 hidden outputs for each request:

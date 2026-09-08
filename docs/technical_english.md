@@ -1,9 +1,10 @@
 # Technical English Guide
 
 This guide adapts ASD-STE100 Issue 9 for software documentation in this repository.
-It is STE-informed.
+It is ASD-STE100-informed.
 ASD has not certified this guide.
 This guide does not claim full ASD-STE100 compliance.
+Do not claim certified or full ASD-STE100 compliance without an authorized review.
 
 ASD published Issue 9 on 2025-01-15.
 Use the [official Issue 9 PDF](https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf) as the primary reference.
@@ -14,7 +15,6 @@ ASD owns the copyright in the standard.
 Use this guide with [`high_level.md`](high_level.md) and [`engineering_conventions.md`](engineering_conventions.md).
 Those documents continue to own architecture and engineering rules.
 This guide does not replace the standard, its controlled dictionary, trained review, or applicable project rules.
-ASD owns the standard and its registered trademark.
 Link to official copies of the standard.
 Do not copy or redistribute the standard or its dictionary in this repository.
 
@@ -151,6 +151,13 @@ Use these Markdown rules:
 - Keep prose out of a table when paragraphs are clearer.
 - Use descriptive link labels and preserve link targets.
 - Keep protected technical text in code formatting.
+
+Recommendation: Use the [MTP protocol](mtp_design.md) as the design-document example for people and LLM agents.
+Lead with the problem, owner, and contract. Follow with a concrete example before detailed source layout or API signatures.
+Prefer ASCII timelines and tables when token positions, counts, ownership, or state transitions are easier to inspect visually.
+Define symbols beside the figure. State the example inputs and distinguish them from production defaults.
+Keep diagrams narrow and label arrows with the data or event they carry.
+Do not repeat the complete diagram in prose or add a diagram that does not answer a reader's question.
 
 A note gives information only.
 Do not put a required action in a note.

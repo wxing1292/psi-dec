@@ -1,7 +1,11 @@
 # Token Budget Allocator
 
-This document describes the first confidence-aware token-budget allocator policy.
+The allocator divides a batch's token budget among the sticky requests assigned to one compute slot.
+It first preserves request progress, then consumes validated input, and then allocates speculative prefixes.
+This document describes the current confidence-aware policy.
 The public allocator API is in `runtime::scheduler`.
+[`core.md`](core.md) owns scheduling and request lifecycle.
+[`future_work.md`](future_work.md#confidence-aware-scheduling) owns the remaining calibration, cost, and integration work.
 
 ## Scope
 
@@ -27,88 +31,27 @@ Confidence changes allocation only when the hard batch budget cannot contain eve
 
 ## Request token inventory
 
-The first version does not add a planning trait or a request budget-curve type.
 Each user request produces an immutable `ReqTokenInventory` for the planning pass.
-The inventory contains these fields:
-
-```rust
-struct ReqTokenInventory<'a> {
-    req_id: RawRequestID,
-    num_ready_tokens: usize,
-    num_queued_tokens: usize,
-    num_spec_tokens: usize,
-    spec_confidences: &'a [NotNan<f32>],
-    max_partial_token_consumption: usize,
-}
-```
+The inventory contains the request ID, ready and queued token counts, speculative token count, and borrowed confidence values.
+The constructor derives `prefill_decode_threshold` from the validated-token count and compile-time cache-lane count `L`.
+The scheduler API does not expose the cache-lane count.
 
 `num_spec_tokens` must equal `spec_confidences.len()`.
-The constructor uses the request's compile-time cache-lane count to derive `max_partial_token_consumption`.
-The scheduler API does not expose the cache-lane count.
 
 The inventory calculates `min_validated_token_consumption()` and `max_validated_token_consumption()` from these
 fields.
 Both methods return request-local bounds without speculative verification.
 They do not replace the independent `max_tokens_per_request` hard limit.
 
-`ReqTokenInventory` owns the piecewise token-consumption curve:
+`ReqTokenInventory` owns the piecewise token-consumption curve.
+`token_consumption()` returns zero when the budget or validated-token count is zero.
+A budget that covers all validated tokens can also include speculative verification, up to the available speculative count.
+A smaller budget is capped at `prefill_decode_threshold`.
 
-```rust
-impl ReqTokenInventory<'_> {
-    fn token_consumption(
-        &self,
-        token_budget: usize,
-    ) -> usize {
-        let num_validated_tokens =
-            self.num_ready_tokens + self.num_queued_tokens;
-        if token_budget == 0 || num_validated_tokens == 0 {
-            0
-        } else if token_budget >= num_validated_tokens {
-            min(
-                token_budget,
-                num_validated_tokens + self.num_spec_tokens,
-            )
-        } else {
-            min(
-                token_budget,
-                self.max_partial_token_consumption,
-            )
-        }
-    }
-
-    fn min_validated_token_consumption(&self) -> usize {
-        let max_consumption = self.max_validated_token_consumption();
-        debug_assert!(max_consumption != 0);
-        if self.max_partial_token_consumption == 0 {
-            max_consumption
-        } else {
-            1
-        }
-    }
-
-    fn max_validated_token_consumption(&self) -> usize {
-        self.num_ready_tokens + self.num_queued_tokens
-    }
-}
-```
-
-The production data flow is direct:
-
-```rust
-let sticky_token_inventories = sticky_requests
-    .iter()
-    .map(UserRequest::token_estimate)
-    .collect::<Vec<_>>();
-
-let sticky_token_budgets = allocate_sticky_token_budgets(
-    BatchBudget {
-        req_budget,
-        token_budget,
-        max_token_per_req,
-    },
-    &sticky_token_inventories,
-);
-```
+The [allocator source](../crates/inference-runtime-core/src/runtime/scheduler/token_budget_allocator.rs) owns the exact fields, formulas, and boundary tests.
+The [scheduler source](../crates/inference-runtime-core/src/runtime/scheduler/simple_scheduler.rs) collects inventories in the compute slot's sticky request order.
+It resolves each ID through the schedule queue and calls `UserRequest::token_estimate` for each present request.
+It passes the inventories and `BatchBudget` to `allocate_sticky_token_budgets`.
 
 This flow does not require a new request trait.
 
@@ -156,7 +99,7 @@ This cap is the largest absolute budget that cannot include speculative verifica
 It then supplies the capped absolute budget to `token_consumption()`.
 
 The query preserves multi-lane discontinuities.
-For example:
+For example, eight validated tokens and four cache lanes give a `prefill_decode_threshold` of five:
 
 ```text
 budget 5 -> consumption 5
@@ -179,18 +122,60 @@ score[r,j] = product(confidence[r,t], t=0..j)
 
 After the allocator selects position `j`, it can add position `j+1` from that request.
 The allocator never uses a future confidence value to select an earlier position.
+When cumulative confidence values tie, the heap selects the earlier proposal position first.
+When positions also tie, it selects the earlier request in the slot's sticky order.
 
 The identity transform ranks raw executor outputs directly.
 It does not prove that the values are calibrated or comparable across requests.
 A telemetry gate must validate these properties before a later policy uses an absolute threshold or a measured cost
 decision.
 
+### Worked allocation
+
+This example uses sticky order `A, B`, a batch token budget of `5`, and a per-request limit of `3`.
+Each request has one validated input token and two available proposals.
+Both inventories use one cache lane.
+Phase 1 assigns one token to each request.
+Phase 2 consumes no additional budget because both validated inputs fit.
+Phase 3 can allocate the remaining three tokens:
+
+```text
++---------+----------------------+----------------------------+
+| Request | Proposal confidence  | Cumulative candidate score |
++---------+----------------------+----------------------------+
+| A       | 0.90, 0.10           | A0 = 0.90, A1 = 0.09       |
+| B       | 0.80, 0.80           | B0 = 0.80, B1 = 0.64       |
++---------+----------------------+----------------------------+
+
++------+-----------------+----------+-----------------+
+| Pick | Available       | Selected | Budgets (A, B)  |
++------+-----------------+----------+-----------------+
+| 1    | A0, B0          | A0       | (2, 1)          |
+| 2    | A1, B0          | B0       | (2, 2)          |
+| 3    | A1, B1          | B1       | (2, 3)          |
++------+-----------------+----------+-----------------+
+```
+
+`B1` becomes eligible only after `B0` is selected.
+The result contains one validated token and one proposal for `A`, and one validated token and two proposals for `B`.
+
+With the same budgets and every confidence set to `1.0`, the selection is:
+
+```text
+candidate order: A0 -> B0 -> A1 -> B1
+selected:        A0 -> B0 -> A1        (3 proposal tokens)
+final budgets:  A = 3, B = 2
+```
+
+This tie case visits the earlier proposal position before it advances either request to the next position.
+
 ## Proposal modes
 
 MTP confidence value `1.0` is a placeholder.
 It is not a calibrated acceptance probability.
 An MTP batch can use the same causal-candidate heap because all scores tie at `1.0`.
-The FIFO tie-break then produces fixed FIFO prefix allocation.
+The tie-break allocates one proposal position across eligible requests before it advances to the next position.
+Request order breaks ties within each position.
 This behavior is valid only while the policy has no absolute threshold and one runtime batch does not mix proposal
 modes.
 

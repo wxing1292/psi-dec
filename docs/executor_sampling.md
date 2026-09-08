@@ -279,7 +279,9 @@ These vectors always have the same length.
 MTP uses `1.0` for each speculative confidence because MTP has no confidence head.
 Qwen3x DSpark requires and evaluates its confidence head.
 The Qwen3 and Qwen3.5 response adapters preserve DSpark confidence values across the executor/runtime boundary.
-The runtime does not apply a confidence threshold or proposal-length policy yet.
+Runtime core uses cumulative confidence to allocate verification prefixes when the batch budget cannot contain every proposal row.
+The [token budget allocator](token_budget_allocator.md) owns this policy.
+Proposal generation remains fixed-width. The runtime does not apply an absolute confidence threshold.
 
 The current fused map preserves the earlier BF16 storage boundaries.
 It dequantizes W1 to F32 and stores the latent row as BF16.

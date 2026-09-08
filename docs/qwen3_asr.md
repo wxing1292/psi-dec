@@ -49,11 +49,12 @@ crates/inference-backend-metal/src/
 crates/inference-executor-metal/src/model/
   resource_arena.rs         shared Metal buffer and byte-range allocation owner
   resource_embed.rs         replay wrapper and active replacement mapping builder
+  main_resource_embed.rs    model-level resource mapping and replay owner
   qwen/v3_asr/
     audio.rs                Audio encoder worker, replay lifecycle, and Audio Tower
     resource.rs             prepared-source registration and processor adapter
   qwen/v3/executor/
-    input.rs                text-only or resource-aware input composition
+    mod.rs                  text-only or resource-aware input composition
 
 crates/inference-runtime-core/src/runtime/
   resource/                 ResourceID, ResourceURI, Resource, and ResourcePlacement

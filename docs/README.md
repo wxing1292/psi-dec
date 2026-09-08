@@ -1,102 +1,71 @@
 # Documentation Guide
 
-The top-level [README](../README.md) is the main entry point.
-It explains the project, request flow, startup process, and subsystem locations.
-This guide identifies the document that owns each type of information.
+Start with the [project README](../README.md) to run a first request.
+Use this index to find the owner of a question. Read only the documents relevant to the task.
+Agents start with [`AGENTS.md`](../AGENTS.md) for repository instructions.
+For source changes, read [high-level guidance](high_level.md) and [engineering conventions](engineering_conventions.md).
+For documentation changes, use [technical English](technical_english.md).
 
-## Document roles
+## Choose a task
 
-| Kind | Answers | Documents |
+| Task | Start here | Add when relevant |
 | --- | --- | --- |
-| Project orientation | What is `psi-dec`, and how do I run or read it? | [README](../README.md) |
-| Architecture | Who owns lifecycle, data, and execution order? | [`core.md`](core.md), [`executor.md`](executor.md), [`gpu_execution.md`](gpu_execution.md), Metal backend [README](../crates/inference-backend-metal/README.md) |
-| Current components | What source implements this model component today? | [`executor_qwen.md`](executor_qwen.md), [`qwen3_asr.md`](qwen3_asr.md), [`executor_gqa.md`](executor_gqa.md), [`executor_gdn.md`](executor_gdn.md), [`executor_dense_mlp.md`](executor_dense_mlp.md), [`executor_moe.md`](executor_moe.md), [`executor_sampling.md`](executor_sampling.md) |
-| Qwen3x DSpark | How does the current fixed-block Qwen3x DSpark path work? | [`dspark_design.md`](dspark_design.md) |
-| Qwen3x DFlash2 | How do current DFlash2 Prefill, Decode, sliding attention, convolution, and selection work? | [`dflash2_design.md`](dflash2_design.md) |
-| Qwen3.5 MTP | How do scheduler/executor requests, cache commit, and Prefill/Decode transitions work? | [`mtp_design.md`](mtp_design.md#schedulerexecutor-protocol) |
-| Workflows | How do I run, verify, benchmark, or profile it? | [`service.md`](service.md), [`executor_benchmarks.md`](executor_benchmarks.md) |
-| Engineering rules | Which rules apply to code, APIs, and technical English? | [`high_level.md`](high_level.md), [`engineering_conventions.md`](engineering_conventions.md), [`technical_english.md`](technical_english.md) |
-| Follow-up work | What remains unresolved or under investigation? | [`future_work.md`](future_work.md) |
+| Run or integrate the service | [Service](service.md) | [Pi provider](../agent-plugins/pi/README.md) |
+| Change scheduling or cache lifecycle | [Runtime core](core.md) | [Token-budget allocation](token_budget_allocator.md) |
+| Change model execution or replay composition | [Executor architecture](executor.md) | [Qwen executor](executor_qwen.md) and the component below |
+| Change GPU recording or a kernel | [GPU execution](gpu_execution.md) | [Metal backend](../crates/inference-backend-metal/README.md) and the component below |
+| Verify correctness or investigate performance | [Verification and benchmarks](executor_benchmarks.md) | The affected component and [active work](future_work.md) |
 
-Each document has one primary job.
-Link to the owning document instead of copying its full contract.
-Current component documents describe current `src`.
-Put future designs in `future_work.md`.
-Put durable repository rules in `engineering_conventions.md`.
-Put component-specific findings in the current document that owns the component.
-
-## Reading paths
-
-Choose the shortest path that reaches the owner of your question.
-
-### Understand one request
+For one request, follow the ownership chain:
 
 ```text
-../README.md
-core.md
-executor.md
-executor_qwen.md
+service API -> runtime core -> model executor -> Metal backend
+               scheduling     model semantics   GPU execution
 ```
 
-### Change runtime scheduling or cache lifecycle
+## Find a component
 
-```text
-high_level.md
-core.md
-../crates/inference-runtime-core/src/
-```
+Each guide identifies its current source and contracts.
+The Qwen guide owns whole-model composition. The other guides own the named computation or lifecycle.
 
-### Change a model component
+| Component or lifecycle | Guide |
+| --- | --- |
+| Qwen model composition | [Qwen executor](executor_qwen.md) |
+| Embedding, normalization, and unembedding | [Model primitives](executor_model_primitives.md) |
+| GQA | [GQA](executor_gqa.md), [kernel selection](gqa_sdpa_selection.md) |
+| Gated DeltaNet | [GDN](executor_gdn.md) |
+| Dense MLP | [Dense MLP](executor_dense_mlp.md) |
+| MoE | [MoE](executor_moe.md) |
+| Sampling and rejection sampling | [Sampling](executor_sampling.md) |
+| Qwen3.5 MTP | [Scheduler/executor protocol](mtp_design.md#schedulerexecutor-protocol) |
+| Qwen3x DSpark | [DSpark](dspark_design.md) |
+| Qwen3x DFlash2 | [DFlash2](dflash2_design.md) |
+| Qwen3-ASR | [Audio transcription](qwen3_asr.md) |
+| Whole-model Stop/Start | [Executor hibernation](executor_hibernation.md) |
+| Snapshot I/O and request/cache movement | [Model state I/O](model_state_io.md) |
 
-```text
-high_level.md
-executor.md
-the matching executor_<component>.md
-../crates/inference-executor-core/src/<component>/
-../crates/inference-backend-metal/src/components/
-../crates/inference-executor-metal/src/<component>/
-```
+Current component documents describe current `src`, including the MTP, DSpark, and DFlash2 `*_design.md` files.
+`model_state_io.md` marks implemented and planned work separately.
+[Future work](future_work.md) tracks active investigations and incomplete work.
 
-GQA and GDN use `attn/gqa` and `attn/gdn`.
-Dense MLP and MoE use `mlp/dense` and `mlp/moe`.
-Sampling uses `sampling`.
-
-### Change Metal recording or a kernel
-
-```text
-high_level.md
-executor.md
-gpu_execution.md
-../crates/inference-backend-metal/README.md
-the matching component doc
-```
-
-### Run or validate the service
-
-```text
-service.md
-executor_benchmarks.md        # when a measurement or release claim is involved
-```
-
-### Investigate performance
-
-```text
-executor_benchmarks.md
-the matching current component doc
-future_work.md                 # active known investigations
-```
-
-Performance notes must record the commit, dirty state, model, command, environment, workload/trajectory, metric,
-baseline, current result, and verdict.
-Run GPU and performance commands one at a time.
+The Firecracker [setup](firecracker/setup.md) and [commands](firecracker/commands.md) are unsupported legacy references.
 
 ## Maintenance rules
 
-- Recommendation: Use a link and a one-sentence boundary instead of duplicated prose.
-- Keep headings navigable and source paths current.
-- Put shared test and benchmark commands in the workflow that owns them.
-- Keep a component command only when it explains the production path or its flags.
-- Do not add broad historical note directories.
-- Consolidate or delete stale prose when a stable rule moves to an owning document.
-- Do not describe desired future state as current API or source.
-- Apply [`technical_english.md`](technical_english.md) to new or revised English documentation.
+Give each document one primary purpose:
+
+- Put durable repository rules in `engineering_conventions.md`.
+- Put component contracts, source paths, and findings in the guide for that component.
+- Put shared verification and benchmark commands in the workflow that owns them.
+- Put active follow-up work in `future_work.md`. Link to a focused design document when an unresolved contract needs more detail.
+
+Recommendation: Link to the owner with a one-sentence description instead of duplicating its contract.
+Keep a component command only when it explains the production path or its flags.
+Keep headings navigable and source paths current.
+Consolidate or delete stale prose when a stable rule moves to an owning document.
+Do not describe desired future state as current API or source.
+Do not add broad historical note directories.
+Apply [technical English](technical_english.md) to new and revised English documentation.
+
+Follow the [performance evidence rules](executor_benchmarks.md#performance-evidence) for measurements.
+Run GPU and performance commands one at a time.

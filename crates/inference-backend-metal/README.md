@@ -8,142 +8,87 @@ The crate does not own request scheduling, request lifecycle, or model-specific 
 The crate has one execution path. Operators record reusable indirect command buffers (ICBs). A `Stream` submits these
 replays through Metal 4.
 
+This guide explains replay recording, submission, and resource lifetime for backend and executor contributors.
+Start with [Add One](#add-one) for a complete example. Use these sections for specific contracts:
+
+- [Recording Layers](#recording-layers): Recording APIs and optional operator fusion.
+- [Component, Operator, and Command Order](#component-operator-and-command-order): Computation boundaries and execution order.
+- [Barrier Ownership](#barrier-ownership): Dependencies between commands.
+- [Execution Resources](#execution-resources): Retention and residency.
+- [End-To-End Lifecycle](#end-to-end-lifecycle): Resource creation, replay build, submission, and completion.
+- [Current Stream Contract](#current-stream-contract): In-flight submissions and replay sequences.
+
+See the [architecture guide](../../docs/high_level.md) for repository ownership rules.
+See the [verification guide](../../docs/executor_benchmarks.md) for test and performance commands.
+
 ## System Overview
 
+The runtime core supplies metadata and page IDs. The model executor chooses the semantic component order.
+The Metal backend records that work and submits reusable replays:
+
 ```text
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Runtime Core                                                                               │
-│ scheduler + request lifecycle + token/block metadata + cache page ownership                │
-└──────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                           │ ragged batch metadata + page IDs
-                                           v
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model Executor                                                                             │
-│                                                                                            │
-│ Embedding / GQA / GDN / Dense MLP / MoE / Final Norm / Sampling / MTP                      │
-│                                      │ semantic component order                            │
-└──────────────────────────────────────┼─────────────────────────────────────────────────────┘
-                                       │
-             ┌─────────────────────────┼────────────────────────────┐
-             │                         │                            │
-             v                         v                            v
-┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
-│ Weights                │  │ Workspace / State      │  │ Runtime Input          │
-│                        │  │                        │  │                        │
-│ quantized buffers      │  │ layer/component input  │  │ token IDs              │
-│ scales / biases        │  │ and output buffers     │  │ cu_tokens              │
-│ norm weights           │  │ GQA KV pages           │  │ page IDs               │
-│ embedding / unembed    │  │ GDN state              │  │ sampling parameters    │
-│                        │  │ scratch buffers        │  │ num_active_threads     │
-│                        │  │                        │  │ ────────────────────── │
-│ long-lived             │  │ reused across replay   │  │ per submission         │
-└───────────┬────────────┘  └───────────┬────────────┘  └───────────┬────────────┘
-            │                           │                           │
-            └───────────────────────────┼───────────────────────────┘
-                                        v
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Metal Resource Layer                                                                       │
-│                                                                                            │
-│ Device                                                                                     │
-│   ├─ Buffer                                      // owns one MTLBuffer                     │
-│   │    └─ BufferView                             // borrow + dtype + shape + offset        │
-│   ├─ Kernel                                      // compiled MTLComputePipelineState       │
-│   ├─ Stream                                                                                │
-│   │    ├─ command queue                          // MTL4CommandQueue                       │
-│   │    ├─ command allocator                      // MTL4CommandAllocator                   │
-│   │    ├─ commit completion                      // MTL4 commit feedback                    │
-│   │    ├─ optional timestamp profiler            // MTL4CounterHeap                        │
-│   │    └─ ResidencySet                           // wraps queue-attached MTLResidencySet   │
-│   └─ BufferIO                                                                              │
-│        └─ I/O command queue                      // serial MTLIOCommandQueue               │
-└──────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                           │ buffers + kernels + semantic order
-                                           v
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Recording Layer                                                                            │
-│                                                                                            │
-│ Component::record                                                                          │
-│        v                                                                                   │
-│ ReplayOp                                                                                   │
-│        v                                                                                   │
-│ ReplayRecorder                              // ordering + operator fusion                  │
-│        v                                                                                   │
-│ Operator / Invocation                                                                      │
-│   pipeline + buffers + offsets + constants                                                 │
-│   num_total_threads + num_threads_per_threadblock   // replay-static dispatch capacity     │
-│        │ Operator::record                                                                  │
-│        v                                                                                   │
-│ CommandRecorder                                                                            │
-│   set_kernel + set_buffer_read/write + set_* + bind_* + dispatch                           │
-│        v                                                                                   │
-│ CommandMetadata[]                                                                          │
-│   pipeline + resource bindings + dispatch + barrier-before                                 │
-└──────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                           │ ReplayProgramBuilder::build
-                                           v
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Replay Build / Cache                                                                       │
-│                                                                                            │
-│ CommandMetadata[] + initial parameter bytes + ReplayParameterTable + stable resources      │
-│        v                                                                                   │
-│ indirect command buffer                     // MTLIndirectCommandBuffer                    │
-│   command slots [C0, C1, ... CN]                                                           │
-│        v                                                                                   │
-│ ReplayResources                                                                            │
-│   ├─ ICB                                                                                   │
-│   ├─ retained buffers                         // MTLBuffer resources                       │
-│   ├─ retained pipelines                       // MTLComputePipelineState resources         │
-│   ├─ replay parameter buffer                                                               │
-│   └─ Residency                                // lease in ResidencySet                     │
-│        v                                                                                   │
-│ ReplayProgram                                  // cached by topology/algorithm/capacity key  │
-└──────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                           │ ReplayArguments + runtime input
-                                           │ per submission
-                                           v
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Submission / GPU Execution                                                                 │
-│                                                                                            │
-│ validate ReplayArguments ──> write num_active_threads and other replay parameters          │
-│                                      │                                                     │
-│ command allocator ──> command buffer ──> compute command encoder                           │
-│                                              │                                             │
-│                                              └─ executeCommandsInBuffer(ICB)               │
-│                                                               │                            │
-│                                                               v                            │
-│ command queue ──> GPU executes command slots ──> invoke commit feedback                    │
-│                                                               │                            │
-│                                                               v                            │
-│ allocator.reset() + release in-flight ReplayResources retention                            │
-└────────────────────────────────────────────────────────────────────────────────────────────┘
+Runtime core -- metadata + page IDs --> Model executor
+                                             |
+                              semantic order + buffer bindings
+                                             v
+record once:  Operator -> CommandRecorder -> ReplayProgramBuilder
+                                             |
+                                             v
+                                      ReplayProgram / ICB
+                                             |
+submit many:  ReplayArguments + runtime input |
+                              |              |
+                              +----> Stream <+
+                                       |
+                                       v
+                              GPU executes the ICB
+                                       |
+                                       v
+                              commit feedback -> allocator reset
 ```
 
-The top three resource groups have different lifecycles. They do not have different Metal allocation types.
+Replay keeps resource identities and dispatch capacity stable. Each submission changes the active input:
 
-Weights are immutable after initialization. Workspace and state buffers keep stable identities. Thus, cached commands
-can retain their bindings while buffer contents change.
+| Resource or value | Lifecycle |
+| --- | --- |
+| Weights, scales, biases, and pipelines | Immutable after initialization. |
+| Workspace, scratch, GQA KV pages, and GDN state buffers | Stable buffer identities. Their contents can change between submissions. |
+| Token IDs, `cu_tokens`, page IDs, and sampling parameters | The executor writes runtime input once per submission. |
+| `num_total_threads` | Recorded dispatch capacity. Topology, algorithm, and capacity select the cached replay. |
+| `num_active_threads` | Per-submission replay parameter that masks unused capacity. |
 
-The executor writes runtime input one time for each submission. `num_total_threads` is part of the recorded dispatch
-capacity. `num_active_threads` masks unused capacity for one submission.
-
+Weights, workspace, and runtime input use the same Metal allocation types despite their different lifecycles.
+`Buffer` owns one `MTLBuffer`. `BufferView` borrows it with a dtype, shape, and byte offset.
 `MetalRuntime` owns one compute `Stream` and one `BufferIO`.
+See [Execution Resources](#execution-resources) for retention and residency, and [End-To-End Lifecycle](#end-to-end-lifecycle) for resource creation and submission.
+
+### GPU timestamps
+
 When `PSI_DEC_METAL_GPU_TIMESTAMPS` is `relaxed` or `precise`, the Stream also owns one reusable Metal 4 timestamp
-counter heap. An instrumented replay sequence writes one initial timestamp and one timestamp after each caller-supplied
-stage end. `ReplaySubmission::wait()` first proves GPU completion. It then resolves the opaque heap on the CPU timeline
-and converts GPU ticks with `MTLDevice::queryTimestampFrequency()`.
+counter heap.
+An instrumented replay sequence writes one initial timestamp and one timestamp after each caller-supplied stage end.
+`ReplaySubmission::wait()` first proves GPU completion.
+It then resolves the opaque heap on the CPU timeline and converts GPU ticks with `MTLDevice::queryTimestampFrequency()`.
 The unset or `off` configuration does not create the heap or encode timestamp commands.
+
 If the device cannot create the heap or Metal returns zero, unordered, or incomplete data, the submission returns no
 GPU intervals and preserves the normal completion path.
+
+### Buffer I/O
+
 `BufferIO::create` creates a new output file.
 `BufferIO::open` opens an existing input file.
 Both methods require `BufferIOFileCacheMode::Cached` or `BufferIOFileCacheMode::Uncached`.
 The uncached mode applies `F_NOCACHE` for positional I/O and `F_GLOBAL_NOCACHE` for all handles of that file.
 Both methods return one `BufferIOFile` that owns the POSIX and Metal handles for the same file.
-`BufferIO::file_to_buffer` uses the Metal I/O queue. It divides ranges larger than 1 GiB into serial commands because
-Metal I/O rejects one command when its size reaches 2 GiB on the supported Apple Silicon path.
+
+`BufferIO::file_to_buffer` uses a serial Metal I/O queue (`MTLIOCommandQueue`).
+It divides ranges larger than 1 GiB into serial commands.
+On the supported Apple Silicon path, Metal I/O rejects a command when its size reaches 2 GiB.
 `BufferIO::buffer_to_file` writes directly from shared `MTLBuffer` storage with positional file I/O.
 Both methods are synchronous.
 Both methods list the source range before the destination range.
+
 The caller must complete earlier GPU access before it starts a transfer.
 The snapshot owner controls file synchronization and publication.
 
@@ -374,16 +319,7 @@ ReplayProgramBuilder
 ICB slots [C0, C1, C2, ...]
 ```
 
-The model or layer owns semantic order. A component lowers its algorithm into backend operators.
-
-`ReplayRecorder` can replace adjacent compatible operators with one fused operator. The fused operator preserves the
-same dependency.
-
-An `Operator` is a recording unit. It does not always equal one kernel or one ICB slot. Each complete kernel dispatch
-becomes one backend command.
-
-On Metal, the command has one compute pipeline and one ICB slot. It also has resource bindings, parameter bindings, and
-dispatch geometry.
+The fused operator preserves the original dependency.
 
 ICB slot order identifies commands. It does not serialize their resource access. Replays use concurrent compute
 dispatches. Thus, commands without a dependency can overlap.

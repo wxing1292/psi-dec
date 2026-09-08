@@ -1,7 +1,8 @@
 # High-Level Engineering Guidance
 
-This document gives shared repository rules. It also defines the boundary between the **runtime core** and the
-**model executor**.
+This document defines shared engineering rules and the boundary between the runtime core, model executor, and Metal backend.
+[`AGENTS.md`](../AGENTS.md) gives the agent workflow and verification commands.
+The [documentation index](README.md) routes readers to component and workflow documents.
 
 ## Doc style
 
@@ -9,8 +10,8 @@ Use the [technical English style](technical_english.md) for repository prose.
 
 Recommendation: Keep the text concise, clear, useful, and aligned with the source.
 
-Current-component documents describe the current `src`. Update the matching `docs/executor_*.md` when a source layout
-or default path changes.
+Current-component documents describe the current `src`. Update the owning component document when a source layout or default path changes.
+Use the documentation index to find that owner.
 
 Put active follow-up work in `docs/future_work.md`. Put durable repository rules in
 `docs/engineering_conventions.md`. Put component findings in the document that owns the component.
@@ -19,7 +20,9 @@ Do not create broad directories for historical or performance archaeology.
 
 Give each document one primary purpose:
 
-- The top-level README gives the project model.
+- `AGENTS.md` gives agents the repository map, workflow, critical constraints, and verification entry points.
+- The top-level README gives the project model and first-run path.
+- The documentation index routes readers by task and distinguishes current behavior from planned work.
 - Architecture documents define ownership and data flow.
 - Component documents describe the current source and validation.
 - Workflow documents contain shared commands, verification rules, and operations.
@@ -71,14 +74,8 @@ protocol from outside the process. Make sure that the server stops cleanly.
 
 Do expensive GPU checks during final acceptance. Do them earlier only when they answer a correctness question.
 
-Before handing off broad Rust changes, run the repository compile gates:
-
-```sh
-cargo +nightly fmt --all -- --check
-cargo check --workspace --all-targets --all-features
-cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
-git diff --check
-```
+Before handing off broad Rust changes, run the [repository compile gates](../AGENTS.md#verification).
+For documentation-only changes, check links, source references, command accuracy, and `git diff --check`.
 
 Run Metal and GPU commands one at a time. Coordinate these commands across processes. Do not use parallel workspace
 tests as a GPU verification gate.
@@ -137,27 +134,13 @@ use block polling or busy waiting.
 
 Name the managed objects before you add APIs.
 
-Add an entity only when it has a necessary purpose. This rule applies to these entities:
-
-- Wrappers
-- Structs
-- Fields
-- Enums
-- Helpers
-- Buffers
-- Scratch owners
-- Compatibility paths
-- Validation layers
-- Tests
-
-An entity has a necessary purpose when it owns a distinct concept, invariant, resource, lifecycle, or reusable
-operation. An entity can also be necessary when it materially improves clarity.
+Add an entity only when it owns a distinct concept, invariant, resource, lifecycle, or reusable operation.
+An entity can also be necessary when it materially improves clarity.
+This rule applies to wrappers, structs, fields, enums, helpers, buffers, scratch owners, compatibility paths, validation layers, and tests.
 
 Recommendation: Use direct data flow. Do not minimize the number of entities mechanically.
 
-Peer-component symmetry reduces maintenance work and cognitive load.
-
-Recommendation: Use a small symmetric entity when it makes peer ownership, data flow, or lifecycle clear.
+Use the peer-component symmetry guidance in [Design style](#design-style) when comparing owners.
 
 Keep stable identity and explicit data-type or tuning choices. Derive facts and capacities from the model or
 configuration dimensions that own them. Do not store duplicates, pass duplicates, or use convenient magic limits.
@@ -233,13 +216,10 @@ Do not hide a second resource lifecycle behind the same `load` and `unload` pair
 A core or executor contract can guarantee a condition. Check that condition at the boundary where a violation becomes
 visible. Do not add defensive recovery code that hides lifecycle bugs.
 
-Use a release `assert!` only for an initialization, one-time structure, or ownership boundary. Also use it for a
-contract that release code must enforce. Use `debug_assert!` for repeated internal paths.
-
 Distinguish an invariant check from a data-flow bug. Existing data flow can already guarantee a condition. In this case,
 add the smallest useful check at the owning boundary.
 
-Select `assert!` or `debug_assert!` with the lifecycle and release-cost rule above. Do not add recovery state for an
+Select `assert!` or `debug_assert!` with the [shared hard constraints](#shared-hard-constraints). Do not add recovery state for an
 impossible case. This restriction also applies to types, branches, and grouping.
 
 Change the structure only in these cases:
@@ -271,11 +251,10 @@ Keep interfaces symmetric across related components. Examples include these comp
 Use parallel names for shapes, inputs, outputs, scratch, kernels, and record methods. Use different names only when the
 semantics are different.
 
-Structural and API symmetry is a maintenance tool. It is not cosmetic consistency. A reader can transfer ownership,
-lifecycle, data-flow, test, and profiling knowledge between peer components.
-
-Unnecessary asymmetry increases maintenance work and cognitive load. Thus, symmetry is more important than mechanical
-entity-count reduction. Use a small symmetric entity when it makes the peer contract clear.
+Structural and API symmetry lets a reader transfer ownership, lifecycle, data-flow, test, and profiling knowledge between peer components.
+Preserve that clarity before reducing entity count mechanically.
+Use a small symmetric entity when it makes the peer contract clear.
+Do not add an entity only for visual symmetry.
 
 Use an asymmetric design only for a concrete semantic or resource-lifecycle difference. State the difference at the
 owning boundary.
@@ -399,7 +378,7 @@ during initialization or cache construction.
 - Public APIs
 - Test style
 
-This document contains only architecture, ownership, lifecycle, performance-evidence, and completion rules.
+Use that document for detailed source and test rules.
 
 ## Performance evidence
 
@@ -419,7 +398,7 @@ executor or kernel regression.
 
 ## Definition of done
 
-A change is done only when:
+Apply the criteria that match the change. A change is done only when:
 
 ```text
 target behavior is implemented

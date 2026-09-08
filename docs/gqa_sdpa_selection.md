@@ -1,7 +1,8 @@
 # GQA SDPA Selection
 
-This document defines the GQA SDPA selection model. It separates reference vocabulary from current implementation
-facts. It also records the scope of the current design change.
+This document describes the current GQA SDPA selection model.
+It separates conceptual task vocabulary from the implemented kernel constants, selection policy, and GPU ABI.
+[`executor_gqa.md`](executor_gqa.md) owns the complete GQA component and source layout.
 
 ## Reference vocabulary
 
@@ -324,7 +325,7 @@ numerator = exp(max_a - max) * denom_a * output_a
 output = numerator / denom
 ```
 
-A possible future ABI can store `max`, `denom`, and `numerator`. That representation is not part of this refactor.
+A possible future ABI can store `max`, `denom`, and `numerator`. The current implementation does not use that representation.
 
 ### Replay and resource contracts
 
@@ -340,14 +341,15 @@ The current implementation uses these contracts:
 Replay padding can change the recorded Map grid. Therefore, the selector includes the selected replay capacity when it
 materializes and compares candidates.
 
-## Proposed design scope
+## Design boundary
 
-This change moves dynamic selection and complete-candidate construction into `gqa::sdpa::Selector`. It replaces the
-old path enum and duplicate identity with one `backend_sdpa::ExecutionVariant`. It also separates Q-token ranges, Map
-task templates, and kernel constant fields.
+`gqa::sdpa::Selector` owns dynamic selection and complete-candidate construction.
+One `backend_sdpa::ExecutionVariant` identifies the selected Map and Reduce pair.
+Q-token ranges, Map task templates, and kernel constant fields remain distinct concepts.
 
-This change does not propose a new partial-state ABI, replay key, resource contract, KV-segment allocation policy, or
-Metal numerical kernel.
+The selector consumes the existing partial-state ABI, replay key, resource contract, KV-segment allocation policy, and
+Metal numerical kernels.
+See the [selector source](../crates/inference-executor-metal/src/attn/gqa/sdpa.rs) for the implemented policy.
 
 ## Validation
 

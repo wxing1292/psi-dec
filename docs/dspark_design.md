@@ -1,188 +1,169 @@
 # Qwen3x DSpark Design
 
-This document describes DSpark-specific composition, state, Markov sampling, and confidence for Qwen3 and Qwen3.5.
+DSpark produces a fixed block of proposals with one transformer forward, then samples those proposals in sequence.
+The Markov head conditions each sample on the preceding token. The confidence head returns a score for each proposal.
+This document describes the current Qwen3 and Qwen3.5 implementation.
 DSpark is experimental, and its checkpoint contract and proposal policy may change.
-See [`executor_gqa.md`](executor_gqa.md) for shared GQA and [`executor_sampling.md`](executor_sampling.md) for sampling.
+
+Use [Proposal block and attention](#proposal-block-and-attention) for row counts and [End-to-end flow](#end-to-end-flow) for execution order.
+[`executor_gqa.md`](executor_gqa.md) owns shared GQA details. [`executor_sampling.md`](executor_sampling.md) owns shared sampling contracts.
 
 ## Scope and ownership
 
 Use `Main`, `MTP`, and `DSpark` or `Spec` for roles.
 Checkpoint fields such as `target_layer_ids` retain upstream names.
 
-Main owns token embedding, the transformer, residual capture from selected Main layers, unembedding, Main sampling,
-and rejection.
-The DSpark owner owns its checkpoint, history page table, replay caches, workspaces, Markov head, and confidence head.
-Runtime core owns scheduling, request lifecycle, physical pages, and page IDs.
+| Owner | Responsibility |
+| --- | --- |
+| Runtime core | Scheduling, request lifecycle, physical pages, and page IDs |
+| Main | Token embedding, transformer execution, selected-layer residual capture, unembedding, Main sampling, and rejection |
+| DSpark | Checkpoint, history page table, replay caches, workspaces, Markov head, and confidence head |
+| Qwen executor | Compose Main and DSpark recordings, submit the ordered sequence, wait, and adapt results |
 
 DSpark supports ungated GQA, the `vanilla` Markov head, Markov-conditioned confidence, `default` RoPE, and Yarn RoPE.
-The runtime proposal length `N` is fixed at startup.
-The service uses checkpoint `block_size` as the default. `--num-spec-tokens N` overrides this default.
-The executor keeps the checkpoint unchanged and uses `N` for query rows, scratch, replay, and draft distributions.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
 Current limits:
 
 - Each Decode request produces exactly `N` proposals.
-- Confidence does not change verification length.
+- Confidence does not change the DSpark proposal count or its recorded graph.
 - Gated GQA is unsupported.
 - Each executor supports one in-flight batch.
 
-## End-to-end flow
-
-```text
-DSpark
-------
-
-selected Main-layer hidden states
-                  │
-                  ▼
-        capture / projection
-                  │
-                  ▼
-        Main context H
-       (Attention only)
-
-      [ANCHOR] [MASK] [MASK] [MASK] ...
-         t=0     t=1    t=2    t=3
-                  │
-                  ▼
-        embedding / proposal input
-                  │
-                  ▼
-
-┌───────────────────────────────────────────────────────────────┐
-│                     DSpark Layer × L                          │
-│                                                               │
-│                    draft hidden h_t                           │
-│                           │                                   │
-│                           ▼                                   │
-│                  ┌─────────────────┐                          │
-│                  │ Attention / MLP │                          │
-│                  └────────┬────────┘                          │
-│                           ▼                                   │
-│                   residual / RMSNorm                          │
-│                           │                                   │
-│                           ▼                                   │
-│                   next-layer hidden                           │
-└───────────────────────────────────────────────────────────────┘
-                 │
-                 ▼
-          final draft hidden h_t
-                 │
-        ┌────────┴─────────┐
-        │                  │
-        ▼                  ▼
- Main unembedding    confidence branch
-        │                  └──────────────► CONFIDENCE HEAD below
-        ▼
- base logits U_t
-        │
-        └───────────────────────────────► MARKOV SAMPLING below
-
-MARKOV SAMPLING
----------------
-
-previous sampled token x_{t-1}
-                 │
-                 ▼
-          W_1[x_{t-1}] = l_t
-                 │
-                 ▼
-                W_2
-                 │
-                 ▼
-      Markov bias vector M_t
-                 │
-       base logits U_t
-                 │
-                 ▼
-           Z_t = U_t + M_t
-                 │
-                 ▼
-     top-k / temperature / top-p
-                 │
-                 ▼
-          q_t(. | x_{t-1})
-                 │
-                 ▼
-             sample x_t
-                 │
-                 └──────────────► next proposal position
-                                   x_t becomes x_{t-1}
-
-M_t = W_2 W_1[x_{t-1}]
-Z_t = U_t + M_t
-
-
-CONFIDENCE HEAD
----------------
-
-          draft hidden h_t
-                 │
-                 ├───────────────┐
-                 │               │
-                 │      W_1[x_{t-1}] = l_t
-                 │               │
-                 └───────┬───────┘
-                         ▼
-                  concat(h_t, l_t)
-                         │
-                         ▼
-            confidence projection + bias
-                         │
-                         ▼
-                sigmoid temperature 1.0
-                         │
-                         ▼
-                        c_t
-                         │
-                         ▼
-             returned with proposal token
-
-N = runtime proposal count (defaults to checkpoint block_size)
-```
-
-Spec Prefill and Spec Decode use independent replay recordings.
-The Qwen executor records them with Main and submits one ordered sequence.
-Spec Decode prepare follows rejection sampling. Prefill follows Main capture.
-When both exist, the serial sequence emits Spec Decode prepare first, then Prefill, and then the remaining Spec Decode
-work.
-Each selected Main layer writes every Main row directly into its assigned capture columns.
-Spec Prefill persists every captured Main row, including the rejected physical suffix.
-Logical commit exposes only fixed Main rows and the accepted speculative prefix.
-Spec Prefill borrows the active token count, request slots, and flat token indices from the current Main GQA metadata.
-
 ## Proposal block and attention
+
+The runtime proposal length `N` is fixed at startup.
+The service uses checkpoint `block_size` as the default. `--num-spec-tokens N` overrides this default.
+The executor keeps the checkpoint unchanged and uses `N` for query rows, scratch, replay, and draft distributions.
+
+| Symbol | Meaning in this document |
+| --- | --- |
+| `N` | Proposals per Decode request and query rows per DSpark block |
+| `p` | Absolute position of the newly sampled Main anchor |
+| `t` | DSpark row and proposal index, from `0` through `N - 1` |
+| `x_{-1}` | Main anchor at position `p` |
+| `x_t` | Proposal token at position `p + t + 1` |
+| `h_t` | Final DSpark hidden output from query row `t` |
 
 The proposal block has one anchor and `N - 1` MASK rows.
 All `N` rows produce proposals in one transformer forward.
+For `N = 3`, the row-to-token relation is:
 
+```text
++--------------------+----------+----------+----------+
+| Query row t        | 0        | 1        | 2        |
++--------------------+----------+----------+----------+
+| Query position     | p        | p + 1    | p + 2    |
+| Input token        | x_{-1}   | MASK     | MASK     |
+| Final hidden       | h_0      | h_1      | h_2      |
+| Produced proposal  | x_0      | x_1      | x_2      |
+| Proposal position  | p + 1    | p + 2    | p + 3    |
++--------------------+----------+----------+----------+
+```
+
+The anchor row produces the first proposal.
+[DFlash2](dflash2_design.md#proposal-block-and-attention) instead uses `N + 1` query rows and gathers only its `N` MASK rows.
+
+Each local row reads history range `[0, p)` and attends to all `N` local rows.
 Each layer reduces SplitKV history partials with bidirectional local-block SDPA partials.
-
-For anchor position `p`, each local row reads history range `[0, p)` and attends to all `N` local rows.
 Proposal-local K/V is temporary.
-
-The template runs once for attention and once for MLP.
 
 The Spec Decode replay key contains padded history TaskTemplate capacity.
 The active count remains a submission argument, so matching padded capacities reuse one replay.
+
+## End-to-end flow
+
+Spec Prefill converts captured Main features into persistent history K/V.
+Spec Decode uses that history and the anchor-plus-MASK block to produce new proposals.
+The two stages use independent replay recordings within one ordered GPU submission:
+
+```text
+Main Embed -> Main forward and selected-layer capture
+  -> GatherUnembed -> RejectionSampling
+  -> Spec Decode prepare: write anchor, positions, and visible history ranges
+  -> DSpark Prefill: project captured Main rows -> history K/V pages
+  -> DSpark Embed -> all DSpark layers -> final RMSNorm
+  -> GatherUnembed -> sequential Markov sampling + confidence
+
+CPU boundary: submit sequence -> wait for completion -> read decision + proposals
+
+Prefill-only: Main Embed -> Main forward/capture -> DSpark Prefill
+```
+
+The Qwen executor owns recording, submission, and wait boundaries.
+There is no CPU rejection read between Main verification and Spec Decode.
+A prefill-only batch creates history but has no sampled anchor and produces no proposals.
+
+Each selected Main layer writes every Main row directly into its assigned capture columns.
+Spec Prefill borrows the active token count, request slots, and flat token indices from the current Main GQA metadata.
+It persists every captured Main row, including the rejected physical suffix.
+Logical commit exposes only fixed Main rows and the accepted speculative prefix.
+
+For example, Main verifies one known token `w` and three old drafts `d0, d1, d2` at positions `b` through `b + 3`.
+Rejection sampling returns a new anchor `y`:
+
+| Accepted old drafts | New anchor position `p` | Newly visible history rows |
+| --- | --- | --- |
+| None | `b + 1` | `w` |
+| `d0` | `b + 2` | `w, d0` |
+| `d0, d1, d2` | `b + 4` | `w, d0, d1, d2` |
+
+In each case, DSpark starts its new block with `x_{-1} = y` at `p`.
+The history bound `[0, p)` excludes the rejected suffix even when physical pages contain its captured rows.
+
+Each DSpark layer applies two residual branches in order:
+
+```text
+residual -> RMSNorm -> attention -> add residual
+         -> RMSNorm -> dense MLP -> add residual -> next layer
+```
 
 ## Markov sampling and confidence
 
 At step `t`, `x_{t-1}` is the preceding sample.
 For `t = 0`, `x_{-1}` is the Main anchor.
+All final hidden rows and base logits exist before this sequential sampling starts.
+Sampling does not run the DSpark transformer again for each token.
 
-`U_t` is the base vocabulary-logit vector.
-`M_t` is the complete vocabulary-sized Markov bias vector.
-`Z_t` is the corrected vocabulary-logit vector.
+| Symbol | Value |
+| --- | --- |
+| `U_t` | Base vocabulary-logit vector from unembedding `h_t` |
+| `l_t` | Markov latent row `W_1[x_{t-1}]` |
+| `M_t` | Complete vocabulary-sized Markov bias vector |
+| `Z_t` | Corrected vocabulary-logit vector |
+| `q_t(. \| x_{t-1})` | Proposal distribution after top-k, temperature, and top-p |
+| `c_t` | Confidence returned with proposal `x_t` |
 
-Confidence reuses `l_t` and `h_t`.
-Its sigmoid uses temperature `1.0`.
-Runtime returns `c_t` but does not use it to change verification length.
+The Markov equations are:
+
+```text
+M_t = W_2 W_1[x_{t-1}]
+Z_t = U_t + M_t
+```
+
+Each sample supplies the next step's Markov input:
+
+```text
+x_{-1} --[U_0 + Markov bias]--> sample x_0
+x_0    --[U_1 + Markov bias]--> sample x_1
+x_1    --[U_2 + Markov bias]--> sample x_2
+```
+
+Confidence uses the same preceding-token latent as that step's Markov bias:
+
+```text
+h_t -------------------+
+                       +-> concat -> confidence projection + bias
+W_1[x_{t-1}] = l_t -----+           -> sigmoid temperature 1.0 -> c_t
+```
+
+Runtime core stores `c_t` with each proposal.
+Its [token budget allocator](token_budget_allocator.md) ranks speculative prefixes by cumulative confidence.
+When the batch budget cannot contain every proposal row, the scheduler can select a shorter prefix for Main verification.
+DSpark still produces exactly `N` proposals. The current policy uses no absolute confidence threshold.
 
 The fused Metal map computes `l_t`, `M_t`, tile-local Top-K, and confidence.
 The reducer performs global Top-K, top-p sampling, and sparse writes.
-Each sample becomes the next Markov input.
 No full latent, bias, or corrected-logit buffer is materialized.
 
 ## Cache and lifecycle
@@ -203,17 +184,7 @@ Draft-distribution identity remains stable across submissions:
 draft_distribution_index = req_slot * N + proposal_position
 ```
 
-The service owns submission and wait boundaries.
-DSpark uses one combined Main submission:
-
-```text
-Main Embed -> Main -> GatherUnembed -> RejectionSampling
-  -> Spec Decode prepare -> DSpark Prefill
-  -> DSpark Embed -> DSpark -> gather/unembed -> Markov sampling
-
-Prefill-only: Main Embed -> Main -> DSpark Prefill
-```
-
+Here, `proposal_position` is the zero-based proposal index within the request.
 Persistent state contains the DSpark page table and history K/V pages.
 Local Q/K/V, attention partials, logits, Markov scratch, and output are ephemeral.
 
@@ -274,4 +245,4 @@ confidence parity, sequential sampling, sparse distributions, replay active coun
 
 Use [`service.md`](service.md) for end-to-end commands.
 Use [`executor_benchmarks.md`](executor_benchmarks.md) before a performance claim.
-[`future_work.md`](future_work.md) owns confidence-guided scheduling, gated GQA, and additional checkpoint variants.
+[`future_work.md`](future_work.md) owns remaining confidence calibration and scheduling work, gated GQA, and additional checkpoint variants.
