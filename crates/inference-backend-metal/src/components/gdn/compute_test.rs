@@ -10,14 +10,17 @@ use inference_executor_core::attn::gdn::reference::gdn_short_conv_reference;
 use super::Buffers;
 use super::Compute;
 use super::Config;
+use super::MixedInvocation;
 use super::Registry;
 use super::Selector;
 use super::Shape;
 use super::VariantConstants;
 use super::VariantKey;
 use crate::metal::Buffer;
+use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Dtype;
+use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
@@ -769,6 +772,73 @@ fn test_mixed_replay_matches_reference_across_prefill_decode_counts() {
     );
 }
 
+// Record the same kernels with an explicit dependency before decode. This
+// isolates scheduling from the CPU oracle's different floating-point order.
+struct SerialMixedInvocation<'a>(MixedInvocation<'a>);
+
+impl Operator for SerialMixedInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        let invocation = self.0;
+        let variant = invocation.variant;
+        variant.record_short_conv(
+            recorder,
+            invocation.shape,
+            &invocation.buffers,
+            invocation.num_active_reqs,
+            invocation.num_active_tokens,
+            !invocation.write_candidate_states,
+        );
+        if invocation.write_candidate_states {
+            variant.record_candidate_conv_state(
+                recorder,
+                invocation.shape,
+                &invocation.buffers,
+                invocation.num_active_reqs,
+                invocation.num_active_tokens,
+            );
+        }
+        variant.record_chunkwise_state(
+            recorder,
+            invocation.shape,
+            &invocation.buffers,
+            invocation.num_active_prefill_requests,
+            invocation.write_candidate_states,
+        );
+        recorder.record_with_barrier_before(SerialDecodeInvocation(&invocation));
+        variant.record_output_norm_gate(
+            recorder,
+            invocation.shape,
+            &invocation.buffers,
+            invocation.num_active_tokens,
+        );
+    }
+}
+
+struct SerialDecodeInvocation<'a>(&'a MixedInvocation<'a>);
+
+impl Operator for SerialDecodeInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        let invocation = self.0;
+        if invocation.write_candidate_states {
+            invocation.variant.record_candidate_recurrent_state(
+                recorder,
+                invocation.shape,
+                &invocation.buffers,
+                invocation.num_active_reqs,
+                invocation.num_active_prefill_requests,
+            );
+        } else {
+            invocation.variant.record_final_recurrent_state(
+                recorder,
+                invocation.shape,
+                &invocation.buffers,
+                invocation.num_active_reqs,
+                invocation.num_active_prefill_requests,
+            );
+        }
+    }
+}
+
 fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens: usize, rounds: &[(u32, &[u32])]) {
     let num_state_slots = num_total_reqs + num_total_tokens;
     const CANARY: f32 = -777.0;
@@ -814,44 +884,52 @@ fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens
     let norm_gated_output =
         Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Bfloat16);
 
+    let buffers = Buffers {
+        qkv: &qkv,
+        a: &a,
+        b: &b,
+        z: &z,
+        conv_weight: &conv_weight,
+        norm_weight: &norm_weight,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        cu_tokens: &cu_tokens,
+        src_recurrent_state_slots: &src_slots,
+        src_conv_state_slots: &src_slots,
+        flat_recurrent_state_write_slots: &recurrent_write_slots,
+        flat_conv_state_write_slots: &conv_write_slots,
+        conv_state: &conv_state,
+        conv_state_offset_bytes: 0,
+        next_conv_state: &conv_state,
+        next_conv_state_offset_bytes: 0,
+        recurrent_state_arena: &recurrent_state,
+        recurrent_state_arena_offset_bytes: 0,
+        conv_qkv: &conv_qkv,
+        recurrent_output: &recurrent_output,
+        norm_gated_output: &norm_gated_output,
+    };
     for write_candidate_states in [false, true] {
         let mut cache = ReplayTestCache::new();
-        let (_, hit) = cache.record((), || {
-            let mut builder = stream.create_replay_program();
-            builder.record(kernels.invoke_mixed(
-                shape,
-                Buffers {
-                    qkv: &qkv,
-                    a: &a,
-                    b: &b,
-                    z: &z,
-                    conv_weight: &conv_weight,
-                    norm_weight: &norm_weight,
-                    a_log: &a_log,
-                    dt_bias: &dt_bias,
-                    cu_tokens: &cu_tokens,
-                    src_recurrent_state_slots: &src_slots,
-                    src_conv_state_slots: &src_slots,
-                    flat_recurrent_state_write_slots: &recurrent_write_slots,
-                    flat_conv_state_write_slots: &conv_write_slots,
-                    conv_state: &conv_state,
-                    conv_state_offset_bytes: 0,
-                    next_conv_state: &conv_state,
-                    next_conv_state_offset_bytes: 0,
-                    recurrent_state_arena: &recurrent_state,
-                    recurrent_state_arena_offset_bytes: 0,
-                    conv_qkv: &conv_qkv,
-                    recurrent_output: &recurrent_output,
-                    norm_gated_output: &norm_gated_output,
-                },
-                ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
-                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-                ReplayU32::Parameter(NUM_ACTIVE_PREFILL_REQUESTS),
-                write_candidate_states,
-            ));
-            builder.build()
-        });
-        assert!(!hit);
+        for serialized in [false, true] {
+            let (_, hit) = cache.record(serialized, || {
+                let mut builder = stream.create_replay_program();
+                let invocation = kernels.invoke_mixed(
+                    shape,
+                    buffers,
+                    ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
+                    ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+                    ReplayU32::Parameter(NUM_ACTIVE_PREFILL_REQUESTS),
+                    write_candidate_states,
+                );
+                if serialized {
+                    builder.record(SerialMixedInvocation(invocation));
+                } else {
+                    builder.record(invocation);
+                }
+                builder.build()
+            });
+            assert!(!hit);
+        }
         for &(num_prefill, request_lengths) in rounds {
             let mut cu_values = vec![0];
             for &length in request_lengths {
@@ -879,25 +957,23 @@ fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens
             expected_conv_state[..source_conv_states.len()].copy_from_slice(&source_conv_states);
             let mut expected_recurrent_state = vec![CANARY; num_state_slots * recurrent_stride];
             expected_recurrent_state[..source_recurrent_states.len()].copy_from_slice(&source_recurrent_states);
-            write_bf16(&conv_state, 0, &expected_conv_state);
-            write_bf16(&recurrent_state, 0, &expected_recurrent_state);
+            let initial_conv_state = expected_conv_state.clone();
+            let initial_recurrent_state = expected_recurrent_state.clone();
+            write_bf16(&conv_state, 0, &initial_conv_state);
+            write_bf16(&recurrent_state, 0, &initial_recurrent_state);
             let mut expected_conv_qkv = vec![CANARY; config.num_qkv_values(shape)];
             let mut expected_output = vec![CANARY; config.num_recurrent_output_values(shape)];
             let mut expected_norm_output = expected_output.clone();
             write_bf16(&conv_qkv, 0, &expected_conv_qkv);
             write_bf16(&recurrent_output, 0, &expected_output);
             write_bf16(&norm_gated_output, 0, &expected_norm_output);
-            let (replay, hit) = cache.record((), || unreachable!());
+            let arguments = ReplayArguments::new()
+                .with_u32(NUM_ACTIVE_REQUESTS, request_lengths.len() as u32)
+                .with_u32(NUM_ACTIVE_TOKENS, num_tokens as u32)
+                .with_u32(NUM_ACTIVE_PREFILL_REQUESTS, num_prefill);
+            let (replay, hit) = cache.record(false, || unreachable!());
             assert!(hit);
-            stream
-                .submit_replay_with_arguments(
-                    replay,
-                    &ReplayArguments::new()
-                        .with_u32(NUM_ACTIVE_REQUESTS, request_lengths.len() as u32)
-                        .with_u32(NUM_ACTIVE_TOKENS, num_tokens as u32)
-                        .with_u32(NUM_ACTIVE_PREFILL_REQUESTS, num_prefill),
-                )
-                .wait();
+            stream.submit_replay_with_arguments(replay, &arguments).wait();
 
             for (req, bounds) in cu_values.windows(2).enumerate() {
                 let begin = bounds[0] as usize;
@@ -980,6 +1056,27 @@ fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens
                 &bf16_round_trip(&expected_recurrent_state),
                 5.0e-3,
             );
+
+            let checked_buffers = [
+                &conv_qkv,
+                &recurrent_output,
+                &norm_gated_output,
+                &conv_state,
+                &recurrent_state,
+            ];
+            let concurrent_values =
+                checked_buffers.map(|buffer| buffer.read_typed::<u16>(0, buffer.len_bytes() / size_of::<u16>()));
+            write_bf16(&conv_state, 0, &initial_conv_state);
+            write_bf16(&recurrent_state, 0, &initial_recurrent_state);
+            for buffer in [&conv_qkv, &recurrent_output, &norm_gated_output] {
+                write_bf16(buffer, 0, &vec![CANARY; buffer.len_bytes() / size_of::<u16>()]);
+            }
+            let (serial_replay, hit) = cache.record(true, || unreachable!());
+            assert!(hit);
+            stream.submit_replay_with_arguments(serial_replay, &arguments).wait();
+            for (buffer, concurrent) in checked_buffers.into_iter().zip(concurrent_values) {
+                assert_eq!(buffer.read_typed::<u16>(0, concurrent.len()), concurrent);
+            }
         }
     }
 }

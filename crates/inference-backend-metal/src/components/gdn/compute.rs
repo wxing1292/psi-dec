@@ -555,7 +555,7 @@ impl Compute {
         }
     }
 
-    /// Record a fixed prefill-chunkwise then decode-recurrent graph.
+    /// Record a fixed mixed graph whose prefill and decode cores can overlap.
     ///
     /// The first `num_active_prefill_requests` requests are prefill. Both
     /// branches retain the full recorded request capacity. Either branch may
@@ -808,30 +808,37 @@ impl Operator for MixedInvocation<'_> {
                 self.num_active_tokens,
             );
         }
-        variant.record_chunkwise_state(
-            recorder,
-            self.shape,
-            &self.buffers,
-            self.num_active_prefill_requests,
-            self.write_candidate_states,
+        // The request prefix and suffix own disjoint output rows and state
+        // slots. State slots may be scattered, but each has one request owner.
+        recorder.record_disjoint_buffers(
+            &[self.buffers.recurrent_output, self.buffers.recurrent_state_arena],
+            || {
+                variant.record_chunkwise_state(
+                    recorder,
+                    self.shape,
+                    &self.buffers,
+                    self.num_active_prefill_requests,
+                    self.write_candidate_states,
+                );
+                if self.write_candidate_states {
+                    variant.record_candidate_recurrent_state(
+                        recorder,
+                        self.shape,
+                        &self.buffers,
+                        self.num_active_reqs,
+                        self.num_active_prefill_requests,
+                    );
+                } else {
+                    variant.record_final_recurrent_state(
+                        recorder,
+                        self.shape,
+                        &self.buffers,
+                        self.num_active_reqs,
+                        self.num_active_prefill_requests,
+                    );
+                }
+            },
         );
-        if self.write_candidate_states {
-            variant.record_candidate_recurrent_state(
-                recorder,
-                self.shape,
-                &self.buffers,
-                self.num_active_reqs,
-                self.num_active_prefill_requests,
-            );
-        } else {
-            variant.record_final_recurrent_state(
-                recorder,
-                self.shape,
-                &self.buffers,
-                self.num_active_reqs,
-                self.num_active_prefill_requests,
-            );
-        }
         variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }

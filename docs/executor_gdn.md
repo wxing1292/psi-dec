@@ -846,7 +846,7 @@ hidden_state (BF16)
           |
           v
        backend_compute::Compute (F32)
-     short_conv -> chunkwise prefill -> recurrent decode -> output_norm_gate
+     short_conv -> { chunkwise prefill, recurrent decode } -> output_norm_gate
           |
           v
        norm_gated_output (BF16)
@@ -862,9 +862,18 @@ Main owns the complete forward replay cache. Each GDN layer records the same com
 
 1. Project and split all active tokens.
 2. Run short convolution and the required convolution-state materialization for all active requests.
-3. Run fused sequential chunkwise state updates for the prefill prefix.
-4. Run the existing recurrent state updates for the decode suffix.
-5. Normalize, gate, and project all active outputs.
+3. Run fused sequential chunkwise state updates for the prefill prefix and recurrent state updates for the decode suffix.
+   These two commands can overlap.
+4. Join both branches before output normalization and gating. Project all active outputs.
+
+`MixedInvocation::record` declares disjoint accesses to `recurrent_output` and `recurrent_state_arena` within the two core commands.
+The request prefix and `cu_tokens` select disjoint output rows.
+The request-state table gives each request separate current and candidate state slots, including scattered physical slots.
+This ownership contract already permits requests within one recurrent dispatch to execute in parallel.
+The declaration has a fresh recording scope for each invocation. It does not extend across layers that reuse the same buffers.
+The chunk command retains the common-input barrier. `output_norm_gate` retains the barrier that joins both branches.
+Other resource dependencies remain unchanged. The backend [barrier contract](../crates/inference-backend-metal/README.md#barrier-ownership)
+defines the scoped access metadata and its ICB lowering.
 
 Both core branches use the full recorded request capacity. A zero-active branch returns before it accesses request
 metadata or state. An empty branch still has dispatch and barrier costs. The graph does not create a component replay
@@ -1482,3 +1491,110 @@ RUST_LOG=warn cargo bench -p inference-executor-metal --bench qwen35_vanilla_pre
 
 This Main run is a correctness and lifecycle check. Its absolute times are not a matched performance comparison.
 ReplaySSM and sequence-parallel chunkwise execution are not part of this change.
+
+## Concurrent mixed replay verification: 2026-09-07
+
+The GDN core commands now declare disjoint access to request-owned output rows and recurrent state slots.
+The recorded graph retains the common-input barrier and the output normalization barrier.
+Main still owns one complete replay. Both full-layer comparison graphs contain eight commands.
+
+### Provenance and method
+
+- Source baseline: `d9692e52bfb54574df6d4b4e90a0f108a3c71834`, with no production source changes at task start.
+  Unrelated documentation edits were present and remained separate from this change.
+- Measured current source: the same commit with the disjoint-access and barrier-encoding changes in the working tree.
+- Baseline binary SHA-256: `dac338c62a910be36bddd44621f73ddf76703ca7210f20f67ab948741ba6a6c6`.
+  This is the preserved serial mixed binary from the preceding verification.
+- Current binary SHA-256: `7f3b7ee3e4694f65c5fa06dc20db56e7fec526fb6322409f5f0ea70b4a05a75a`.
+- Model: `/Users/wenquanxing/Workspace/models/Qwen3.6-35B-A3B-4bit`.
+- Machine: Mac15,9, arm64, 16 CPU cores, 48 GiB memory, macOS 27.0 build 26A5425a.
+- Power: battery, 81% during screening and 80% to 79% during confirmation.
+  The user reported concurrent Codex GPU use and requested relative comparisons.
+- Environment: `RUST_LOG=warn`. GPU timestamps, force-sync, Metal debug layer, and shader validation were unset.
+- Artifacts: `/private/tmp/psi-gdn-concurrent` contains build logs, source snapshots, binary hashes, commands, and raw samples.
+  The `relative` and `relative-confirm` directories contain the two measurement sets.
+
+The baseline and current builds use the same chunkwise and recurrent kernels.
+The current build also calls `setBarrier()` before encoding the consumer dispatch, as the Apple API directs.
+The comparison therefore measures both synchronization changes together.
+It does not isolate the effect of the barrier API call order.
+
+The driver launches the two binaries serially in ABBA blocks. A is the serial baseline. B is the current build.
+This is a comparison between processes, not an interleaved comparison within one process.
+Each process uses the same deterministic inputs, real weights, request lengths, and initial state.
+The fixture uses context 32 and the production candidate-state mask: final Prefill row and every Decode row.
+Each internal timer includes replay submission and wait. It excludes model load, compilation, recording, and warmup.
+No production benchmark switch was added.
+
+For each ABBA block, the driver averages the two baseline process means and the two current process means.
+The reported change is the median of the block ratios minus one. Negative values mean less wall time.
+The screening run used two ABBA blocks, 10 warmup iterations, and 100 measured iterations per process.
+The confirmation run used three ABBA blocks, 50 warmup iterations, and 500 measured iterations per process.
+Confirmation focused on the variable Decode controls and the mixed case with an observed compute reduction.
+
+```sh
+python3 /private/tmp/psi-gdn-concurrent/run_relative.py \
+  --baseline /private/tmp/psi-gdn-concurrent/qwen35_gdn-serial \
+  --current /private/tmp/psi-gdn-concurrent/qwen35_gdn-concurrent \
+  --blocks 2 --output-dir /private/tmp/psi-gdn-concurrent/relative
+
+python3 /private/tmp/psi-gdn-concurrent/run_relative.py \
+  --baseline /private/tmp/psi-gdn-concurrent/qwen35_gdn-serial \
+  --current /private/tmp/psi-gdn-concurrent/qwen35_gdn-concurrent \
+  --blocks 3 --iters 500 --warmup-iters 50 \
+  --cases decode-b1,decode-b4,mixed-balanced --subcomponent-cases mixed-balanced \
+  --output-dir /private/tmp/psi-gdn-concurrent/relative-confirm
+```
+
+### Relative observations
+
+The screening results measure the complete GDN layer, including both projections.
+
+| Request lengths | Prefill requests | Median wall-time change | Block change range |
+| --- | ---: | ---: | ---: |
+| `1` | 0 | -8.95% | -13.83% to -4.07% |
+| `1,1,1,1` | 0 | +3.58% | +3.47% to +3.68% |
+| `9,7,1,4` | 2 | -1.89% | -4.21% to +0.42% |
+| `128,128,1,4` | 2 | -0.07% | -0.57% to +0.42% |
+| `128,4,4,4` | 1 | -3.64% | -6.16% to -1.12% |
+| `128` | 1 | -0.90% | -1.41% to -0.39% |
+
+The longer confirmation produced these results.
+
+| Request lengths | Measured operation | Median wall-time change | Block change range |
+| --- | --- | ---: | ---: |
+| `1` | Complete GDN layer | -2.70% | -8.18% to +1.17% |
+| `1,1,1,1` | Complete GDN layer | -0.94% | -1.19% to +0.40% |
+| `128,4,4,4` | Complete GDN layer | -2.86% | -4.02% to -2.59% |
+| `128,4,4,4` | GDN compute | -6.05% | -6.16% to -5.38% |
+| `128,4,4,4` | QKVABZ projection | +0.32% | +0.13% to +0.49% |
+| `128,4,4,4` | QKVABZ split | +0.65% | +0.10% to +1.05% |
+| `128,4,4,4` | Output projection | +0.18% | -0.32% to +4.00% |
+
+GDN compute includes short convolution, state materialization, both core branches, and output normalization/gating.
+Its result is not a measurement of the fused chunk kernel alone.
+The complete `128,4,4,4` layer used baseline block means of 1788.348, 1772.829, and 1759.244 microseconds.
+Its current block means were 1716.411, 1722.102, and 1713.677 microseconds.
+
+Verdict: the confirmed mixed fixture reduces full-layer wall time by about 2.9% under these conditions.
+The long mixed screening fixture is approximately unchanged.
+The Decode control changes vary across runs, including a direction change for four requests.
+These observations do not establish a universal speedup or a Decode regression.
+The tests establish that the graph permits overlap. No GPU timeline was captured to quantify physical overlap.
+No whole-model performance comparison was made.
+
+### Correctness and integration
+
+- The mixed backend test reuses both graphs across dynamic Prefill counts, pure phases, empty branches, and ragged token counts.
+  The concurrent graph and the same kernels with serialized Decode produce identical bits in all five output and state buffers.
+  The CPU oracle, sparse state destinations, final-only state contract, and inactive canaries remain covered.
+- Four dependency tests verify entry and join hazards, partition history, scope isolation, unselected resources, and explicit barriers.
+- A GPU fork/join test executes two consecutive groups that reuse storage.
+  Eight active-count and split combinations include empty branches, padded capacity, and full capacity.
+  All outputs and canaries match the CPU result.
+- All 161 backend tests passed, including 19 GDN tests and 24 shared-stream tests.
+  All 16 executor GDN tests also passed.
+- The real 35B Main lifecycle passed case-order and chunk-consistency checks for two requests at contexts 0 and 32.
+  It used 32 Prefill tokens per request and two Decode tokens per request with greedy sampling.
+  This run verifies integration only. Its timings are not part of the relative comparison.
+- Formatting, workspace check, and workspace Clippy with `-D warnings` passed.

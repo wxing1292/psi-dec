@@ -3,6 +3,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 use objc2_metal::MTLResourceUsage;
 
+use crate::metal::stream::operation::BufferAccessPartition;
 use crate::metal::stream::operation::CommandBinding;
 use crate::metal::stream::operation::CommandMetadata;
 
@@ -23,12 +24,23 @@ impl CommandDependencyTracker {
 
     fn has_dependency(&self, command: &CommandMetadata) -> bool {
         for binding in &command.bindings {
-            let Some(CommandBinding::Buffer { buffer, usage, .. }) = binding else {
+            let Some(CommandBinding::Buffer {
+                buffer,
+                usage,
+                partition,
+                ..
+            }) = binding
+            else {
                 continue;
             };
             let current_writes = usage.contains(MTLResourceUsage::Write);
             for access in &self.accesses {
                 if Retained::as_ptr(&access.buffer) != Retained::as_ptr(buffer) {
+                    continue;
+                }
+                if let (Some(previous), Some(current)) = (&access.partition, partition)
+                    && previous.is_disjoint_from(current)
+                {
                     continue;
                 }
                 let previous_wrote = access.usage.contains(MTLResourceUsage::Write);
@@ -42,20 +54,25 @@ impl CommandDependencyTracker {
 
     fn update(&mut self, command: &CommandMetadata) {
         for binding in &command.bindings {
-            let Some(CommandBinding::Buffer { buffer, usage, .. }) = binding else {
+            let Some(CommandBinding::Buffer {
+                buffer,
+                usage,
+                partition,
+                ..
+            }) = binding
+            else {
                 continue;
             };
-            if let Some(existing) = self
-                .accesses
-                .iter_mut()
-                .find(|existing| Retained::as_ptr(&existing.buffer) == Retained::as_ptr(buffer))
-            {
+            if let Some(existing) = self.accesses.iter_mut().find(|existing| {
+                Retained::as_ptr(&existing.buffer) == Retained::as_ptr(buffer) && existing.partition == *partition
+            }) {
                 existing.usage |= *usage;
                 continue;
             }
             self.accesses.push(BufferAccess {
                 buffer: buffer.clone(),
                 usage: *usage,
+                partition: partition.clone(),
             });
         }
     }
@@ -65,4 +82,9 @@ impl CommandDependencyTracker {
 struct BufferAccess {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     usage: MTLResourceUsage,
+    partition: Option<BufferAccessPartition>,
 }
+
+#[cfg(test)]
+#[path = "dependency_test.rs"]
+mod tests;

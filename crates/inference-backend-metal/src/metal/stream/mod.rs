@@ -24,6 +24,9 @@ pub use operation::Operator;
 
 mod dependency;
 
+#[cfg(test)]
+mod disjoint_test;
+
 mod parameter;
 pub use parameter::ReplayArguments;
 pub use parameter::ReplayF32;

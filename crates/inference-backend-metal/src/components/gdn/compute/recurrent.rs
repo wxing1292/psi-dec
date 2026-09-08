@@ -54,7 +54,6 @@ impl Variant {
         num_active_prefill_requests: ReplayU32,
     ) {
         recorder.set_kernel(&self.final_recurrent_state);
-        recorder.set_barrier_before();
         recorder.set_buffer_write(0, buffers.recurrent_output, 0);
         recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
         recorder.set_buffer_read(2, buffers.conv_qkv, 0);
@@ -114,7 +113,6 @@ impl Variant {
         num_active_prefill_requests: ReplayU32,
     ) {
         recorder.set_kernel(&self.candidate_recurrent_state);
-        recorder.set_barrier_before();
         recorder.set_buffer_write(0, buffers.recurrent_output, 0);
         recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
         recorder.set_buffer_read(2, buffers.conv_qkv, 0);

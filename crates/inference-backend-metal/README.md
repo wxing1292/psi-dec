@@ -418,6 +418,31 @@ The program builder ignores a barrier request on the first command. No producer 
 The replay builder also infers RAW, WAR, and WAW hazards. It detects commands that bind the same `MTLBuffer` handle with
 declared read or write use.
 
+An operator can call `record_disjoint_buffers(&[...], || { ... })` for commands that access separate regions of selected buffers.
+For every submission, an element written by one command must not be read or written by another command in that scope.
+The regions can depend on submission metadata and can contain scattered slots.
+The operator owns this contract. Buffer offsets alone do not establish it.
+
+Each call creates a fresh recording scope. The dependency tracker keeps each command's selected accesses separate.
+Different partitions in the same scope do not create a hazard. An unannotated access or a different scope can still create a hazard.
+Other buffer bindings and explicit barriers retain their dependencies. This declaration does not change residency or shader bindings.
+
+For a common producer, two independent consumers, and a shared output consumer, the ICB has this structure:
+
+```text
+producer
+first branch    [barrier before]
+second branch   [no intervening barrier]
+output consumer [barrier before]
+```
+
+The entry barrier orders the producer before both branches. The output barrier joins both branches.
+This structure retains one ICB execution. It permits overlap but does not guarantee a performance gain.
+Apple defines memory barriers as ordering earlier commands before later commands within a pass.
+See [Apple's memory barrier explanation](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1492)
+and the [ICB barrier API](https://developer.apple.com/documentation/metal/mtlindirectcomputecommand/setbarrier%28%29).
+The replay builder calls `setBarrier()` before it encodes the consumer dispatch, as the API requires.
+
 Explicit component barriers remain necessary when buffer identity cannot express a dependency. Aliased views and
 semantic-phase boundaries are examples.
 
