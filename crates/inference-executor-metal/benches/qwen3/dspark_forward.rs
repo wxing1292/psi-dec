@@ -297,8 +297,8 @@ impl MainFixture {
     }
 
     fn run(&mut self) -> Duration {
-        let batch = self.batch_request();
-        let prepared = self.model.prepare_batch(&batch);
+        let mut batch = self.batch_request();
+        let prepared = self.model.prepare_batch(&mut batch);
         let mut recorder = self.model.begin_ops_recording(&prepared);
         let hidden = self.model.embed_main(&mut recorder, &prepared);
         let hidden = self.model.forward_main(&mut recorder, &prepared, hidden);

@@ -170,9 +170,13 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
     -> Markov correction + sampling
   ```
 
-- `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile. `--candidate-states`
-  materializes every current row into a distinct slot and uses the production candidate-state kernels.
-  `--subcomponents` reports candidate compute as `gdn.compute_candidate_state`.
+- `qwen35_gdn` measures the production fixed prefill-chunkwise/decode-recurrent GDN graph with the 35B-A3B profile.
+  `--tokens-per-req` selects an explicit ragged request layout. `--prefill-requests` identifies its prefill prefix.
+  `--candidate-states` uses the production candidate graph. It materializes each Decode row and the final Prefill row.
+  `--compare-recurrent` records the previous recurrent graph in the benchmark and compares it with the production graph.
+  Both graphs share weights, inputs, and initial state. An untimed check compares outputs and materialized state.
+  Timed iterations alternate their order and report relative wall-time changes.
+  `--subcomponents` retains the existing isolated operation measurements.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_main_layers` records only selected `Qwen35MainLayer` owners.
   It accepts `layer0`, `layer3`, `layer4`, `first4`, `all_layers`, or `layersSTART-END`.

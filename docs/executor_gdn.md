@@ -42,16 +42,25 @@ crates/inference-executor-metal/src/model/qwen/
 crates/inference-backend-metal/src/components/
   gdn/
     mod.rs              backend GDN component module root
-    compute.rs          recurrent variant registry, selector, constants, and compute graph
+    compute.rs          shared geometry, variant registry, validation, and compute graph
+    compute/
+      chunkwise.rs      fused chunkwise source specialization and command recording
+      recurrent.rs      final/candidate recurrent source specialization and command recording
     compute_test.rs     GDN compute reference and selection tests
     qkvabz_split.rs     reusable QKVABZ split component
     state_pages.rs      reusable GDN state-page read/write helpers
   metal/
-    gdn_compute.metal        short-convolution, ragged recurrent, and output-norm/gate source
+    gdn_compute.metal           shared short-convolution and output-norm/gate source
+    gdn_compute_chunkwise.metal fused sequential chunkwise state kernel
+    gdn_compute_recurrent.metal final/candidate recurrent state kernels
     gdn_qkvabz_split.metal  QKVABZ split source
     gdn_state_page_read.metal
     gdn_state_page_write.metal
 ```
+
+The private `compute/chunkwise.rs` and `compute/recurrent.rs` modules own the algorithm-specific source constants
+and record methods. `compute.rs` owns the shared model geometry, buffer contract, and replay composition.
+The source fragments compile into one Metal library. Source separation does not add replay caches or submissions.
 
 `crates/inference-executor-core` owns the backend-neutral GDN semantic metadata. `crates/inference-executor-metal` owns
 the Metal replay wiring and request state table.
@@ -137,25 +146,30 @@ terms. This section defines the GDN-specific mapping.
 ```text
 Vec<(VariantKey, Variant)>
 
-VariantKey::Recurrent
-    -> current recurrent algorithm
+VariantKey::Mixed
+    -> fixed prefill chunkwise and decode recurrent graph
     -> VariantConstants
-    -> compiled short-convolution, recurrent, and output kernels
+    -> compiled short-convolution, chunkwise, recurrent, and output kernels
 ```
 
 The private `Selector::select(...)` returns `(VariantKey, &Variant)` for one `backend_compute::Shape`. The current
-registry has one entry. The selector therefore returns `Recurrent` for all legal shapes. GDN does not have a `Planner`,
+registry has one entry. The selector therefore returns `Mixed` for all legal shapes. GDN does not have a `Planner`,
 `Plan`, or rich selection object.
 
 Each `backend_compute::Compute::invoke*` method runs the selector and stores the selected `&Variant` in the returned
 invocation. `Operator::record(...)` consumes this frozen variant. It does not select an execution variant.
 
-This structure keeps one selection level. A future chunkwise implementation must be another complete registry entry.
-It must not add an outer algorithm selector and an inner kernel selector.
+This structure keeps one selection level. `invoke_mixed` records both algorithms in a fixed order.
+It uses a submission parameter to split the active request domain. It does not select an algorithm for the whole batch.
+The existing recurrent invocation methods record the recurrent graph for isolated comparisons.
 
 The current inputs pack ragged request segments on one flat token axis and use `cu_tokens` to recover each segment.
-The project calls the algorithm `Recurrent`. It does not call the variant `PackedDecode` because the implementation
-also processes multi-token request segments.
+The recurrent algorithm also processes multi-token Decode request segments. Request phase comes from the runtime
+`QueryTokens` enum, not from query length. `BatchDeviceRequest` packs Prefill requests before Decode requests.
+Before it packs model metadata, Qwen3.5 orders requests as Prefill, long non-speculative Decode, and remaining Decode.
+The GDN backend owns the initial short-input limit of eight tokens. This limit is independent of the chunkwise tile width.
+All speculative Decode inputs stay in the final group. Each group preserves its input order.
+The request enum and sampling semantics do not change when the executor reorders the batch.
 
 The current variant constants have this hierarchy:
 
@@ -401,13 +415,13 @@ gdn::qkvabz_split::Shape
 ```
 
 Generic `backend_compute::Config` is the public construction input. `backend_compute::Compute::new` validates the config
-and constructs one private recurrent variant. Its `VariantConstants` contain all generated Metal constants and each
+and constructs one private mixed variant. Its `VariantConstants` contain all generated Metal constants and each
 kernel's required thread-block geometry. The variant stores `q_scale` and `norm_eps` separately because the host passes
 them as kernel arguments.
 
 `backend_compute::Shape` contains recorded capacities. `ReplayU32` values contain active counts. A caller without
 capacity padding sets each active count equal to its total count. The selector reads the shape when `Compute::invoke*`
-constructs an invocation. The current one-entry registry always returns `VariantKey::Recurrent`. Recording uses the
+constructs an invocation. The current one-entry registry always returns `VariantKey::Mixed`. Recording uses the
 variant stored in the invocation.
 
 The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
@@ -429,12 +443,19 @@ short convolution
                  next_conv_state_offset_bytes, write_final_conv_state
   dispatch: max(num_total_tokens * Cqkv, num_total_reqs * Cqkv * Ks), 256 threads/threadblock
 
+prefill chunkwise state
+  buffers 0..9: same binding domains as final recurrent state
+  scalars 10..13: q_scale, num_active_chunkwise_requests, recurrent_state_offset_bytes, write_candidate_states
+  grid: (Dv / kernels.chunkwise_state.thread_block.num_v_rows,
+         num_total_reqs * Hv, 1)
+  threads: (32, kernels.chunkwise_state.thread_block.num_simdgroups, 1)
+
 final recurrent state
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
                 a_log, dt_bias, src_recurrent_state_slots,
                 flat_recurrent_state_write_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
-  scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
+  scalars 10..13: q_scale, num_active_reqs, recurrent_state_offset_bytes, num_active_chunkwise_requests
   grid: (Dv / kernels.final_recurrent_state.thread_block.num_v_rows,
          num_total_reqs * Hv, 1)
   threads: (kernels.final_recurrent_state.thread_block.num_qk_dim_threads,
@@ -467,15 +488,16 @@ Candidate convolution materialization uses buffers 0..5 for `next_conv_state`, `
 `num_active_tokens`, `conv_state_offset_bytes`, and `next_conv_state_offset_bytes`.
 
 Candidate recurrent materialization uses `src_recurrent_state_slots` at buffer 7,
-`flat_recurrent_state_write_slots` at buffer 8, and `cu_tokens` at buffer 9. It uses scalars 10..12. One SIMDgroup
+`flat_recurrent_state_write_slots` at buffer 8, and `cu_tokens` at buffer 9. It uses scalars 10..13. One SIMDgroup
 owns one `[2, Dqk]` register-resident state slice. Two SIMDgroups share normalized Q/K and gate scalars through
 threadgroup memory. The grid is `(Dv / 4, num_total_reqs * Hv, 1)`. The thread-block dimensions are `(32, 2, 1)`.
 The candidate-state path requires `Dqk % 32 == 0` and `Dv % 4 == 0`. These requirements are initialization-time
 geometry contracts.
 
-The invalid state-slot sentinel is `u32::MAX`. All compute variants use the same row-level contract. A row always
-produces its normal output. A kernel writes the row's convolution or recurrent state only when the corresponding domain
-entry contains a valid slot.
+The invalid state-slot sentinel is `u32::MAX`. Every active row produces its normal output.
+Candidate execution considers every row for state materialization. Final-only execution considers only the last row
+of each request and ignores nonfinal destinations. A considered row writes convolution or recurrent state only when
+the corresponding domain entry contains a valid slot.
 
 ## Ownership
 
@@ -515,14 +537,14 @@ boundary.
 `GDN` does not select or name an affine kernel.
 
 `GDN` translates immutable `GDNCore` geometry into `backend_compute::Config`. `backend_compute::Compute::new` constructs
-one recurrent variant. Its final recurrent-state constants use eight V rows per thread block when `v_head_dim` permits
+one mixed variant. Its final recurrent-state constants use eight V rows per thread block when `v_head_dim` permits
 it. They fall back to four V rows for other valid dimensions. The candidate recurrent-state constants use two V rows
 per SIMDgroup and two SIMDgroups per thread block. The variant constants also record the
 required thread count for short convolution, candidate convolution materialization, and output norm + gate.
 
 The selected model and thread-block geometry specialize the generated Metal source. The model adapter does not select
 this geometry. `backend_compute::Shape` contains recorded request and token extents. The private selector uses this
-shape and returns the current recurrent variant.
+shape and returns the current mixed variant.
 
 Kernel source-hash caching shares compiled pipelines for identical component configs across layers and models. The backend
 API does not contain model names or model config types. Batch metadata objects and scratch bindings do not copy static
@@ -686,7 +708,7 @@ Arena lengths and the leading dimensions derive the per-slot and per-layer byte 
 these strides. It directly derives aggregate allocation lengths and the all-layer page-ID count. It does not store derived
 BF16-per-page counts, recurrent/conv page counts, or a selected layer coordinate.
 
-Backend code then runs the recurrent state update and output projection. Global `qkv`, gates, `conv_qkv`, recurrent
+Backend code then runs prefill chunkwise and decode recurrent state updates, followed by output projection. Global `qkv`, gates, `conv_qkv`, recurrent
 state, `recurrent_output`, and `norm_gated_output` use BF16. Kernels promote inputs to F32 and use F32 for all arithmetic
 and reductions before they round global outputs to BF16.
 
@@ -727,10 +749,13 @@ submission parameters:
 ```text
 gdn.num_active_requests  u32 [1, num_total_reqs]
 gdn.num_active_tokens    u32 [1, num_total_tokens]
+gdn.num_active_chunkwise_requests u32 [0, num_total_reqs]
 ```
 
 A composite stage can supply its own token key so all token consumers share one active-token parameter. The stage sets
-that parameter once. GDN adds only its private `gdn.num_active_requests` argument.
+that parameter once. GDN adds its private active-request and active-prefill-request arguments.
+`GDNMetadataBuffers::update` validates that the prefill count does not exceed the active request count.
+The prefill count is submission metadata. It does not enter the replay key.
 
 Each command binds only the domains that it consumes:
 
@@ -739,12 +764,13 @@ qkvabz affine                         active tokens
 QKVABZ split                          active tokens
 short convolution                     active requests and active tokens
 candidate convolution materialization active requests and active tokens
-final or candidate recurrent-state active requests
+prefill chunkwise state               active prefill requests
+final or candidate recurrent-state    active requests and active prefill requests
 output norm + gate                    active tokens
 output affine                         active tokens
 ```
 
-One parameterized GDN program therefore has two deduplicated `u32` parameters. Every inactive command returns before an
+One parameterized GDN program therefore has three deduplicated `u32` parameters. Every inactive command returns before an
 inactive lane reads input or metadata, mutates state, reaches a threadblock barrier, or writes output. Each recurrent
 request guard is uniform for the complete thread block.
 
@@ -824,7 +850,7 @@ hidden_state (BF16)
           |
           v
        backend_compute::Compute (F32)
-     short_conv -> final_recurrent_state -> output_norm_gate
+     short_conv -> { chunkwise prefill, recurrent decode } -> output_norm_gate
           |
           v
        norm_gated_output (BF16)
@@ -835,6 +861,39 @@ hidden_state (BF16)
           v
        next_hidden_state (BF16)
 ```
+
+Main owns the complete forward replay cache. Each GDN layer records the same command topology:
+
+1. Project and split all active tokens.
+2. Run short convolution and the required convolution-state materialization for all active requests.
+3. Run fused sequential chunkwise state updates for the chunkwise prefix and recurrent state updates for the remaining requests.
+   These two commands can overlap.
+4. Join both branches before output normalization and gating. Project all active outputs.
+
+`MixedInvocation::record` declares disjoint accesses to `recurrent_output` and `recurrent_state_arena` within the two core commands.
+The chunkwise prefix includes Prefill and non-speculative Decode requests with more than eight tokens.
+The remaining Decode requests use the recurrent branch. All requests retain their sampling semantics.
+The request prefix and `cu_tokens` select disjoint output rows.
+The request-state table gives each request separate current and candidate state slots, including scattered physical slots.
+This ownership contract already permits requests within one recurrent dispatch to execute in parallel.
+The declaration has a fresh recording scope for each invocation. It does not extend across layers that reuse the same buffers.
+The chunk command retains the common-input barrier. `output_norm_gate` retains the barrier that joins both branches.
+Other resource dependencies remain unchanged. The backend [barrier contract](../crates/inference-backend-metal/README.md#barrier-ownership)
+defines the scoped access metadata and its ICB lowering.
+
+Both core branches use the full recorded request capacity. A zero-active branch returns before it accesses request
+metadata or state. An empty branch still has dispatch and barrier costs. The graph does not create a component replay
+cache, copy ICB commands, or submit each branch separately.
+
+The fused prefill kernel processes at most eight tokens per chunk. Chunks advance sequentially inside one request's
+threadblock. SIMDgroup matrix operations compute the chunk transform, outputs, and state update. State fragments remain
+F32 in registers across chunks. Global inputs, outputs, and materialized state remain BF16.
+
+In candidate mode, a chunk ends at the next requested state-materialization row if that row precedes the eight-token
+boundary. Final-only mode ignores intermediate slots and writes only the final request state. The kernel
+writes that row's state slot and continues from its unrounded register state. Thus intermediate cache boundaries and
+selected candidate states follow the existing state-table contract. An active request must still contain at least one
+token. An empty branch must have zero active requests, not an active request with an empty token segment.
 
 Stage nouns identify the operation. They do not overload one generic “attention” pipeline:
 
@@ -852,8 +911,8 @@ In recurrent execution, each Q/K lane produces `q_square_sum_partial`, `k_square
 Output norm + gate uses `square_sum_partial` and threadgroup `square_sum_partials` before it computes the inverse RMS.
 No partial changes the existing dispatch, scratch, or ABI.
 
-The current `backend_compute::Compute` registry owns one recurrent algorithm variant. That variant has final-state and
-candidate-state kernels for the two materialization contracts. It handles one or more flat tokens per request with
+The current `backend_compute::Compute` registry owns one mixed variant. It contains the fused prefill kernel and
+final-state and candidate-state recurrent kernels. The recurrent kernels handle one or more flat tokens per request with
 `cu_tokens`. Each recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in
 order. It parallelizes across requests, V heads, V-row ranges, and Q/K-dimension lanes.
 
@@ -1142,7 +1201,7 @@ publish writes only committed/verified versions
 rejected speculative rows leave their candidate slots uncommitted
 ```
 
-The recurrent algorithm handles every current row shape. This includes decode and MTP verification batches with one or more
+The recurrent algorithm handles the Decode suffix, including MTP verification batches with one or more
 rows per request, segmented by `cu_tokens`. One thread block selects a request, V head, and V-row range. Its
 Q/K-dimension lanes load distributed source-state fragments. They then scan the request segment in order.
 
@@ -1194,7 +1253,7 @@ Do not add dynamic values to profile paths.
 ## GDN kernel family
 
 The current forward replay path uses `backend_compute::Compute` in `crates/inference-backend-metal/src/components/`. It records QKVABZ
-split, short convolution, ragged recurrent, and `output_norm_gate` through explicit replay invocations. State page read and
+split, short convolution, prefill chunkwise, decode recurrent, and `output_norm_gate` through explicit replay invocations. State page read and
 write helpers belong to the separate exact restore/publish lifecycle stages.
 
 Focused backend tests, component benches with parity checks, and Qwen real-weight wrapper/layer tests provide correctness
@@ -1256,13 +1315,14 @@ The full-forward `qwen35_gdn` bench uses CLI arguments, not environment variable
 total current microbatch row count. `--num-reqs` is the number of request segments in that microbatch. `--contexts` means
 context/state that exists before the measured forward.
 
-The bench distributes rows as evenly as possible across requests. It builds `cu_tokens`, source state slots, and
-candidate destination slots from these options.
+The bench preserves the ragged request lengths from `--tokens-per-req` when supplied. Otherwise, it distributes rows
+as evenly as possible across requests. `--prefill-requests` selects the prefill prefix. The bench builds `cu_tokens`,
+source state slots, and candidate destination slots from these options.
 
-`--candidate-states` materializes every current row into a distinct candidate slot. It selects the production
-convolution and recurrent candidate-state kernels. `--subcomponents` reports the full set of projection, split,
-compute, and output subcomponents. Candidate compute uses the `gdn.compute_candidate_state` key. Normal recurrent
-compute uses the `gdn.compute` key.
+`--candidate-states` materializes the final prefill row and every decode row into distinct candidate slots.
+It selects the production mixed candidate-state path. `--subcomponents` reports projection, split, compute, and
+output subcomponents. Candidate compute uses the `gdn.compute_mixed_candidate_state` key. Final-only compute uses
+the `gdn.compute_mixed` key.
 
 For current GDN paths, the source state slot represents prior history. The bench reports `ctx` for comparison hygiene.
 The value does not change recurrent kernel metadata yet. Invalid batch-shape combinations print a structured `skip` line.
@@ -1339,3 +1399,208 @@ cargo bench -p inference-backend-metal --bench gdn_attn -- 'metal/gdn-attn/core-
 
 Shared GPU serialization, benchmark metrics, and performance-evidence rules are in
 [`executor_benchmarks.md`](executor_benchmarks.md).
+
+
+## Fixed mixed replay verification: 2026-09-07
+
+This comparison measures one complete GDN layer with real Qwen3.6-35B-A3B weights.
+It does not measure a whole-model speedup.
+
+Provenance:
+
+- Measured base: `45c86d920cbd0d74d10c36c9aa22257a720bc5b1`, with dirty implementation and benchmark changes.
+  The tested source is preserved by `abd44a31` and `87a51b8c`.
+- Machine: Mac15,9, 16 CPU cores, 48 GiB, arm64, macOS 27.0 (`26A5425a`).
+- Power: Battery Power, 89%, discharging. Codex was active and the user reported concurrent GPU use.
+  Treat these as relative results under that shared workload.
+- Model: `/Users/wenquanxing/Workspace/models/Qwen3.6-35B-A3B-4bit`.
+- Environment: `RUST_LOG=warn`. No GPU timestamps or force-sync profiling.
+- Release benchmark SHA256: `dac338c62a910be36bddd44621f73ddf76703ca7210f20f67ab948741ba6a6c6`.
+- Local artifacts: `/private/tmp/psi-gdn-mixed`. This directory contains `provenance.json`, `source.patch`,
+  `commands.json`, `results.json`, and the raw logs. Temporary artifacts are local to this machine.
+
+The baseline records the previous full recurrent graph through the current legacy invocation APIs.
+It has seven commands and no empty chunk dispatch. It is not a historical executable.
+The candidate records the production fixed mixed graph with eight commands.
+Both use one replay execution and one completion wait per layer.
+Both use the same weights, input buffers, and immutable source-state slots.
+The candidate graph saves each Decode candidate row and only the final Prefill row in these fixtures.
+
+Each iteration alternates which graph runs first. Each run has ten warmup pairs and 100 measured pairs.
+Five runs produce five paired ratios. The metric is ordinary replay wall time, including submit and wait.
+The percentage column is the median of the five candidate/baseline ratios, minus one.
+It is not the ratio of the two independently calculated median-time columns.
+
+```sh
+RUST_LOG=warn cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-35B-A3B-4bit \
+  --tokens-per-req 128,128,1,4 --prefill-requests 2 --contexts 32 \
+  --candidate-states --compare-recurrent --warmup-iters 10 --iters 100 --runs 5
+```
+
+The measurements invoked the saved release executable directly with the same arguments.
+The table gives the request lengths and prefill-prefix count for each command variant.
+All GPU commands ran serially.
+
+| Tokens per request | Prefill requests | Recurrent median (us) | Mixed median (us) | Paired wall-time change |
+| --- | ---: | ---: | ---: | ---: |
+| `1` | 0 | 308.554 | 309.882 | -0.17% |
+| `1,1,1,1` | 0 | 399.914 | 402.548 | +0.47% |
+| `4,4,4,4` | 0 | 597.977 | 598.691 | +1.67% |
+| `7,8,9` | 3 | 690.446 | 704.000 | +0.82% |
+| `128` | 1 | 1594.107 | 1482.272 | -6.93% |
+| `9,7,1,4` | 2 | 697.025 | 712.408 | +1.94% |
+| `128,128,1,4` | 2 | 2961.659 | 2781.420 | -6.05% |
+
+Paired candidate/baseline ratios:
+
+| Tokens per request | Ratios by run |
+| --- | --- |
+| `1` | `0.982180, 0.993354, 1.000208, 1.004304, 0.998305` |
+| `1,1,1,1` | `1.002889, 0.976741, 1.006196, 1.021392, 1.004709` |
+| `4,4,4,4` | `1.023441, 0.996890, 1.016720, 0.989838, 1.026010` |
+| `7,8,9` | `1.028615, 1.003400, 1.008192, 1.007636, 1.020598` |
+| `128` | `0.931097, 0.930660, 0.933896, 0.927438, 0.925235` |
+| `9,7,1,4` | `1.019437, 1.020138, 1.022431, 1.005030, 1.018201` |
+| `128,128,1,4` | `0.939455, 0.935506, 0.935535, 0.939861, 0.941235` |
+
+Verdict: the 128-token Prefill and long mixed fixtures reduce full-layer wall time by about 6–7%.
+Decode and short fixtures range from -0.17% to +1.94%. These small differences do not establish a general Decode gain.
+Some short fixtures are slightly slower. These measurements do not isolate empty-branch cost from timing variation
+or chunkwise work. The result supports this fixed graph as a starting point for the measured workloads.
+
+All seven fixtures pass the untimed comparison. Decode hidden outputs and recurrent states match exactly.
+For fixtures with Prefill, the largest hidden-output absolute error is `0.00024414` and the largest recurrent-state
+absolute error is `0.00006104`. The largest relative L2 errors are `0.00021685` and `0.00006020`, respectively.
+The benchmark also checks convolution results and source-state preservation.
+Chunkwise arithmetic reorders F32 operations before BF16 output rounding, so Prefill is not required to match bitwise.
+
+Correctness checks passed:
+
+- 19 Metal backend GDN tests.
+- 16 executor GDN owner, metadata, and state-lifecycle tests.
+- 129 executor-core tests and 301 runtime-core tests. Two shared-memory tests needed normal host permissions.
+- The final mixed backend regression also verifies that final-only execution ignores valid nonfinal state slots.
+- Real Main Prefill/Decode case-order, repeatability, and chunk-decomposition checks at two requests and contexts `0,32`.
+- `cargo +nightly fmt --all -- --check`, workspace check, workspace Clippy with `-D warnings`, and `git diff --check`.
+
+The real Main lifecycle check used this command:
+
+```sh
+RUST_LOG=warn cargo bench -p inference-executor-metal --bench qwen35_vanilla_prefill_decode -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-35B-A3B-4bit \
+  --cases prefill,decode --contexts 0,32 --prefill-tokens 32 --decode-tokens 2 \
+  --num-reqs 2 --max-tokens 64 --max-tokens-per-request 32 \
+  --num-tokens-per-block 2048 --num-cache-pages 16384 \
+  --temperature 0 --top-p 0 --warmup-iters 1 --iters 1 --runs 1
+```
+
+This Main run is a correctness and lifecycle check. Its absolute times are not a matched performance comparison.
+ReplaySSM and sequence-parallel chunkwise execution are not part of this change.
+
+## Concurrent mixed replay verification: 2026-09-07
+
+The GDN core commands now declare disjoint access to request-owned output rows and recurrent state slots.
+The recorded graph retains the common-input barrier and the output normalization barrier.
+Main still owns one complete replay. Both full-layer comparison graphs contain eight commands.
+
+### Provenance and method
+
+- Source baseline: `d9692e52bfb54574df6d4b4e90a0f108a3c71834`, with no production source changes at task start.
+  Unrelated documentation edits were present and remained separate from this change.
+- Measured current source: the same commit with the disjoint-access and barrier-encoding changes in the working tree.
+- Baseline binary SHA-256: `dac338c62a910be36bddd44621f73ddf76703ca7210f20f67ab948741ba6a6c6`.
+  This is the preserved serial mixed binary from the preceding verification.
+- Current binary SHA-256: `7f3b7ee3e4694f65c5fa06dc20db56e7fec526fb6322409f5f0ea70b4a05a75a`.
+- Model: `/Users/wenquanxing/Workspace/models/Qwen3.6-35B-A3B-4bit`.
+- Machine: Mac15,9, arm64, 16 CPU cores, 48 GiB memory, macOS 27.0 build 26A5425a.
+- Power: battery, 81% during screening and 80% to 79% during confirmation.
+  The user reported concurrent Codex GPU use and requested relative comparisons.
+- Environment: `RUST_LOG=warn`. GPU timestamps, force-sync, Metal debug layer, and shader validation were unset.
+- Artifacts: `/private/tmp/psi-gdn-concurrent` contains build logs, source snapshots, binary hashes, commands, and raw samples.
+  The `relative` and `relative-confirm` directories contain the two measurement sets.
+
+The baseline and current builds use the same chunkwise and recurrent kernels.
+The current build also calls `setBarrier()` before encoding the consumer dispatch, as the Apple API directs.
+The comparison therefore measures both synchronization changes together.
+It does not isolate the effect of the barrier API call order.
+
+The driver launches the two binaries serially in ABBA blocks. A is the serial baseline. B is the current build.
+This is a comparison between processes, not an interleaved comparison within one process.
+Each process uses the same deterministic inputs, real weights, request lengths, and initial state.
+The fixture uses context 32 and the production candidate-state mask: final Prefill row and every Decode row.
+Each internal timer includes replay submission and wait. It excludes model load, compilation, recording, and warmup.
+No production benchmark switch was added.
+
+For each ABBA block, the driver averages the two baseline process means and the two current process means.
+The reported change is the median of the block ratios minus one. Negative values mean less wall time.
+The screening run used two ABBA blocks, 10 warmup iterations, and 100 measured iterations per process.
+The confirmation run used three ABBA blocks, 50 warmup iterations, and 500 measured iterations per process.
+Confirmation focused on the variable Decode controls and the mixed case with an observed compute reduction.
+
+```sh
+python3 /private/tmp/psi-gdn-concurrent/run_relative.py \
+  --baseline /private/tmp/psi-gdn-concurrent/qwen35_gdn-serial \
+  --current /private/tmp/psi-gdn-concurrent/qwen35_gdn-concurrent \
+  --blocks 2 --output-dir /private/tmp/psi-gdn-concurrent/relative
+
+python3 /private/tmp/psi-gdn-concurrent/run_relative.py \
+  --baseline /private/tmp/psi-gdn-concurrent/qwen35_gdn-serial \
+  --current /private/tmp/psi-gdn-concurrent/qwen35_gdn-concurrent \
+  --blocks 3 --iters 500 --warmup-iters 50 \
+  --cases decode-b1,decode-b4,mixed-balanced --subcomponent-cases mixed-balanced \
+  --output-dir /private/tmp/psi-gdn-concurrent/relative-confirm
+```
+
+### Relative observations
+
+The screening results measure the complete GDN layer, including both projections.
+
+| Request lengths | Prefill requests | Median wall-time change | Block change range |
+| --- | ---: | ---: | ---: |
+| `1` | 0 | -8.95% | -13.83% to -4.07% |
+| `1,1,1,1` | 0 | +3.58% | +3.47% to +3.68% |
+| `9,7,1,4` | 2 | -1.89% | -4.21% to +0.42% |
+| `128,128,1,4` | 2 | -0.07% | -0.57% to +0.42% |
+| `128,4,4,4` | 1 | -3.64% | -6.16% to -1.12% |
+| `128` | 1 | -0.90% | -1.41% to -0.39% |
+
+The longer confirmation produced these results.
+
+| Request lengths | Measured operation | Median wall-time change | Block change range |
+| --- | --- | ---: | ---: |
+| `1` | Complete GDN layer | -2.70% | -8.18% to +1.17% |
+| `1,1,1,1` | Complete GDN layer | -0.94% | -1.19% to +0.40% |
+| `128,4,4,4` | Complete GDN layer | -2.86% | -4.02% to -2.59% |
+| `128,4,4,4` | GDN compute | -6.05% | -6.16% to -5.38% |
+| `128,4,4,4` | QKVABZ projection | +0.32% | +0.13% to +0.49% |
+| `128,4,4,4` | QKVABZ split | +0.65% | +0.10% to +1.05% |
+| `128,4,4,4` | Output projection | +0.18% | -0.32% to +4.00% |
+
+GDN compute includes short convolution, state materialization, both core branches, and output normalization/gating.
+Its result is not a measurement of the fused chunk kernel alone.
+The complete `128,4,4,4` layer used baseline block means of 1788.348, 1772.829, and 1759.244 microseconds.
+Its current block means were 1716.411, 1722.102, and 1713.677 microseconds.
+
+Verdict: the confirmed mixed fixture reduces full-layer wall time by about 2.9% under these conditions.
+The long mixed screening fixture is approximately unchanged.
+The Decode control changes vary across runs, including a direction change for four requests.
+These observations do not establish a universal speedup or a Decode regression.
+The tests establish that the graph permits overlap. No GPU timeline was captured to quantify physical overlap.
+No whole-model performance comparison was made.
+
+### Correctness and integration
+
+- The mixed backend test reuses both graphs across dynamic Prefill counts, pure phases, empty branches, and ragged token counts.
+  The concurrent graph and the same kernels with serialized Decode produce identical bits in all five output and state buffers.
+  The CPU oracle, sparse state destinations, final-only state contract, and inactive canaries remain covered.
+- Four dependency tests verify entry and join hazards, partition history, scope isolation, unselected resources, and explicit barriers.
+- A GPU fork/join test executes two consecutive groups that reuse storage.
+  Eight active-count and split combinations include empty branches, padded capacity, and full capacity.
+  All outputs and canaries match the CPU result.
+- All 161 backend tests passed, including 19 GDN tests and 24 shared-stream tests.
+  All 16 executor GDN tests also passed.
+- The real 35B Main lifecycle passed case-order and chunk-consistency checks for two requests at contexts 0 and 32.
+  It used 32 Prefill tokens per request and two Decode tokens per request with greedy sampling.
+  This run verifies integration only. Its timings are not part of the relative comparison.
+- Formatting, workspace check, and workspace Clippy with `-D warnings` passed.

@@ -32,9 +32,9 @@ use crate::replay::Replay;
 use crate::replay::ReplayComponent;
 
 const NUM_TOTAL_REQUESTS: u32 = 8;
-const NUM_TOTAL_TOKENS: u32 = 8;
+const NUM_TOTAL_TOKENS: u32 = 32;
 const NUM_SOURCE_STATE_SLOTS: usize = 8;
-const NUM_STATE_SLOTS: usize = 16;
+const NUM_STATE_SLOTS: usize = NUM_SOURCE_STATE_SLOTS + NUM_TOTAL_TOKENS as usize + 1;
 const HIDDEN_DIM: usize = 32;
 const QK_HEAD_DIM: usize = 32;
 const V_HEAD_DIM: usize = 32;
@@ -69,73 +69,120 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
     let recurrent_state_arena = bf16_buffer(&device, &initial_recurrent_arena);
     let mut replay = Replay::new("test GDN", TestGDN(component));
     let mut recorded_keys = HashSet::new();
-    let cases = [(1_u32, 1_u32), (8, 4), (3, 2), (7, 3), (2, 1), (6, 4), (4, 3), (5, 2)];
+    let cases: &[(&[u32], u32)] = &[
+        (&[1], 0),
+        (&[2, 2, 2, 2], 4),
+        (&[3, 2, 2], 1),
+        (&[2, 1], 0),
+        (&[1, 1, 1, 1], 0),
+        (&[2, 2, 2, 2], 0),
+        (&[2, 2, 2, 2], 3),
+        (&[2, 2, 2, 2], 1),
+        (&[7, 8, 9], 3),
+        (&[9, 7, 1, 4], 2),
+        (&[9, 7, 1, 4], 0),
+        (&[9, 7, 1, 4], 4),
+        (&[9, 7, 1, 4], 1),
+    ];
 
-    for (num_active_tokens, num_active_requests) in cases {
-        let cu_tokens = cumulative_tokens(num_active_tokens, num_active_requests);
-        let source_slots = (0..num_active_requests).collect::<Vec<_>>();
-        let mut candidate_slots = vec![u32::MAX; num_active_tokens as usize];
-        for (request_index, &request_end) in cu_tokens.iter().skip(1).enumerate() {
-            candidate_slots[request_end as usize - 1] = NUM_SOURCE_STATE_SLOTS as u32 + request_index as u32;
+    for materialize_candidate_states in [false, true] {
+        for &(counts, num_active_chunkwise_requests) in cases {
+            let cu_tokens = cumulative_tokens(counts);
+            let num_active_tokens = *cu_tokens.last().unwrap();
+            let num_active_requests = counts.len() as u32;
+            let source_slots = (0..num_active_requests).collect::<Vec<_>>();
+            let mut recurrent_write_slots = vec![u32::MAX; num_active_tokens as usize];
+            let mut conv_write_slots = recurrent_write_slots.clone();
+            for window in cu_tokens.windows(2) {
+                for token_index in window[0]..window[1] {
+                    let is_final = token_index + 1 == window[1];
+                    if is_final || (materialize_candidate_states && token_index % 3 != 1) {
+                        recurrent_write_slots[token_index as usize] = NUM_SOURCE_STATE_SLOTS as u32 + token_index;
+                        conv_write_slots[token_index as usize] =
+                            NUM_SOURCE_STATE_SLOTS as u32 + NUM_TOTAL_TOKENS - 1 - token_index;
+                    }
+                }
+            }
+            let prepared = GDNPreparedRequestState {
+                src_recurrent_state_slots: source_slots.clone(),
+                src_conv_state_slots: source_slots,
+                flat_recurrent_state_write_slots: recurrent_write_slots,
+                flat_conv_state_write_slots: conv_write_slots,
+            };
+            let num_total_tokens = num_active_tokens.max(8);
+            let shape = replay.component().0.prepare(
+                &metadata,
+                &cu_tokens,
+                num_active_chunkwise_requests,
+                &prepared,
+                &policy,
+                num_total_tokens,
+            );
+            let input = GDNInput {
+                hidden_state: &hidden,
+                next_hidden_state: &next_hidden,
+                scratch: scratch.bindings(),
+                batch_metadata: &metadata,
+                state: GDNLayerStateBindings {
+                    conv_state: &conv_state_arena,
+                    conv_state_offset_bytes: 0,
+                    next_conv_state: &conv_state_arena,
+                    next_conv_state_offset_bytes: 0,
+                    recurrent_state_arena: &recurrent_state_arena,
+                    recurrent_state_arena_offset_bytes: 0,
+                },
+                materialize_candidate_states,
+                weights: weights.bindings(),
+                num_active_tokens: ReplayU32::Parameter(GDN_NUM_ACTIVE_TOKENS),
+            };
+            let (key, cache_hit) = replay.record(&runtime, &input);
+            let seen = !recorded_keys.insert(key);
+            assert_eq!(cache_hit, seen);
+
+            let previous_conv = read_bf16_values(&conv_state_arena, initial_conv_arena.len());
+            let previous_recurrent = read_bf16_values(&recurrent_state_arena, initial_recurrent_arena.len());
+            let previous_output = read_bf16_values(&next_hidden, hidden_values.len());
+            let mut arguments = ReplayArguments::new();
+            add_gdn_replay_arguments(shape, num_active_chunkwise_requests, &mut arguments);
+            runtime
+                .submit_replay_with_arguments(replay.replay(&key), &arguments)
+                .wait();
+
+            let reference = gdn_reference(
+                &core,
+                config,
+                &cu_tokens,
+                &prepared,
+                &hidden_values,
+                &source_conv,
+                &source_recurrent,
+                &previous_conv,
+                &previous_recurrent,
+                &weights,
+            );
+            let actual_output = read_bf16_values(&next_hidden, hidden_values.len());
+            assert_close(&actual_output[..reference.output.len()], &reference.output, 0.0625);
+            assert_eq!(
+                &actual_output[reference.output.len()..],
+                &previous_output[reference.output.len()..]
+            );
+            let actual_conv = read_bf16_values(&conv_state_arena, initial_conv_arena.len());
+            let actual_recurrent = read_bf16_values(&recurrent_state_arena, initial_recurrent_arena.len());
+            assert_close(&actual_conv, &reference.conv_state_arena, 0.0025);
+            assert_close(&actual_recurrent, &reference.recurrent_state_arena, 0.0025);
+            assert_unchanged_slots(
+                &actual_conv,
+                &previous_conv,
+                &prepared.flat_conv_state_write_slots,
+                conv_stride,
+            );
+            assert_unchanged_slots(
+                &actual_recurrent,
+                &previous_recurrent,
+                &prepared.flat_recurrent_state_write_slots,
+                recurrent_stride,
+            );
         }
-        let prepared = GDNPreparedRequestState {
-            src_recurrent_state_slots: source_slots.clone(),
-            src_conv_state_slots: source_slots,
-            flat_recurrent_state_write_slots: candidate_slots.clone(),
-            flat_conv_state_write_slots: candidate_slots,
-        };
-        let shape = replay
-            .component()
-            .0
-            .prepare(&metadata, &cu_tokens, &prepared, &policy, NUM_TOTAL_TOKENS);
-        let topology = replay.component().0.replay_topology(&metadata, true);
-        let input = GDNInput {
-            hidden_state: &hidden,
-            next_hidden_state: &next_hidden,
-            scratch: scratch.bindings(),
-            batch_metadata: &metadata,
-            state: GDNLayerStateBindings {
-                conv_state: &conv_state_arena,
-                conv_state_offset_bytes: 0,
-                next_conv_state: &conv_state_arena,
-                next_conv_state_offset_bytes: 0,
-                recurrent_state_arena: &recurrent_state_arena,
-                recurrent_state_arena_offset_bytes: 0,
-            },
-            materialize_candidate_states: true,
-            weights: weights.bindings(),
-            num_active_tokens: ReplayU32::Parameter(GDN_NUM_ACTIVE_TOKENS),
-        };
-        let (key, cache_hit) = replay.record(&runtime, &input);
-        let seen = !recorded_keys.insert(key);
-        assert_eq!(cache_hit, seen);
-
-        write_bf16_values(&conv_state_arena, &initial_conv_arena);
-        write_bf16_values(&recurrent_state_arena, &initial_recurrent_arena);
-        next_hidden.zero_bytes(0, next_hidden.len_bytes());
-        let mut arguments = ReplayArguments::new();
-        add_gdn_replay_arguments(shape, &mut arguments);
-        runtime
-            .submit_replay_with_arguments(replay.replay(&key), &arguments)
-            .wait();
-
-        let reference = gdn_reference(
-            &core,
-            config,
-            &cu_tokens,
-            &hidden_values,
-            &source_conv,
-            &source_recurrent,
-            &initial_conv_arena,
-            &initial_recurrent_arena,
-            &weights,
-        );
-        let actual_output = read_bf16_values(&next_hidden, reference.output.len());
-        assert_close(&actual_output, &reference.output, 0.0625);
-        let actual_conv = read_bf16_values(&conv_state_arena, initial_conv_arena.len());
-        let actual_recurrent = read_bf16_values(&recurrent_state_arena, initial_recurrent_arena.len());
-        assert_close(&actual_conv, &reference.conv_state_arena, 0.0025);
-        assert_close(&actual_recurrent, &reference.recurrent_state_arena, 0.0025);
     }
 }
 
@@ -246,6 +293,7 @@ fn gdn_reference(
     core: &GDNCore,
     config: GDNMetalConfig,
     cu_tokens: &[u32],
+    prepared: &GDNPreparedRequestState,
     hidden: &[f32],
     source_conv: &[f32],
     source_recurrent: &[f32],
@@ -319,16 +367,46 @@ fn gdn_reference(
     ));
     let mut conv_state_arena = bf16_round_trip(initial_conv_arena);
     let mut recurrent_state_arena = bf16_round_trip(initial_recurrent_arena);
-    for request_index in 0..num_requests {
-        let candidate_slot = NUM_SOURCE_STATE_SLOTS + request_index;
-        conv_state_arena[candidate_slot * conv_stride..(candidate_slot + 1) * conv_stride].copy_from_slice(
-            &bf16_round_trip(&conv.next_conv_state)[request_index * conv_stride..(request_index + 1) * conv_stride],
-        );
-        recurrent_state_arena[candidate_slot * recurrent_stride..(candidate_slot + 1) * recurrent_stride]
-            .copy_from_slice(
-                &bf16_round_trip(&recurrent.next_recurrent_state)
-                    [request_index * recurrent_stride..(request_index + 1) * recurrent_stride],
+    for (request_index, window) in cu_tokens.windows(2).enumerate() {
+        let request_start = window[0] as usize;
+        for token_index in request_start..window[1] as usize {
+            let conv_slot = prepared.flat_conv_state_write_slots[token_index];
+            let recurrent_slot = prepared.flat_recurrent_state_write_slots[token_index];
+            if conv_slot == u32::MAX && recurrent_slot == u32::MAX {
+                continue;
+            }
+            let prefix_tokens = [0, (token_index + 1 - request_start) as u32];
+            let prefix_conv = gdn_short_conv_reference(
+                core,
+                &prefix_tokens,
+                &quantized_source_conv[request_index * conv_stride..(request_index + 1) * conv_stride],
+                &qkv[request_start * core.qkv_dim()..(token_index + 1) * core.qkv_dim()],
+                &quantized_conv_weight,
             );
+            let prefix_recurrent = gdn_recurrent_reference(
+                core,
+                GDNRecurrentReferenceInput {
+                    cu_tokens: &prefix_tokens,
+                    source_recurrent_state: &quantized_source_recurrent
+                        [request_index * recurrent_stride..(request_index + 1) * recurrent_stride],
+                    conv_qkv: &bf16_round_trip(&prefix_conv.conv_qkv),
+                    a: &a[request_start * core.num_v_heads..(token_index + 1) * core.num_v_heads],
+                    b: &b[request_start * core.num_v_heads..(token_index + 1) * core.num_v_heads],
+                    a_log: &quantized_a_log,
+                    dt_bias: &quantized_dt_bias,
+                },
+            );
+            if conv_slot != u32::MAX {
+                let start = conv_slot as usize * conv_stride;
+                conv_state_arena[start..start + conv_stride]
+                    .copy_from_slice(&bf16_round_trip(&prefix_conv.next_conv_state));
+            }
+            if recurrent_slot != u32::MAX {
+                let start = recurrent_slot as usize * recurrent_stride;
+                recurrent_state_arena[start..start + recurrent_stride]
+                    .copy_from_slice(&bf16_round_trip(&prefix_recurrent.next_recurrent_state));
+            }
+        }
     }
     GDNReference {
         output,
@@ -362,13 +440,10 @@ fn fixture_config() -> GDNMetalConfig {
     }
 }
 
-fn cumulative_tokens(num_tokens: u32, num_requests: u32) -> Vec<u32> {
-    let base = num_tokens / num_requests;
-    let remainder = num_tokens % num_requests;
-    let mut cumulative = Vec::with_capacity(num_requests as usize + 1);
+fn cumulative_tokens(counts: &[u32]) -> Vec<u32> {
+    let mut cumulative = Vec::with_capacity(counts.len() + 1);
     cumulative.push(0);
-    for request_index in 0..num_requests {
-        let count = base + u32::from(request_index < remainder);
+    for &count in counts {
         cumulative.push(cumulative.last().copied().unwrap() + count);
     }
     cumulative
@@ -437,16 +512,6 @@ fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
         .collect()
 }
 
-fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
-    buffer.write_typed(
-        0,
-        &values
-            .iter()
-            .map(|&value| bf16::from_f32(value).to_bits())
-            .collect::<Vec<_>>(),
-    );
-}
-
 fn f32_to_bf16(value: f32) -> bf16 {
     bf16::from_f32(value)
 }
@@ -457,6 +522,18 @@ fn bf16_to_f32(value: bf16) -> f32 {
 
 fn bf16_round_trip(values: &[f32]) -> Vec<f32> {
     values.iter().map(|&value| bf16_to_f32(f32_to_bf16(value))).collect()
+}
+
+fn assert_unchanged_slots(actual: &[f32], previous: &[f32], write_slots: &[u32], stride: usize) {
+    for slot in 0..NUM_STATE_SLOTS {
+        if !write_slots.contains(&(slot as u32)) {
+            assert_eq!(
+                &actual[slot * stride..(slot + 1) * stride],
+                &previous[slot * stride..(slot + 1) * stride],
+                "inactive state slot {slot} changed",
+            );
+        }
+    }
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

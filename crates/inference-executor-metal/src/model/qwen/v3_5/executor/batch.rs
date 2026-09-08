@@ -12,6 +12,7 @@ impl Qwen35Executor {
             self.config.max_tokens,
             core_batch_req.token_cost()
         );
+        let max_spec_tokens = self.num_spec_tokens();
         for request in &core_batch_req.dev_reqs {
             assert!(
                 request.decoder_query_tokens.token_consumption() <= self.config.max_tokens_per_request,
@@ -20,17 +21,14 @@ impl Qwen35Executor {
                 self.config.max_tokens_per_request
             );
             let num_spec_tokens = request.decoder_query_tokens.num_spec_tokens();
-            let max_spec_tokens = self.num_spec_tokens();
-            if max_spec_tokens == 0 {
-                assert_eq!(
-                    num_spec_tokens, 0,
-                    "qwen3.5 executor without a speculator does not accept speculative input tokens"
-                );
-            } else {
-                assert!(
-                    num_spec_tokens <= max_spec_tokens,
-                    "qwen3.5 speculative-token count exceeds speculator capacity"
-                );
+            assert!(
+                num_spec_tokens <= max_spec_tokens,
+                "qwen3.5 speculative-token count exceeds speculator capacity"
+            );
+            if num_spec_tokens > 0 {
+                let num_fixed_tokens = request.decoder_query_tokens.token_consumption() - num_spec_tokens;
+                assert!(!self.main_gdn_state.backend().uses_chunkwise(num_fixed_tokens, 0),
+                    "qwen3.5 speculative input exceeds the GDN fixed-token replay window");
             }
         }
         let max_context_tokens = core_batch_req

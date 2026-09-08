@@ -2,7 +2,9 @@ use std::fs::File;
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::time::Instant;
 
+use half::bf16;
 use inference_backend_metal::components::gdn::compute as backend_compute;
 use inference_backend_metal::components::gdn::qkvabz_split as backend_qkvabz_split;
 use inference_backend_metal::metal::Buffer;
@@ -48,6 +50,7 @@ use crate::gdn_qkvabz_affine_config;
 use crate::gdn_recurrent_state_fixture;
 use crate::hidden_fixture;
 use crate::measure_runs;
+use crate::median;
 use crate::print_named_perf;
 use crate::print_perf;
 use crate::print_skip;
@@ -72,25 +75,42 @@ pub fn run(args: Args) {
         args.contexts
     };
 
-    for num_tokens in args.tokens {
-        for &num_reqs in &args.num_reqs {
-            if !valid_num_reqs(num_tokens, num_reqs) {
-                print_skip(num_tokens, num_reqs, None, None, "num_reqs_exceeds_tokens");
-                continue;
-            }
-            for &existing_context_len in &contexts {
-                let fixture = RealGDNFixture::new(
-                    &device,
-                    num_tokens,
-                    num_reqs,
-                    existing_context_len,
-                    args.candidate_states,
-                    &weights,
-                );
-                fixture.measure(args.warmup_iters, args.iters, args.runs);
-                if args.subcomponents {
-                    fixture.measure_subcomponents(args.warmup_iters, args.iters, args.runs);
+    let request_shapes = if let Some(counts) = args.tokens_per_req {
+        vec![counts]
+    } else {
+        let mut shapes = Vec::new();
+        for num_tokens in args.tokens {
+            for &num_reqs in &args.num_reqs {
+                if !valid_num_reqs(num_tokens, num_reqs) {
+                    print_skip(num_tokens, num_reqs, None, None, "num_reqs_exceeds_tokens");
+                    continue;
                 }
+                shapes.push(request_token_counts(num_tokens, num_reqs));
+            }
+        }
+        shapes
+    };
+    for num_tokens_per_req in request_shapes {
+        for &existing_context_len in &contexts {
+            let fixture = RealGDNFixture::new(
+                &device,
+                &num_tokens_per_req,
+                args.prefill_requests,
+                existing_context_len,
+                args.candidate_states,
+                &weights,
+            );
+            println!(
+                "bench_shape component=gdn tokens_per_req={num_tokens_per_req:?} prefill_requests={}",
+                args.prefill_requests
+            );
+            if args.compare_recurrent {
+                fixture.measure_recurrent_comparison(args.warmup_iters, args.iters, args.runs);
+            } else {
+                fixture.measure(args.warmup_iters, args.iters, args.runs);
+            }
+            if args.subcomponents {
+                fixture.measure_subcomponents(args.warmup_iters, args.iters, args.runs);
             }
         }
     }
@@ -101,6 +121,7 @@ struct RealGDNFixture<'a> {
     stream: Stream,
     num_tokens: u32,
     num_reqs: u32,
+    num_prefill_requests: u32,
     existing_context_len: u32,
     materialize_candidate_states: bool,
     next_hidden_state: Buffer,
@@ -124,12 +145,14 @@ struct RealGDNFixture<'a> {
 impl<'a> RealGDNFixture<'a> {
     fn new(
         device: &Device,
-        num_tokens: u32,
-        num_reqs: u32,
+        num_tokens_per_req: &[u32],
+        num_prefill_requests: u32,
         existing_context_len: u32,
         materialize_candidate_states: bool,
         weights: &'a RealGDNWeights,
     ) -> Self {
+        let num_tokens = num_tokens_per_req.iter().sum();
+        let num_reqs = u32::try_from(num_tokens_per_req.len()).expect("request count must fit u32");
         assert!(
             valid_num_reqs(num_tokens, num_reqs),
             "GDN bench requires 1 <= num_reqs <= num_tokens"
@@ -158,18 +181,24 @@ impl<'a> RealGDNFixture<'a> {
         let hidden_state = Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM));
         let next_hidden_state =
             Buffer::new_zeroed(device, num_tokens as usize * HIDDEN_DIM * Dtype::Bfloat16.item_size());
-        let num_tokens_per_req = request_token_counts(num_tokens, num_reqs);
         let batch_metadata = GDNMetadataBuffers::new(device, num_reqs as usize, num_tokens as usize);
-        let cu_tokens = cu_tokens(&num_tokens_per_req)
+        let cu_tokens = cu_tokens(num_tokens_per_req)
             .into_iter()
             .map(|value| value as u32)
             .collect::<Vec<_>>();
         let mut flat_materialized_state_slots = vec![u32::MAX; num_tokens as usize];
         if materialize_candidate_states {
-            for (flat_token_index, state_slot) in flat_materialized_state_slots.iter_mut().enumerate() {
-                *state_slot = num_reqs
-                    .checked_add(u32::try_from(flat_token_index).expect("GDN bench flat token index must fit u32"))
-                    .expect("GDN bench candidate state slot ID must fit u32");
+            for (req_index, window) in cu_tokens.windows(2).enumerate() {
+                let first_write = if req_index < num_prefill_requests as usize {
+                    window[1] - 1
+                } else {
+                    window[0]
+                };
+                for flat_token_index in first_write..window[1] {
+                    flat_materialized_state_slots[flat_token_index as usize] = num_reqs
+                        .checked_add(flat_token_index)
+                        .expect("GDN bench candidate state slot ID must fit u32");
+                }
             }
         } else {
             for (req_index, &flat_end) in cu_tokens.iter().skip(1).enumerate() {
@@ -180,6 +209,7 @@ impl<'a> RealGDNFixture<'a> {
         }
         batch_metadata.update(
             &cu_tokens,
+            num_prefill_requests,
             &(0..num_reqs).collect::<Vec<_>>(),
             &(0..num_reqs).collect::<Vec<_>>(),
             &flat_materialized_state_slots,
@@ -261,6 +291,7 @@ impl<'a> RealGDNFixture<'a> {
             stream,
             num_tokens,
             num_reqs,
+            num_prefill_requests,
             existing_context_len,
             materialize_candidate_states,
             next_hidden_state,
@@ -296,13 +327,246 @@ impl<'a> RealGDNFixture<'a> {
             self.num_reqs,
             Some(self.existing_context_len),
             Some(if self.materialize_candidate_states {
-                "forward_candidate_state"
+                "mixed_candidate_state"
             } else {
-                "ragged_recurrent"
+                "mixed"
             }),
             iters,
             &samples,
         );
+    }
+
+    fn measure_recurrent_comparison(&self, warmup_iters: usize, iters: usize, runs: usize) {
+        let recurrent = self.recurrent_replay();
+        let replays = [&recurrent, &self.replay];
+        let run = |index: usize| self.stream.submit_replay(replays[index]).wait();
+        let read = |buffer: &Buffer| buffer.read_typed::<u16>(0, buffer.len_bytes() / size_of::<u16>());
+        let initial_recurrent = read(&self.recurrent_state_arena);
+        let initial_conv = read(&self.next_conv_state);
+        run(0);
+        let expected_hidden = read(&self.next_hidden_state);
+        let expected_recurrent = read(&self.recurrent_state_arena);
+        let expected_conv = read(&self.next_conv_state);
+        self.recurrent_state_arena.write_typed(0, &initial_recurrent);
+        self.next_conv_state.write_typed(0, &initial_conv);
+        run(1);
+        let actual_hidden = read(&self.next_hidden_state);
+        let actual_recurrent = read(&self.recurrent_state_arena);
+        assert_eq!(
+            read(&self.next_conv_state),
+            expected_conv,
+            "short convolution must remain unchanged"
+        );
+        let source_state_len = self.num_reqs as usize * GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM;
+        assert_eq!(
+            &actual_recurrent[..source_state_len],
+            &initial_recurrent[..source_state_len]
+        );
+        assert_eq!(
+            &expected_recurrent[..source_state_len],
+            &initial_recurrent[..source_state_len]
+        );
+        let prefill_tokens = self
+            .batch_metadata
+            .cu_tokens()
+            .read_typed::<u32>(self.num_prefill_requests as usize, 1)[0] as usize;
+        assert_eq!(
+            &actual_hidden[prefill_tokens * HIDDEN_DIM..],
+            &expected_hidden[prefill_tokens * HIDDEN_DIM..],
+            "the unchanged recurrent decode branch must preserve output bits",
+        );
+        let state_stride = GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM;
+        let write_slots = self
+            .batch_metadata
+            .flat_recurrent_state_write_slots()
+            .read_typed::<u32>(0, self.num_tokens as usize);
+        for &slot in &write_slots[prefill_tokens..] {
+            if slot != u32::MAX {
+                let start = slot as usize * state_stride;
+                assert_eq!(
+                    &actual_recurrent[start..start + state_stride],
+                    &expected_recurrent[start..start + state_stride]
+                );
+            }
+        }
+        for (name, actual, expected, absolute_tolerance) in [
+            ("hidden", &actual_hidden, &expected_hidden, 0.0625_f32),
+            ("recurrent_state", &actual_recurrent, &expected_recurrent, 0.005_f32),
+        ] {
+            let mut max_absolute_error = 0.0_f32;
+            let mut squared_error = 0.0_f64;
+            let mut squared_reference = 0.0_f64;
+            for (&actual, &expected) in actual.iter().zip(expected) {
+                let actual = bf16::from_bits(actual).to_f32();
+                let expected = bf16::from_bits(expected).to_f32();
+                let error = (actual - expected).abs();
+                assert!(actual.is_finite() && expected.is_finite());
+                assert!(
+                    error <= absolute_tolerance + 0.02 * expected.abs(),
+                    "{name}: {actual} != {expected}"
+                );
+                max_absolute_error = max_absolute_error.max(error);
+                squared_error += f64::from(error).powi(2);
+                squared_reference += f64::from(expected).powi(2);
+            }
+            println!(
+                "bench_check component=gdn check=recurrent-comparison tensor={name} max_abs={max_absolute_error:.8} \
+                 relative_l2={:.8} status=pass",
+                (squared_error / squared_reference.max(f64::MIN_POSITIVE)).sqrt()
+            );
+        }
+        println!(
+            "bench_compare component=gdn baseline_commands={} mixed_commands={} prefill_requests={} \
+             candidate_states={} order=alternating",
+            recurrent.command_count(),
+            self.replay.command_count(),
+            self.num_prefill_requests,
+            self.materialize_candidate_states
+        );
+        let mut samples = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
+        for run_index in 0..runs {
+            for iteration in 0..warmup_iters {
+                let first = (run_index + iteration) % 2;
+                run(first);
+                run(1 - first);
+            }
+            let mut elapsed = [0.0; 2];
+            for iteration in 0..iters {
+                let first = (run_index + iteration) % 2;
+                for index in [first, 1 - first] {
+                    let start = Instant::now();
+                    run(index);
+                    elapsed[index] += start.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
+                }
+            }
+            for index in 0..2 {
+                samples[index].push(elapsed[index]);
+            }
+        }
+        for (name, sample) in ["recurrent", "mixed"].into_iter().zip(&samples) {
+            print_perf(
+                self.num_tokens,
+                self.num_reqs,
+                Some(self.existing_context_len),
+                Some(name),
+                iters,
+                sample,
+            );
+        }
+        let ratios = samples[1]
+            .iter()
+            .zip(&samples[0])
+            .map(|(mixed, recurrent)| mixed / recurrent)
+            .collect::<Vec<_>>();
+        println!(
+            "bench_compare component=gdn mixed_over_recurrent={:.6} ratios={ratios:?}",
+            median(&ratios)
+        );
+    }
+
+    fn recurrent_replay(&self) -> ReplayProgram {
+        let device = &self.device;
+        let mut builder = self.stream.create_replay_program();
+        let qkvabz_config = gdn_qkvabz_affine_config();
+        let qkvabz = affine_quantized::Matmul::new(device, qkvabz_config);
+        let qkvabz_to_qkv_a_b_z = backend_qkvabz_split::Compute::new(
+            device,
+            backend_qkvabz_split::Config::new(
+                GDN_CONV_DIM.try_into().expect("GDN qkv_dim must fit u32"),
+                GDN_V_HEADS.try_into().expect("GDN V heads must fit u32"),
+                GDN_V_DIM.try_into().expect("GDN V dim must fit u32"),
+            ),
+        );
+        let compute = backend_compute::Compute::new(device, gdn_compute_config());
+        let output_config = gdn_output_affine_config();
+        let output = affine_quantized::Matmul::new(device, output_config);
+
+        builder.record_with_barrier_before(qkvabz.invoke(
+            self.num_tokens,
+            ReplayU32::Fixed(self.num_tokens),
+            &self.qkvabz,
+            0,
+            &self.hidden_state,
+            0,
+            &self.weights.qkvabz_weight,
+            0,
+            &self.weights.qkvabz_scales,
+            0,
+            &self.weights.qkvabz_biases,
+            0,
+        ));
+        builder.record_with_barrier_before(qkvabz_to_qkv_a_b_z.invoke(
+            backend_qkvabz_split::Shape {
+                num_total_tokens: self.num_tokens,
+            },
+            backend_qkvabz_split::Buffers {
+                qkvabz: &self.qkvabz,
+                qkv: &self.qkv,
+                a: &self.a,
+                b: &self.b,
+                z: &self.z,
+            },
+            ReplayU32::Fixed(self.num_tokens),
+        ));
+        let compute_shape = backend_compute::Shape {
+            num_total_reqs: self.num_reqs,
+            num_total_tokens: self.num_tokens,
+        };
+        let compute_buffers = backend_compute::Buffers {
+            qkv: &self.qkv,
+            a: &self.a,
+            b: &self.b,
+            z: &self.z,
+            conv_weight: &self.weights.conv_weight,
+            norm_weight: &self.weights.norm_weight,
+            a_log: &self.weights.a_log,
+            dt_bias: &self.weights.dt_bias,
+            cu_tokens: self.batch_metadata.cu_tokens(),
+            src_recurrent_state_slots: self.batch_metadata.src_recurrent_state_slots(),
+            src_conv_state_slots: self.batch_metadata.src_conv_state_slots(),
+            flat_recurrent_state_write_slots: self.batch_metadata.flat_recurrent_state_write_slots(),
+            flat_conv_state_write_slots: self.batch_metadata.flat_conv_state_write_slots(),
+            conv_state: &self.conv_state,
+            conv_state_offset_bytes: 0,
+            next_conv_state: &self.next_conv_state,
+            next_conv_state_offset_bytes: 0,
+            recurrent_state_arena: &self.recurrent_state_arena,
+            recurrent_state_arena_offset_bytes: 0,
+            conv_qkv: &self.conv_qkv,
+            recurrent_output: &self.recurrent_output,
+            norm_gated_output: &self.norm_gated_output,
+        };
+        if self.materialize_candidate_states {
+            builder.record_with_barrier_before(compute.invoke_with_candidate_state_update(
+                compute_shape,
+                compute_buffers,
+                ReplayU32::Fixed(self.num_reqs),
+                ReplayU32::Fixed(self.num_tokens),
+            ))
+        } else {
+            builder.record_with_barrier_before(compute.invoke(
+                compute_shape,
+                compute_buffers,
+                ReplayU32::Fixed(self.num_reqs),
+                ReplayU32::Fixed(self.num_tokens),
+            ))
+        }
+        builder.record_with_barrier_before(output.invoke(
+            self.num_tokens,
+            ReplayU32::Fixed(self.num_tokens),
+            &self.next_hidden_state,
+            0,
+            &self.norm_gated_output,
+            0,
+            &self.weights.output_weight,
+            0,
+            &self.weights.output_scales,
+            0,
+            &self.weights.output_biases,
+            0,
+        ));
+
+        builder.build()
     }
 
     fn measure_subcomponents(&self, warmup_iters: usize, iters: usize, runs: usize) {
@@ -382,27 +646,17 @@ impl<'a> RealGDNFixture<'a> {
             recurrent_output: &self.recurrent_output,
             norm_gated_output: &self.norm_gated_output,
         };
-        let compute_replay = if self.materialize_candidate_states {
-            build_single_invocation_replay(
-                &self.stream,
-                compute.invoke_with_candidate_state_update(
-                    compute_shape,
-                    compute_buffers,
-                    ReplayU32::Fixed(self.num_reqs),
-                    ReplayU32::Fixed(self.num_tokens),
-                ),
-            )
-        } else {
-            build_single_invocation_replay(
-                &self.stream,
-                compute.invoke(
-                    compute_shape,
-                    compute_buffers,
-                    ReplayU32::Fixed(self.num_reqs),
-                    ReplayU32::Fixed(self.num_tokens),
-                ),
-            )
-        };
+        let compute_replay = build_single_invocation_replay(
+            &self.stream,
+            compute.invoke_mixed(
+                compute_shape,
+                compute_buffers,
+                ReplayU32::Fixed(self.num_reqs),
+                ReplayU32::Fixed(self.num_tokens),
+                ReplayU32::Fixed(self.num_prefill_requests),
+                self.materialize_candidate_states,
+            ),
+        );
         let output_replay = build_single_invocation_replay(
             &self.stream,
             output.invoke(
@@ -425,9 +679,9 @@ impl<'a> RealGDNFixture<'a> {
         self.measure_subcomponent("qkvabz-to-qkv-a-b-z", &split_replay, warmup_iters, iters, runs);
         self.measure_subcomponent(
             if self.materialize_candidate_states {
-                "compute_candidate_state"
+                "compute_mixed_candidate_state"
             } else {
-                "compute"
+                "compute_mixed"
             },
             &compute_replay,
             warmup_iters,

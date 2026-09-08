@@ -148,8 +148,9 @@ IDs as its sticky working set. Different compute slots can contain the same requ
 device batch must contain each request ID at most once.
 
 `BatchDeviceRequest::new` preserves the scheduler's request order. Core does not sort requests for model execution.
-`BatchDevReq::from_parts` may reorder complete requests without changing request identity or the scheduler's sticky order.
-Runtime core resolves responses by request ID.
+The model executor can reorder complete requests during `prepare_batch`, before it constructs component metadata.
+This packing order does not change the scheduler's request selection or sticky order.
+The same order reaches model commit and response construction. Runtime core continues to resolve responses by request ID.
 
 `SimpleScheduler` resolves only runnable sticky IDs. It skips IDs that are pending, terminal, swapped, or absent. It
 first creates immutable `ReqTokenInventory` values. It then allocates minimum validated, maximum validated, and

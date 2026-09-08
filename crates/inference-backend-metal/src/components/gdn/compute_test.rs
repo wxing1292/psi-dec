@@ -10,14 +10,17 @@ use inference_executor_core::attn::gdn::reference::gdn_short_conv_reference;
 use super::Buffers;
 use super::Compute;
 use super::Config;
+use super::MixedInvocation;
 use super::Registry;
 use super::Selector;
 use super::Shape;
 use super::VariantConstants;
 use super::VariantKey;
 use crate::metal::Buffer;
+use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Dtype;
+use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
@@ -26,9 +29,18 @@ use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_requests");
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_tokens");
+const NUM_ACTIVE_CHUNKWISE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("test.gdn_compute.num_active_chunkwise_requests");
 
 #[test]
-fn test_selector_returns_registered_recurrent_variant() {
+fn test_execution_segments() {
+    for (num_tokens, num_spec_tokens, chunkwise) in [(1, 0, false), (8, 0, false), (9, 0, true), (9, 1, false)] {
+        assert_eq!(super::uses_chunkwise(num_tokens, num_spec_tokens), chunkwise);
+    }
+}
+
+#[test]
+fn test_selector_returns_registered_mixed_variant() {
     let device = Device::system_default();
     let registry = Registry::new(&device, fixture_config());
 
@@ -40,7 +52,7 @@ fn test_selector_returns_registered_recurrent_variant() {
         },
     );
 
-    assert_eq!(key, VariantKey::Recurrent);
+    assert_eq!(key, VariantKey::Mixed);
     assert_eq!(variant.constants, VariantConstants::from_config(fixture_config()));
 }
 
@@ -514,6 +526,19 @@ fn test_candidate_state_preserves_distinct_source_slots() {
 
 #[test]
 fn test_candidate_replay_matches_reference_across_active_counts() {
+    for num_total_tokens in [8, 7] {
+        check_recurrent_replay_across_active_counts(num_total_tokens, true);
+    }
+}
+
+#[test]
+fn test_final_replay_matches_reference_across_active_counts() {
+    for num_total_tokens in [8, 7] {
+        check_recurrent_replay_across_active_counts(num_total_tokens, false);
+    }
+}
+
+fn check_recurrent_replay_across_active_counts(num_total_tokens: u32, candidate_states: bool) {
     const NUM_REQUESTS: usize = 8;
     const NUM_STATE_SLOTS: usize = NUM_REQUESTS * 3;
     const CANARY: f32 = -777.0;
@@ -521,7 +546,7 @@ fn test_candidate_replay_matches_reference_across_active_counts() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let config = fixture_config();
-    let shape = fixture_shape(NUM_REQUESTS as u32, NUM_REQUESTS as u32);
+    let shape = fixture_shape(NUM_REQUESTS as u32, num_total_tokens);
     let kernels = Compute::new(&device, config);
     let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
     let a_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
@@ -573,35 +598,45 @@ fn test_candidate_replay_matches_reference_across_active_counts() {
     let mut cache = ReplayTestCache::new();
     let (_, cache_hit) = cache.record(cache_key, || {
         let mut builder = stream.create_replay_program();
-        builder.record(kernels.invoke_with_candidate_state_update(
-            shape,
-            Buffers {
-                qkv: &qkv,
-                a: &a,
-                b: &b,
-                z: &z,
-                conv_weight: &conv_weight,
-                norm_weight: &norm_weight,
-                a_log: &a_log,
-                dt_bias: &dt_bias,
-                cu_tokens: &cu_tokens,
-                src_recurrent_state_slots: &src_state_slots,
-                src_conv_state_slots: &src_state_slots,
-                flat_recurrent_state_write_slots: &flat_materialized_state_slots,
-                flat_conv_state_write_slots: &flat_materialized_state_slots,
-                conv_state: &conv_state_arena,
-                conv_state_offset_bytes: 0,
-                next_conv_state: &conv_state_arena,
-                next_conv_state_offset_bytes: 0,
-                recurrent_state_arena: &recurrent_state_arena,
-                recurrent_state_arena_offset_bytes: 0,
-                conv_qkv: &conv_qkv,
-                recurrent_output: &recurrent_output,
-                norm_gated_output: &norm_gated_output,
-            },
-            ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
-            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-        ));
+        let buffers = Buffers {
+            qkv: &qkv,
+            a: &a,
+            b: &b,
+            z: &z,
+            conv_weight: &conv_weight,
+            norm_weight: &norm_weight,
+            a_log: &a_log,
+            dt_bias: &dt_bias,
+            cu_tokens: &cu_tokens,
+            src_recurrent_state_slots: &src_state_slots,
+            src_conv_state_slots: &src_state_slots,
+            flat_recurrent_state_write_slots: &flat_materialized_state_slots,
+            flat_conv_state_write_slots: &flat_materialized_state_slots,
+            conv_state: &conv_state_arena,
+            conv_state_offset_bytes: 0,
+            next_conv_state: &conv_state_arena,
+            next_conv_state_offset_bytes: 0,
+            recurrent_state_arena: &recurrent_state_arena,
+            recurrent_state_arena_offset_bytes: 0,
+            conv_qkv: &conv_qkv,
+            recurrent_output: &recurrent_output,
+            norm_gated_output: &norm_gated_output,
+        };
+        if candidate_states {
+            builder.record(kernels.invoke_with_candidate_state_update(
+                shape,
+                buffers,
+                ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ));
+        } else {
+            builder.record(kernels.invoke(
+                shape,
+                buffers,
+                ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ));
+        }
         builder.build()
     });
     assert!(!cache_hit);
@@ -610,7 +645,10 @@ fn test_candidate_replay_matches_reference_across_active_counts() {
     write_bf16(&b, 0, &b_values);
     write_bf16(&z, 0, &z_values);
 
-    for num_active in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+    for num_active in [1_usize, 8, 3, 7, 2, 6, 4, 5]
+        .into_iter()
+        .filter(|&count| count <= num_total_tokens as usize)
+    {
         let mut conv_arena_values = vec![CANARY; NUM_STATE_SLOTS * conv_state_stride];
         for req in 0..NUM_REQUESTS {
             let src_begin = req * conv_state_stride;
@@ -708,6 +746,345 @@ fn test_candidate_replay_matches_reference_across_active_counts() {
             &bf16_round_trip(&expected_recurrent_arena),
             5.0e-3,
         );
+    }
+}
+
+#[test]
+fn test_mixed_replay_matches_reference_across_prefill_decode_counts() {
+    assert_mixed_replay_matches_reference(
+        4,
+        32,
+        &[
+            (0, &[1]),
+            (4, &[9, 8, 7, 8]),
+            (1, &[17, 2, 3]),
+            (2, &[5, 11, 4, 2]),
+            (2, &[8, 9]),
+            (0, &[1, 4, 2, 3]),
+            (1, &[1]),
+        ],
+    );
+    // Request and token capacities are independent. An affine boundary can
+    // select fewer total tokens than total requests, with valid active work.
+    assert_mixed_replay_matches_reference(
+        8,
+        7,
+        &[
+            (0, &[1]),
+            (7, &[1, 1, 1, 1, 1, 1, 1]),
+            (1, &[2, 1]),
+            (0, &[1, 1, 1, 1, 1, 1, 1]),
+            (2, &[2, 3]),
+        ],
+    );
+}
+
+// Record the same kernels with an explicit dependency before decode. This
+// isolates scheduling from the CPU oracle's different floating-point order.
+struct SerialMixedInvocation<'a>(MixedInvocation<'a>);
+
+impl Operator for SerialMixedInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        let invocation = self.0;
+        let variant = invocation.variant;
+        variant.record_short_conv(
+            recorder,
+            invocation.shape,
+            &invocation.buffers,
+            invocation.num_active_reqs,
+            invocation.num_active_tokens,
+            !invocation.write_candidate_states,
+        );
+        if invocation.write_candidate_states {
+            variant.record_candidate_conv_state(
+                recorder,
+                invocation.shape,
+                &invocation.buffers,
+                invocation.num_active_reqs,
+                invocation.num_active_tokens,
+            );
+        }
+        variant.record_chunkwise_state(
+            recorder,
+            invocation.shape,
+            &invocation.buffers,
+            invocation.num_active_chunkwise_requests,
+            invocation.write_candidate_states,
+        );
+        recorder.record_with_barrier_before(SerialDecodeInvocation(&invocation));
+        variant.record_output_norm_gate(
+            recorder,
+            invocation.shape,
+            &invocation.buffers,
+            invocation.num_active_tokens,
+        );
+    }
+}
+
+struct SerialDecodeInvocation<'a>(&'a MixedInvocation<'a>);
+
+impl Operator for SerialDecodeInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        let invocation = self.0;
+        if invocation.write_candidate_states {
+            invocation.variant.record_candidate_recurrent_state(
+                recorder,
+                invocation.shape,
+                &invocation.buffers,
+                invocation.num_active_reqs,
+                invocation.num_active_chunkwise_requests,
+            );
+        } else {
+            invocation.variant.record_final_recurrent_state(
+                recorder,
+                invocation.shape,
+                &invocation.buffers,
+                invocation.num_active_reqs,
+                invocation.num_active_chunkwise_requests,
+            );
+        }
+    }
+}
+
+fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens: usize, rounds: &[(u32, &[u32])]) {
+    let num_state_slots = num_total_reqs + num_total_tokens;
+    const CANARY: f32 = -777.0;
+
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let config = fixture_config();
+    let shape = fixture_shape(num_total_reqs as u32, num_total_tokens as u32);
+    let kernels = Compute::new(&device, config);
+    let qkv_values = bf16_round_trip(&fixture_values(config.num_qkv_values(shape), 0.03125, 3));
+    let a_values = bf16_round_trip(&fixture_values(num_total_tokens, 0.0625, 5));
+    let b_values = bf16_round_trip(&fixture_values(num_total_tokens, 0.0625, 7));
+    let z_values = bf16_round_trip(&fixture_values(config.num_recurrent_output_values(shape), 0.03125, 11));
+    let conv_weight_values = bf16_round_trip(&fixture_values(
+        config.qkv_dim() as usize * config.conv_kernel_size as usize,
+        0.00390625,
+        13,
+    ));
+    let norm_weight_values = vec![1.0; config.v_head_dim as usize];
+    let a_log_values = vec![-0.25; config.num_v_heads as usize];
+    let dt_bias_values = vec![0.125; config.num_v_heads as usize];
+    let conv_stride = config.qkv_dim() as usize * config.conv_state_len() as usize;
+    let recurrent_stride = config.recurrent_state_stride();
+    let source_conv_states = bf16_round_trip(&fixture_values(num_total_reqs * conv_stride, 0.015625, 17));
+    let source_recurrent_states = bf16_round_trip(&fixture_values(num_total_reqs * recurrent_stride, 0.0078125, 19));
+    let qkv = bf16_buffer(&device, &qkv_values);
+    let a = bf16_buffer(&device, &a_values);
+    let b = bf16_buffer(&device, &b_values);
+    let z = bf16_buffer(&device, &z_values);
+    let conv_weight = bf16_buffer(&device, &conv_weight_values);
+    let norm_weight = bf16_buffer(&device, &norm_weight_values);
+    let a_log = bf16_buffer(&device, &a_log_values);
+    let dt_bias = bf16_buffer(&device, &dt_bias_values);
+    let cu_tokens = Buffer::from_slice(&device, &vec![u32::MAX; num_total_reqs + 1]);
+    let src_slots = Buffer::from_slice(&device, &(0..num_total_reqs as u32).collect::<Vec<_>>());
+    let recurrent_write_slots = Buffer::from_slice(&device, &vec![u32::MAX; num_total_tokens]);
+    let conv_write_slots = Buffer::from_slice(&device, &vec![u32::MAX; num_total_tokens]);
+    let conv_state = Buffer::new_zeroed_elements(&device, num_state_slots * conv_stride, Dtype::Bfloat16);
+    let recurrent_state = Buffer::new_zeroed_elements(&device, num_state_slots * recurrent_stride, Dtype::Bfloat16);
+    let conv_qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Bfloat16);
+    let recurrent_output =
+        Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Bfloat16);
+    let norm_gated_output =
+        Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Bfloat16);
+
+    let buffers = Buffers {
+        qkv: &qkv,
+        a: &a,
+        b: &b,
+        z: &z,
+        conv_weight: &conv_weight,
+        norm_weight: &norm_weight,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        cu_tokens: &cu_tokens,
+        src_recurrent_state_slots: &src_slots,
+        src_conv_state_slots: &src_slots,
+        flat_recurrent_state_write_slots: &recurrent_write_slots,
+        flat_conv_state_write_slots: &conv_write_slots,
+        conv_state: &conv_state,
+        conv_state_offset_bytes: 0,
+        next_conv_state: &conv_state,
+        next_conv_state_offset_bytes: 0,
+        recurrent_state_arena: &recurrent_state,
+        recurrent_state_arena_offset_bytes: 0,
+        conv_qkv: &conv_qkv,
+        recurrent_output: &recurrent_output,
+        norm_gated_output: &norm_gated_output,
+    };
+    for write_candidate_states in [false, true] {
+        let mut cache = ReplayTestCache::new();
+        for serialized in [false, true] {
+            let (_, hit) = cache.record(serialized, || {
+                let mut builder = stream.create_replay_program();
+                let invocation = kernels.invoke_mixed(
+                    shape,
+                    buffers,
+                    ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
+                    ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+                    ReplayU32::Parameter(NUM_ACTIVE_CHUNKWISE_REQUESTS),
+                    write_candidate_states,
+                );
+                if serialized {
+                    builder.record(SerialMixedInvocation(invocation));
+                } else {
+                    builder.record(invocation);
+                }
+                builder.build()
+            });
+            assert!(!hit);
+        }
+        for &(num_prefill, request_lengths) in rounds {
+            let mut cu_values = vec![0];
+            for &length in request_lengths {
+                cu_values.push(cu_values.last().unwrap() + length);
+            }
+            let num_tokens = *cu_values.last().unwrap() as usize;
+            cu_tokens.write_typed(0, &vec![u32::MAX; num_total_reqs + 1]);
+            cu_tokens.write_typed(0, &cu_values);
+            let mut recurrent_slots = vec![u32::MAX; num_total_tokens];
+            let mut conv_slots = vec![u32::MAX; num_total_tokens];
+            // Final-only execution must ignore valid nonfinal destination
+            // slots. Candidate execution must materialize those same rows.
+            for (req, bounds) in cu_values.windows(2).enumerate() {
+                for row in bounds[0] as usize..bounds[1] as usize {
+                    let final_row = row + 1 == bounds[1] as usize;
+                    if (final_row && req % 2 == 0) || (!final_row && row % 5 == 1) {
+                        recurrent_slots[row] = (num_total_reqs + row) as u32;
+                        conv_slots[row] = (num_state_slots - row - 1) as u32;
+                    }
+                }
+            }
+            recurrent_write_slots.write_typed(0, &recurrent_slots);
+            conv_write_slots.write_typed(0, &conv_slots);
+            let mut expected_conv_state = vec![CANARY; num_state_slots * conv_stride];
+            expected_conv_state[..source_conv_states.len()].copy_from_slice(&source_conv_states);
+            let mut expected_recurrent_state = vec![CANARY; num_state_slots * recurrent_stride];
+            expected_recurrent_state[..source_recurrent_states.len()].copy_from_slice(&source_recurrent_states);
+            let initial_conv_state = expected_conv_state.clone();
+            let initial_recurrent_state = expected_recurrent_state.clone();
+            write_bf16(&conv_state, 0, &initial_conv_state);
+            write_bf16(&recurrent_state, 0, &initial_recurrent_state);
+            let mut expected_conv_qkv = vec![CANARY; config.num_qkv_values(shape)];
+            let mut expected_output = vec![CANARY; config.num_recurrent_output_values(shape)];
+            let mut expected_norm_output = expected_output.clone();
+            write_bf16(&conv_qkv, 0, &expected_conv_qkv);
+            write_bf16(&recurrent_output, 0, &expected_output);
+            write_bf16(&norm_gated_output, 0, &expected_norm_output);
+            let arguments = ReplayArguments::new()
+                .with_u32(NUM_ACTIVE_REQUESTS, request_lengths.len() as u32)
+                .with_u32(NUM_ACTIVE_TOKENS, num_tokens as u32)
+                .with_u32(NUM_ACTIVE_CHUNKWISE_REQUESTS, num_prefill);
+            let (replay, hit) = cache.record(false, || unreachable!());
+            assert!(hit);
+            stream.submit_replay_with_arguments(replay, &arguments).wait();
+
+            for (req, bounds) in cu_values.windows(2).enumerate() {
+                let begin = bounds[0] as usize;
+                let end = bounds[1] as usize;
+                for prefix_end in begin + 1..=end {
+                    let core = fixture_core(fixture_shape(1, (prefix_end - begin) as u32));
+                    let prefix_cu = [0, (prefix_end - begin) as u32];
+                    let conv_reference = gdn_short_conv_reference(
+                        &core,
+                        &prefix_cu,
+                        &source_conv_states[req * conv_stride..(req + 1) * conv_stride],
+                        &qkv_values[begin * config.qkv_dim() as usize..prefix_end * config.qkv_dim() as usize],
+                        &conv_weight_values,
+                    );
+                    let conv_values = bf16_round_trip(&conv_reference.conv_qkv);
+                    let recurrent_reference = gdn_recurrent_reference(
+                        &core,
+                        GDNRecurrentReferenceInput {
+                            cu_tokens: &prefix_cu,
+                            source_recurrent_state: &source_recurrent_states
+                                [req * recurrent_stride..(req + 1) * recurrent_stride],
+                            conv_qkv: &conv_values,
+                            a: &a_values[begin..prefix_end],
+                            b: &b_values[begin..prefix_end],
+                            a_log: &a_log_values,
+                            dt_bias: &dt_bias_values,
+                        },
+                    );
+                    let row = prefix_end - 1;
+                    if recurrent_slots[row] != u32::MAX && (write_candidate_states || prefix_end == end) {
+                        let start = recurrent_slots[row] as usize * recurrent_stride;
+                        expected_recurrent_state[start..start + recurrent_stride]
+                            .copy_from_slice(&bf16_round_trip(&recurrent_reference.next_recurrent_state));
+                    }
+                    if conv_slots[row] != u32::MAX && (write_candidate_states || prefix_end == end) {
+                        let start = conv_slots[row] as usize * conv_stride;
+                        expected_conv_state[start..start + conv_stride]
+                            .copy_from_slice(&bf16_round_trip(&conv_reference.next_conv_state));
+                    }
+                    if prefix_end == end {
+                        let output_values = bf16_round_trip(&recurrent_reference.recurrent_output);
+                        let norm_values = bf16_round_trip(&gdn_output_norm_gate_reference(
+                            &core,
+                            &output_values,
+                            &z_values[begin * config.v_head_dim as usize..end * config.v_head_dim as usize],
+                            &norm_weight_values,
+                            config.norm_eps,
+                        ));
+                        expected_conv_qkv[begin * config.qkv_dim() as usize..end * config.qkv_dim() as usize]
+                            .copy_from_slice(&conv_values);
+                        expected_output[begin * config.v_head_dim as usize..end * config.v_head_dim as usize]
+                            .copy_from_slice(&output_values);
+                        expected_norm_output[begin * config.v_head_dim as usize..end * config.v_head_dim as usize]
+                            .copy_from_slice(&norm_values);
+                    }
+                }
+            }
+            assert_close(
+                &read_bf16(&conv_qkv, 0, expected_conv_qkv.len()),
+                &bf16_round_trip(&expected_conv_qkv),
+                5.0e-3,
+            );
+            assert_close(
+                &read_bf16(&recurrent_output, 0, expected_output.len()),
+                &bf16_round_trip(&expected_output),
+                5.0e-3,
+            );
+            assert_close(
+                &read_bf16(&norm_gated_output, 0, expected_norm_output.len()),
+                &bf16_round_trip(&expected_norm_output),
+                5.0e-3,
+            );
+            assert_close(
+                &read_bf16(&conv_state, 0, expected_conv_state.len()),
+                &bf16_round_trip(&expected_conv_state),
+                5.0e-3,
+            );
+            assert_close(
+                &read_bf16(&recurrent_state, 0, expected_recurrent_state.len()),
+                &bf16_round_trip(&expected_recurrent_state),
+                5.0e-3,
+            );
+
+            let checked_buffers = [
+                &conv_qkv,
+                &recurrent_output,
+                &norm_gated_output,
+                &conv_state,
+                &recurrent_state,
+            ];
+            let concurrent_values =
+                checked_buffers.map(|buffer| buffer.read_typed::<u16>(0, buffer.len_bytes() / size_of::<u16>()));
+            write_bf16(&conv_state, 0, &initial_conv_state);
+            write_bf16(&recurrent_state, 0, &initial_recurrent_state);
+            for buffer in [&conv_qkv, &recurrent_output, &norm_gated_output] {
+                write_bf16(buffer, 0, &vec![CANARY; buffer.len_bytes() / size_of::<u16>()]);
+            }
+            let (serial_replay, hit) = cache.record(true, || unreachable!());
+            assert!(hit);
+            stream.submit_replay_with_arguments(serial_replay, &arguments).wait();
+            for (buffer, concurrent) in checked_buffers.into_iter().zip(concurrent_values) {
+                assert_eq!(buffer.read_typed::<u16>(0, concurrent.len()), concurrent);
+            }
+        }
     }
 }
 

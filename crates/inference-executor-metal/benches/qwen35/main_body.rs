@@ -591,6 +591,7 @@ fn prepare_gdn_metadata(gdn_state: &Qwen3xGDNState, num_active_tokens: u32, num_
     flat_materialized_state_slots[num_active_tokens as usize - 1] = 1;
     gdn_state.metadata().update(
         &[0, num_active_tokens],
+        0,
         &[0],
         &[0],
         &flat_materialized_state_slots,

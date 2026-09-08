@@ -719,12 +719,12 @@ impl VanillaFixture {
 
     fn execute_batch(
         &mut self,
-        core_batch_req: BatchDeviceRequest,
+        mut core_batch_req: BatchDeviceRequest,
         kind: BatchKind,
     ) -> (ExecutionTiming, BatchDeviceResponse) {
         let wall_start = Instant::now();
         let prepare_start = Instant::now();
-        let model_batch_req = self.model.prepare_batch(&core_batch_req);
+        let model_batch_req = self.model.prepare_batch(&mut core_batch_req);
         let prepare = prepare_start.elapsed();
 
         let record_start = Instant::now();

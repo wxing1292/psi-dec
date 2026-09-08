@@ -50,11 +50,14 @@ struct Args {
     tokens: Vec<u32>,
     contexts: Vec<u32>,
     num_reqs: Vec<u32>,
+    tokens_per_req: Option<Vec<u32>>,
+    prefill_requests: u32,
     iters: usize,
     warmup_iters: usize,
     runs: usize,
     subcomponents: bool,
     candidate_states: bool,
+    compare_recurrent: bool,
 }
 
 impl Args {
@@ -64,11 +67,14 @@ impl Args {
             tokens: vec![1, 2, 4, 8, 16, 32, 64],
             contexts: Vec::new(),
             num_reqs: vec![1],
+            tokens_per_req: None,
+            prefill_requests: 0,
             iters: 50,
             warmup_iters: 20,
             runs: 1,
             subcomponents: false,
             candidate_states: false,
+            compare_recurrent: false,
         };
         let mut values = std::env::args().skip(1);
         while let Some(arg) = values.next() {
@@ -78,11 +84,14 @@ impl Args {
                 "--tokens" => args.tokens = parse_u32_list(&next_arg(&mut values, &arg), &arg),
                 "--contexts" => args.contexts = parse_u32_list(&next_arg(&mut values, &arg), &arg),
                 "--num-reqs" => args.num_reqs = parse_u32_list(&next_arg(&mut values, &arg), &arg),
+                "--tokens-per-req" => args.tokens_per_req = Some(parse_u32_list(&next_arg(&mut values, &arg), &arg)),
+                "--prefill-requests" => args.prefill_requests = parse_u32(&next_arg(&mut values, &arg), &arg),
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--runs" => args.runs = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--subcomponents" => args.subcomponents = true,
                 "--candidate-states" => args.candidate_states = true,
+                "--compare-recurrent" => args.compare_recurrent = true,
                 "--bench" => {},
                 other => panic!("unknown argument {other:?}; pass --help for usage"),
             }
@@ -100,6 +109,25 @@ impl Args {
         assert!(args.runs > 0, "--runs must be positive");
         for &num_reqs in &args.num_reqs {
             assert!(num_reqs > 0, "--num-reqs entries must be positive");
+        }
+        if let Some(counts) = &args.tokens_per_req {
+            assert!(
+                counts.iter().all(|&count| count > 0),
+                "request segments must be non-empty"
+            );
+            assert!(
+                args.prefill_requests as usize <= counts.len(),
+                "prefill requests must be a request prefix"
+            );
+            let _ = counts
+                .iter()
+                .try_fold(0_u32, |total, &count| total.checked_add(count))
+                .expect("request token total must fit u32");
+        } else {
+            assert!(
+                args.num_reqs.iter().all(|&count| args.prefill_requests <= count),
+                "prefill requests must be a request prefix"
+            );
         }
         args
     }
@@ -150,7 +178,10 @@ fn print_help_and_exit() -> ! {
 --tokens 1,2,4,8,16,32,64
 --contexts 0,128
 --num-reqs 1,2,4
---candidate-states
+--tokens-per-req 9,7,1,4  (overrides --tokens and --num-reqs)
+--prefill-requests N      (first N requests; default 0)
+--candidate-states       (all decode rows; final prefill row only)
+--compare-recurrent      (old full graph, interleaved with the mixed graph)
 --subcomponents
 --iters N
 --warmup-iters N

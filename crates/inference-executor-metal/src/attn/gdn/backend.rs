@@ -21,6 +21,8 @@ use crate::def::replay_op::ReplayOp;
 
 pub const GDN_NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("gdn.num_active_requests");
 pub const GDN_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("gdn.num_active_tokens");
+pub const GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("gdn.num_active_chunkwise_requests");
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GDNReplayTopology {
@@ -29,14 +31,24 @@ pub struct GDNReplayTopology {
     pub output_affine: affine_quantized::KernelKind,
 }
 
-pub fn add_gdn_replay_arguments(shape: GDNReplayShape, arguments: &mut ReplayArguments) {
-    add_gdn_private_replay_arguments(shape, arguments);
+pub fn add_gdn_replay_arguments(
+    shape: GDNReplayShape,
+    num_active_chunkwise_requests: u32,
+    arguments: &mut ReplayArguments,
+) {
+    add_gdn_private_replay_arguments(shape, num_active_chunkwise_requests, arguments);
     arguments.set_u32(GDN_NUM_ACTIVE_TOKENS, shape.num_tokens);
 }
 
-pub fn add_gdn_private_replay_arguments(shape: GDNReplayShape, arguments: &mut ReplayArguments) {
+pub fn add_gdn_private_replay_arguments(
+    shape: GDNReplayShape,
+    num_active_chunkwise_requests: u32,
+    arguments: &mut ReplayArguments,
+) {
     shape.validate();
+    debug_assert!(num_active_chunkwise_requests <= shape.num_reqs);
     arguments.set_u32(GDN_NUM_ACTIVE_REQUESTS, shape.num_reqs);
+    arguments.set_u32(GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS, num_active_chunkwise_requests);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -146,6 +158,14 @@ pub struct GDN {
 }
 
 impl GDN {
+    pub fn max_replay_tokens_per_request(num_spec_tokens: usize) -> usize {
+        backend_compute::max_replay_tokens_per_request(num_spec_tokens)
+    }
+
+    pub fn uses_chunkwise(&self, num_tokens: usize, num_spec_tokens: usize) -> bool {
+        backend_compute::uses_chunkwise(num_tokens, num_spec_tokens)
+    }
+
     pub fn new(device: &Device, core: GDNCore, config: GDNMetalConfig) -> Self {
         core.validate();
         config.validate();
@@ -188,6 +208,7 @@ impl GDN {
         &self,
         metadata: &GDNMetadataBuffers,
         cu_tokens: &[u32],
+        num_active_chunkwise_requests: u32,
         state: &GDNPreparedRequestState,
         policy: &GDNReplayBucketPolicy,
         num_total_tokens: u32,
@@ -204,6 +225,7 @@ impl GDN {
             u32::try_from(state.src_recurrent_state_slots.len()).expect("GDN active request count must fit u32");
         metadata.update(
             cu_tokens,
+            num_active_chunkwise_requests,
             &state.src_recurrent_state_slots,
             &state.src_conv_state_slots,
             &state.flat_recurrent_state_write_slots,
@@ -289,6 +311,10 @@ impl ReplayLayer for GDN {
                     key, GDN_NUM_ACTIVE_REQUESTS,
                     "GDN active-token key must differ from the private active-request key"
                 );
+                assert_ne!(
+                    key, GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS,
+                    "GDN active-token key must differ from the private prefill-request key"
+                );
                 self.validate_token_capacity(shape.num_tokens, shape.num_total_tokens);
             },
         }
@@ -304,6 +330,11 @@ impl ReplayLayer for GDN {
             ReplayU32::Fixed(shape.num_reqs)
         };
         let active_tokens = input.num_active_tokens;
+        let active_prefill_requests = if matches!(active_tokens, ReplayU32::Parameter(_)) {
+            ReplayU32::Parameter(GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS)
+        } else {
+            ReplayU32::Fixed(batch_metadata.num_active_chunkwise_requests())
+        };
         let qkvabz = self.qkvabz.invoke(
             shape.num_total_tokens,
             active_tokens,
@@ -358,20 +389,15 @@ impl ReplayLayer for GDN {
             norm_gated_output: scratch.norm_gated_output,
         };
         let compute_shape = compute_shape(shape);
-        if input.materialize_candidate_states {
-            let compute = self.compute.invoke_with_candidate_state_update(
-                compute_shape,
-                compute_buffers,
-                active_reqs,
-                active_tokens,
-            );
-            recorder.record_with_barrier_before(ReplayOp::opaque(compute));
-        } else {
-            let compute = self
-                .compute
-                .invoke(compute_shape, compute_buffers, active_reqs, active_tokens);
-            recorder.record_with_barrier_before(ReplayOp::opaque(compute));
-        }
+        let compute = self.compute.invoke_mixed(
+            compute_shape,
+            compute_buffers,
+            active_reqs,
+            active_tokens,
+            active_prefill_requests,
+            input.materialize_candidate_states,
+        );
+        recorder.record_with_barrier_before(ReplayOp::opaque(compute));
         let output = self.output.invoke(
             shape.num_total_tokens,
             active_tokens,

@@ -178,10 +178,10 @@ impl Fixture {
         (timing, trajectory)
     }
 
-    fn execute(&mut self, core_batch_request: BatchDeviceRequest) -> (ExecutionTiming, BatchDeviceResponse) {
+    fn execute(&mut self, mut core_batch_request: BatchDeviceRequest) -> (ExecutionTiming, BatchDeviceResponse) {
         let wall_start = Instant::now();
         let prepare_start = Instant::now();
-        let model_batch_request = self.model.prepare_batch(&core_batch_request);
+        let model_batch_request = self.model.prepare_batch(&mut core_batch_request);
         let prepare = prepare_start.elapsed();
 
         let main_record_start = Instant::now();

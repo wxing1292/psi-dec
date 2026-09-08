@@ -303,7 +303,7 @@ fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::execu
             vec![(begin..next_page_id).collect()]
         })
         .collect();
-    let core_batch = BatchDeviceRequest::new(
+    let mut core_batch = BatchDeviceRequest::new(
         0,
         [DeviceRequest::new(
             0,
@@ -320,7 +320,7 @@ fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::execu
             Default::default(),
         )],
     );
-    let model_batch = model.prepare_batch(&core_batch);
+    let model_batch = model.prepare_batch(&mut core_batch);
     let mut recorder = model.begin_ops_recording(&model_batch);
     let hidden = model.embed_main(&mut recorder, &model_batch);
     let hidden = model.forward_main(&mut recorder, &model_batch, hidden);

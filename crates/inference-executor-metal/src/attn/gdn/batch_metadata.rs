@@ -43,6 +43,7 @@ pub struct GDNMetadataBuffers {
     flat_recurrent_state_write_slots: Buffer,
     flat_conv_state_write_slots: Buffer,
     replay_shape: Cell<Option<GDNReplayShape>>,
+    num_active_chunkwise_requests: Cell<u32>,
 }
 
 impl GDNMetadataBuffers {
@@ -64,11 +65,16 @@ impl GDNMetadataBuffers {
             flat_recurrent_state_write_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
             flat_conv_state_write_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
             replay_shape: Cell::new(None),
+            num_active_chunkwise_requests: Cell::new(0),
         }
     }
 
     pub fn cu_tokens(&self) -> &Buffer {
         &self.cu_tokens
+    }
+
+    pub fn num_active_chunkwise_requests(&self) -> u32 {
+        self.num_active_chunkwise_requests.get()
     }
 
     pub fn max_requests(&self) -> usize {
@@ -99,6 +105,7 @@ impl GDNMetadataBuffers {
     pub fn update(
         &self,
         cu_tokens: &[u32],
+        num_active_chunkwise_requests: u32,
         src_recurrent_state_slots: &[u32],
         src_conv_state_slots: &[u32],
         flat_recurrent_state_write_slots: &[u32],
@@ -125,6 +132,10 @@ impl GDNMetadataBuffers {
         assert!(num_tokens_usize <= self.flat_recurrent_state_write_slots.len_bytes() / size_of::<u32>());
         let num_reqs = src_recurrent_state_slots.len() as u32;
         assert!(
+            num_active_chunkwise_requests <= num_reqs,
+            "GDN chunkwise prefix must fit the active requests"
+        );
+        assert!(
             num_reqs <= num_total_requests,
             "GDN active request count must not exceed the total request count"
         );
@@ -150,6 +161,7 @@ impl GDNMetadataBuffers {
         self.flat_conv_state_write_slots
             .write_typed(0, flat_conv_state_write_slots);
         self.replay_shape.set(Some(replay_shape));
+        self.num_active_chunkwise_requests.set(num_active_chunkwise_requests);
         replay_shape
     }
 
@@ -178,6 +190,7 @@ mod tests {
 
         let exact = metadata.update(
             &cu_tokens,
+            0,
             &src_recurrent_state_slots,
             &src_conv_state_slots,
             &flat_recurrent_state_write_slots,
@@ -189,6 +202,7 @@ mod tests {
 
         let padded = metadata.update(
             &cu_tokens,
+            0,
             &src_recurrent_state_slots,
             &src_conv_state_slots,
             &flat_recurrent_state_write_slots,
@@ -200,6 +214,7 @@ mod tests {
 
         let caller_sized = metadata.update(
             &cu_tokens,
+            0,
             &src_recurrent_state_slots,
             &src_conv_state_slots,
             &flat_recurrent_state_write_slots,
@@ -234,7 +249,7 @@ mod tests {
         let device = Device::system_default();
         let metadata = GDNMetadataBuffers::new(&device, 1, 8);
 
-        metadata.update(&[0, 7], &[10], &[20], &[u32::MAX; 7], &[u32::MAX; 7], 1, 6);
+        metadata.update(&[0, 7], 0, &[10], &[20], &[u32::MAX; 7], &[u32::MAX; 7], 1, 6);
     }
 
     #[test]
@@ -243,7 +258,7 @@ mod tests {
         let device = Device::system_default();
         let metadata = GDNMetadataBuffers::new(&device, 1, 8);
 
-        metadata.update(&[0, 1], &[10], &[20], &[u32::MAX], &[u32::MAX], 1, 9);
+        metadata.update(&[0, 1], 0, &[10], &[20], &[u32::MAX], &[u32::MAX], 1, 9);
     }
 
     #[test]
@@ -252,6 +267,6 @@ mod tests {
         let device = Device::system_default();
         let metadata = GDNMetadataBuffers::new(&device, 2, 2);
 
-        metadata.update(&[0, 1, 1], &[3, 4], &[5, 6], &[7], &[8], 2, 1);
+        metadata.update(&[0, 1, 1], 0, &[3, 4], &[5, 6], &[7], &[8], 2, 1);
     }
 }

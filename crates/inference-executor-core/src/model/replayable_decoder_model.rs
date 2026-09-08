@@ -91,7 +91,9 @@ pub trait ReplayableDecoderModel {
     fn load_weights(&mut self) -> Result<(), ModelExecutorError>;
     fn load_state(&mut self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError>;
 
-    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest;
+    /// Prepares model metadata. The executor may reorder complete requests before
+    /// packing them. Commit receives the same order and preserves request identity.
+    fn prepare_batch(&mut self, core_batch_req: &mut BatchDeviceRequest) -> Self::ModelBatchRequest;
     fn commit_batch(
         &mut self,
         core_batch_req: BatchDeviceRequest,

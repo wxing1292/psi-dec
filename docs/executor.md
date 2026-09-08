@@ -4,6 +4,9 @@ The model executor turns runtime-owned batch metadata and page IDs into model ex
 weights, component state, replay composition, and sampling. It does not schedule requests or allocate globally owned
 cache pages.
 
+`ReplayableDecoderModel::prepare_batch` can reorder complete requests before it constructs model and component metadata.
+The caller retains that order through `commit_batch`. Request IDs preserve the response identity across this reorder.
+
 Read this document after the top-level [README](../README.md) and [`core.md`](core.md). It explains the stable executor
 mental model. Component documents describe current source and algorithms. Workflow documents contain shared commands
 and cross-component measurement rules.
@@ -489,8 +492,10 @@ topology choices in its replay key. Capacity bucketing must not combine differen
 or dispatch structures. A topology boundary identifies the first active count for the new topology. The policy ignores
 a boundary above the configured capacity. The backend component that selects the topology must own these boundaries.
 
-Some work domains permit zero active work. In this case, a policy result of zero means that the domain does not record
-or dispatch work. Zero is not a replay capacity.
+Some work domains permit zero active work. A policy result of zero means that the domain does not record or dispatch
+work. Zero is not a replay capacity. A fixed graph can instead retain an optional branch at a positive recorded
+capacity and submit zero active work. The branch must satisfy the inactive-kernel contract above. This form preserves
+command topology but retains dispatch and barrier costs.
 
 `ReplayArguments` contain keyed submission values that recording declares. Each cached replay work domain declares its
 active count as one of these values. Submission validates that the caller provides each declared value exactly once
