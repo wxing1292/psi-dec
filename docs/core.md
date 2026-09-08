@@ -143,9 +143,13 @@ cancellation restores it.
 existing ID at its current position. Commit and cancellation can therefore restore a request without creating a
 second runnable occurrence.
 
-Each compute slot keeps the request ID order from its most recent device batch. The next use of that slot treats these
+Each compute slot keeps the request ID order selected for its most recent device batch. The next use of that slot treats these
 IDs as its sticky working set. Different compute slots can contain the same request ID during pipelined Prefill. One
 device batch must contain each request ID at most once.
+
+`BatchDeviceRequest::new` preserves the scheduler's request order. Core does not sort requests for model execution.
+`BatchDevReq::from_parts` may reorder complete requests without changing request identity or the scheduler's sticky order.
+Runtime core resolves responses by request ID.
 
 `SimpleScheduler` resolves only runnable sticky IDs. It skips IDs that are pending, terminal, swapped, or absent. It
 first creates immutable `ReqTokenInventory` values. It then allocates minimum validated, maximum validated, and
@@ -633,13 +637,14 @@ previous scheduled work is still in flight. The batcher keeps it in the
 request-ID map. It does not put the request back on the run queue. The model executor response returns it through
 `commit`.
 
-Do not requeue `Pending` requests. Device batch responses currently commit in submission order because decoder
-scheduled token ranges are FIFO-owned.
+Do not requeue `Pending` requests. Device batch responses must commit in compute-sequence order because decoder
+scheduled token ranges are FIFO-owned. Within a batch, commit and cancellation resolve each request by request ID.
+Request order within a batch does not have to match the scheduler's selection order.
 
 Commit and cancellation put a continuing request at the front of the run queue. The queue deduplicates an ID that is
 already runnable.
 
-Pipeline stages can overlap. Their final responses must preserve submission order until core owns an explicit epoch or
+Pipeline stages can overlap. Their final batch responses must preserve compute-sequence order until core owns an explicit epoch or
 reorder buffer.
 
 An out-of-order response is an internal contract violation.

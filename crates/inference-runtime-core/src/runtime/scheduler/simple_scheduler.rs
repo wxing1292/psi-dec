@@ -168,14 +168,6 @@ where
             Some(compute_slot_seq),
             "simple scheduler cancellation compute slot sequence mismatch"
         );
-        debug_assert!(
-            compute_slot
-                .sticky_req_ids_ref()
-                .iter()
-                .copied()
-                .eq(dev_reqs.iter().map(DevReq::id)),
-            "simple scheduler cancellation request IDs mismatch"
-        );
         compute_slot.reset();
         self.free_compute_slots.push_front(compute_slot);
 
@@ -193,14 +185,6 @@ where
             compute_slot.seq(),
             Some(compute_slot_seq),
             "simple scheduler commit compute slot sequence mismatch"
-        );
-        assert!(
-            compute_slot
-                .sticky_req_ids_ref()
-                .iter()
-                .copied()
-                .eq(dev_resps.iter().map(DevResp::id)),
-            "simple scheduler commit request IDs mismatch"
         );
         compute_slot.reset();
         self.free_compute_slots.push_back(compute_slot);
@@ -261,7 +245,9 @@ mod tests {
             self.dev_reqs.len()
         }
 
-        fn from_parts(seq: RawComputeSlotSeq, dev_reqs: Vec<MockDevReq>) -> Self {
+        fn from_parts(seq: RawComputeSlotSeq, mut dev_reqs: Vec<MockDevReq>) -> Self {
+            // Model packing may change request order within a compute slot.
+            dev_reqs.reverse();
             Self { seq, dev_reqs }
         }
 
@@ -351,11 +337,24 @@ mod tests {
     #[test]
     fn test_prepare_commit() {
         let mut batcher = TestBatcher::new();
-        batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
-        batcher.expect_commit().times(3).returning(|_, _| Vec::new());
+        batcher.expect_prepare().times(3).returning(|_, _, _, _, _| {
+            [1usize, 2]
+                .into_iter()
+                .map(|id| {
+                    let mut request = MockDevReq::new();
+                    request.expect_id().return_const(id);
+                    request
+                })
+                .collect()
+        });
+        batcher
+            .expect_commit()
+            .times(3)
+            .withf(|_, responses| responses.iter().map(DevResp::id).eq([2, 1]))
+            .returning(|_, _| Vec::new());
 
         let (async_task_req_tx, _async_task_req_rx) = bounded(1);
-        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 1, 8, 4, 3);
+        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 2, 8, 4, 3);
         let (first, second, third) = {
             let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
                 &mut scheduler;
@@ -372,9 +371,18 @@ mod tests {
         {
             let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
                 &mut scheduler;
-            scheduler.commit(TestBatchDeviceResp::from_parts(first.seq(), Vec::new()));
-            scheduler.commit(TestBatchDeviceResp::from_parts(second.seq(), Vec::new()));
-            scheduler.commit(TestBatchDeviceResp::from_parts(third.seq(), Vec::new()));
+            for batch in [first, second, third] {
+                let responses = batch
+                    .dev_reqs
+                    .iter()
+                    .map(|request| {
+                        let mut response = MockDevResp::new();
+                        response.expect_id().return_const(request.id());
+                        response
+                    })
+                    .collect();
+                scheduler.commit(TestBatchDeviceResp::from_parts(batch.seq(), responses));
+            }
         }
         assert_eq!(scheduler.next_compute_slot_seq(), Some(4));
     }
@@ -382,11 +390,24 @@ mod tests {
     #[test]
     fn test_prepare_cancel() {
         let mut batcher = TestBatcher::new();
-        batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
-        batcher.expect_cancel().times(3).returning(|_, _| {});
+        batcher.expect_prepare().times(3).returning(|_, _, _, _, _| {
+            [1usize, 2]
+                .into_iter()
+                .map(|id| {
+                    let mut request = MockDevReq::new();
+                    request.expect_id().return_const(id);
+                    request
+                })
+                .collect()
+        });
+        batcher
+            .expect_cancel()
+            .times(3)
+            .withf(|_, requests| requests.iter().map(DevReq::id).eq([2, 1]))
+            .returning(|_, _| {});
 
         let (async_task_req_tx, _async_task_req_rx) = bounded(1);
-        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 1, 8, 4, 3);
+        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 2, 8, 4, 3);
         let (first, second, third) = {
             let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
                 &mut scheduler;

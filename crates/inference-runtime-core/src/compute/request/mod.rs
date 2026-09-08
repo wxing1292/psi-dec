@@ -29,6 +29,7 @@ where
     fn request_cost(&self) -> usize;
     fn token_cost(&self) -> usize;
 
+    /// Packs the selected requests. Implementations may reorder requests while preserving each request's identity.
     fn from_parts(seq: RawComputeSlotSeq, dev_reqs: Vec<DeviceReq>) -> Self;
     fn into_inner(self) -> (RawComputeSlotSeq, Vec<DeviceReq>);
 }
@@ -110,7 +111,7 @@ impl BatchDevReq<DeviceRequest> for BatchDeviceRequest {
     }
 
     fn from_parts(seq: RawComputeSlotSeq, dev_reqs: Vec<DeviceRequest>) -> Self {
-        Self { seq, dev_reqs }
+        Self::new(seq, dev_reqs)
     }
 
     fn into_inner(self) -> (RawComputeSlotSeq, Vec<DeviceRequest>) {
