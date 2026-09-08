@@ -489,8 +489,10 @@ topology choices in its replay key. Capacity bucketing must not combine differen
 or dispatch structures. A topology boundary identifies the first active count for the new topology. The policy ignores
 a boundary above the configured capacity. The backend component that selects the topology must own these boundaries.
 
-Some work domains permit zero active work. In this case, a policy result of zero means that the domain does not record
-or dispatch work. Zero is not a replay capacity.
+Some work domains permit zero active work. A policy result of zero means that the domain does not record or dispatch
+work. Zero is not a replay capacity. A fixed graph can instead retain an optional branch at a positive recorded
+capacity and submit zero active work. The branch must satisfy the inactive-kernel contract above. This form preserves
+command topology but retains dispatch and barrier costs.
 
 `ReplayArguments` contain keyed submission values that recording declares. Each cached replay work domain declares its
 active count as one of these values. Submission validates that the caller provides each declared value exactly once

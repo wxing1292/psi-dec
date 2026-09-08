@@ -1,3 +1,6 @@
+mod chunkwise;
+mod recurrent;
+
 use crate::components::assert_u32_count_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
@@ -34,6 +37,12 @@ struct FinalRecurrentStateThreadBlockConstants {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChunkwiseStateThreadBlockConstants {
+    num_v_rows: u32,
+    num_simdgroups: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CandidateRecurrentStateSimdgroupConstants {
     num_v_rows: u32,
 }
@@ -66,11 +75,12 @@ struct KernelSetConstants {
     short_conv: KernelConstants<ThreadBlockConstants>,
     candidate_conv_state: KernelConstants<ThreadBlockConstants>,
     final_recurrent_state: KernelConstants<FinalRecurrentStateThreadBlockConstants>,
+    chunkwise_state: KernelConstants<ChunkwiseStateThreadBlockConstants>,
     candidate_recurrent_state: KernelConstants<CandidateRecurrentStateThreadBlockConstants>,
     output_norm_gate: KernelConstants<ThreadBlockConstants>,
 }
 
-/// Compile-time model and kernel geometry for one recurrent execution variant.
+/// Compile-time model and kernel geometry for one mixed execution variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VariantConstants {
     model: ModelGeometry,
@@ -195,6 +205,10 @@ impl VariantConstants {
             },
             required_threads: CANDIDATE_RECURRENT_STATE_NUM_QK_DIM_THREADS * CANDIDATE_RECURRENT_STATE_NUM_SIMDGROUPS,
         };
+        let chunkwise_num_v_rows = [128, 64, 32, 16, 8, 4]
+            .into_iter()
+            .find(|num_v_rows| config.v_head_dim.is_multiple_of(*num_v_rows))
+            .expect("GDN chunkwise V-row tile must divide Dv");
         let constants = Self {
             model: config.model_geometry(),
             kernels: KernelSetConstants {
@@ -213,6 +227,12 @@ impl VariantConstants {
                         num_qk_dim_threads: FINAL_RECURRENT_STATE_NUM_QK_DIM_THREADS,
                         num_v_rows: final_recurrent_state_num_v_rows,
                         required_threads: FINAL_RECURRENT_STATE_NUM_QK_DIM_THREADS * final_recurrent_state_num_v_rows,
+                    },
+                },
+                chunkwise_state: KernelConstants {
+                    thread_block: ChunkwiseStateThreadBlockConstants {
+                        num_v_rows: chunkwise_num_v_rows,
+                        num_simdgroups: chunkwise_num_v_rows.div_ceil(8),
                     },
                 },
                 candidate_recurrent_state: KernelConstants {
@@ -238,6 +258,9 @@ impl VariantConstants {
             final_recurrent_state.num_qk_dim_threads * final_recurrent_state.num_v_rows
         );
         assert_eq!(self.model.v_head_dim % final_recurrent_state.num_v_rows, 0);
+        let chunkwise_state = self.kernels.chunkwise_state.thread_block;
+        assert_eq!(self.model.v_head_dim % chunkwise_state.num_v_rows, 0);
+        assert_eq!(chunkwise_state.num_simdgroups, chunkwise_state.num_v_rows.div_ceil(8));
         let candidate_recurrent_state = self.kernels.candidate_recurrent_state.thread_block;
         assert_eq!(
             candidate_recurrent_state.required_threads,
@@ -373,19 +396,11 @@ impl Shape {
 
 fn source(variant_constants: VariantConstants) -> String {
     let model = variant_constants.model;
-    let final_recurrent_state = variant_constants.kernels.final_recurrent_state.thread_block;
-    let candidate_recurrent_state = variant_constants.kernels.candidate_recurrent_state.thread_block;
     let source_constants = format!(
         "using namespace metal;\n\nconstant uint num_qk_heads = {num_qk_heads}u;\nconstant uint qk_head_dim = \
          {qk_head_dim}u;\nconstant uint num_v_heads = {num_v_heads}u;\nconstant uint v_head_dim = \
          {v_head_dim}u;\nconstant uint conv_kernel_size = {conv_kernel_size}u;\nconstant uint qkv_dim = \
          {qkv_dim}u;\nconstant uint conv_state_len = {conv_state_len}u;\nconstant uint \
-         final_recurrent_state_num_v_rows = {final_recurrent_state_num_v_rows}u;\nconstant uint \
-         final_recurrent_state_num_qk_dim_threads = {final_recurrent_state_num_qk_dim_threads}u;\nconstant uint \
-         candidate_recurrent_state_num_qk_dim_threads = {candidate_recurrent_state_num_qk_dim_threads}u;\nconstant \
-         uint candidate_recurrent_state_num_v_rows_per_simdgroup = \
-         {candidate_recurrent_state_num_v_rows_per_simdgroup}u;\nconstant uint \
-         candidate_recurrent_state_num_simdgroups = {candidate_recurrent_state_num_simdgroups}u;\nconstant uint \
          output_norm_gate_required_threads = {output_norm_gate_required_threads}u;",
         num_qk_heads = model.num_qk_heads,
         qk_head_dim = model.qk_head_dim,
@@ -394,14 +409,14 @@ fn source(variant_constants: VariantConstants) -> String {
         conv_kernel_size = model.conv_kernel_size,
         qkv_dim = model.qkv_dim(),
         conv_state_len = model.conv_state_len(),
-        final_recurrent_state_num_v_rows = final_recurrent_state.num_v_rows,
-        final_recurrent_state_num_qk_dim_threads = final_recurrent_state.num_qk_dim_threads,
-        candidate_recurrent_state_num_qk_dim_threads = candidate_recurrent_state.num_qk_dim_threads,
-        candidate_recurrent_state_num_v_rows_per_simdgroup = candidate_recurrent_state.simdgroup.num_v_rows,
-        candidate_recurrent_state_num_simdgroups = candidate_recurrent_state.num_simdgroups,
         output_norm_gate_required_threads = variant_constants.kernels.output_norm_gate.thread_block.required_threads,
     );
-    GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &source_constants, 1)
+    let common_source = GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &source_constants, 1);
+    format!(
+        "{common_source}\n{}\n{}",
+        recurrent::source(variant_constants),
+        chunkwise::source(variant_constants),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -438,7 +453,7 @@ pub struct Buffers<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VariantKey {
-    Recurrent,
+    Mixed,
 }
 
 struct Variant {
@@ -448,6 +463,7 @@ struct Variant {
     short_conv: CompiledKernel,
     candidate_conv_state: CompiledKernel,
     final_recurrent_state: CompiledKernel,
+    chunkwise_state: CompiledKernel,
     candidate_recurrent_state: CompiledKernel,
     output_norm_gate: CompiledKernel,
 }
@@ -460,13 +476,14 @@ impl Registry {
     fn new(device: &Device, config: Config) -> Self {
         let constants = VariantConstants::from_config(config);
         let source = source(constants);
-        let recurrent = Variant {
+        let mixed = Variant {
             constants,
             q_scale: config.q_scale,
             norm_eps: config.norm_eps,
             short_conv: CompiledKernel::new(device, &source, "gdn_compute_short_conv_bf16"),
             candidate_conv_state: CompiledKernel::new(device, &source, "gdn_compute_candidate_conv_state_bf16"),
             final_recurrent_state: CompiledKernel::new(device, &source, "gdn_compute_final_recurrent_state_bf16"),
+            chunkwise_state: CompiledKernel::new(device, &source, "gdn_compute_chunkwise_state_bf16"),
             candidate_recurrent_state: CompiledKernel::new(
                 device,
                 &source,
@@ -475,7 +492,7 @@ impl Registry {
             output_norm_gate: CompiledKernel::new(device, &source, "gdn_compute_output_norm_gate_bf16"),
         };
         Self {
-            entries: vec![(VariantKey::Recurrent, recurrent)],
+            entries: vec![(VariantKey::Mixed, mixed)],
         }
     }
 }
@@ -511,10 +528,6 @@ impl Compute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> Invocation<'a> {
-        assert!(
-            shape.num_total_tokens >= shape.num_total_reqs,
-            "GDN ragged recurrent requires at least one token per request"
-        );
         let (_, variant) = self.select(shape);
         Invocation {
             variant,
@@ -532,10 +545,6 @@ impl Compute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> CandidateStateUpdateInvocation<'a> {
-        assert!(
-            shape.num_total_tokens >= shape.num_total_reqs,
-            "GDN ragged recurrent requires at least one token per request"
-        );
         let (_, variant) = self.select(shape);
         CandidateStateUpdateInvocation {
             variant,
@@ -543,6 +552,34 @@ impl Compute {
             buffers,
             num_active_reqs,
             num_active_tokens,
+        }
+    }
+
+    /// Record a fixed prefill-chunkwise then decode-recurrent graph.
+    ///
+    /// The first `num_active_prefill_requests` requests are prefill. Both
+    /// branches retain the full recorded request capacity. Either branch may
+    /// have zero active requests. Each active request must have a token.
+    /// Candidate mode writes every supplied state destination. Final-only
+    /// mode ignores nonfinal destinations in both branches.
+    pub fn invoke_mixed<'a>(
+        &'a self,
+        shape: Shape,
+        buffers: Buffers<'a>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
+        num_active_prefill_requests: ReplayU32,
+        write_candidate_states: bool,
+    ) -> MixedInvocation<'a> {
+        let (_, variant) = self.select(shape);
+        MixedInvocation {
+            variant,
+            shape,
+            buffers,
+            num_active_reqs,
+            num_active_tokens,
+            num_active_prefill_requests,
+            write_candidate_states,
         }
     }
 
@@ -614,126 +651,6 @@ impl Variant {
         );
     }
 
-    /// Current final-state recurrent execution (`R = num_reqs`):
-    ///
-    /// ```text
-    /// recurrent_state: [S, Hv, Dv, Dqk]  (Dqk contiguous)
-    /// grid:             (Dv / num_v_rows, R * Hv, 1)
-    /// threadblock:      (num_qk_dim_threads, num_v_rows, 1)
-    /// FinalRecurrentStateThreadBlockTask / threadblock
-    ///   -> owns recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk]
-    ///   -> advances it over flat_token_indices in order
-    /// task from grid: request_index, v_head_index, v_dim_indices
-    /// task from metadata: flat_token_indices
-    /// parallel: requests, V heads, V-row ranges, Dqk lanes
-    /// ordered:  tokens within one request
-    /// produces: recurrent_output; updates: destination recurrent_state slice
-    /// ```
-    ///
-    /// The kernel derives the task from its arguments, thread-block index, and
-    /// constants. It does not require a materialized task buffer.
-    fn record_final_recurrent_state(
-        &self,
-        recorder: &CommandRecorder,
-        shape: Shape,
-        buffers: &Buffers<'_>,
-        num_active_reqs: ReplayU32,
-    ) {
-        recorder.set_kernel(&self.final_recurrent_state);
-        recorder.set_barrier_before();
-        recorder.set_buffer_write(0, buffers.recurrent_output, 0);
-        recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
-        recorder.set_buffer_read(2, buffers.conv_qkv, 0);
-        recorder.set_buffer_read(3, buffers.a, 0);
-        recorder.set_buffer_read(4, buffers.b, 0);
-        recorder.set_buffer_read(5, buffers.a_log, 0);
-        recorder.set_buffer_read(6, buffers.dt_bias, 0);
-        recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
-        recorder.set_buffer_read(8, buffers.flat_recurrent_state_write_slots, 0);
-        recorder.set_buffer_read(9, buffers.cu_tokens, 0);
-        recorder.set_f32(10, self.q_scale);
-        set_replay_u32(
-            recorder,
-            11,
-            num_active_reqs,
-            shape.num_total_reqs,
-            "GDN active request count",
-        );
-        recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        let thread_block = self.constants.kernels.final_recurrent_state.thread_block;
-        let num_v_row_ranges = self.constants.model.v_head_dim / thread_block.num_v_rows;
-        recorder.dispatch_threadblocks(
-            (
-                num_v_row_ranges as usize,
-                shape.num_total_reqs as usize * self.constants.model.num_v_heads as usize,
-                1,
-            ),
-            (
-                thread_block.num_qk_dim_threads as usize,
-                thread_block.num_v_rows as usize,
-                1,
-            ),
-        );
-    }
-
-    /// Current candidate-state recurrent execution:
-    ///
-    /// ```text
-    /// grid:        (Dv / num_v_rows, R * Hv, 1)
-    /// threadblock: (num_qk_dim_threads, num_simdgroups, 1)
-    /// CandidateRecurrentStateThreadBlockTask / threadblock
-    ///   -> owns recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk]
-    ///   -> advances flat_token_indices in order
-    ///   -> can materialize the state after each token
-    /// ```
-    ///
-    /// Each SIMDgroup owns `simdgroup.num_v_rows` rows. The full thread block
-    /// owns `thread_block.num_v_rows()` rows. The kernel derives the task from
-    /// its arguments, thread-block index, and constants.
-    fn record_candidate_recurrent_state(
-        &self,
-        recorder: &CommandRecorder,
-        shape: Shape,
-        buffers: &Buffers<'_>,
-        num_active_reqs: ReplayU32,
-    ) {
-        recorder.set_kernel(&self.candidate_recurrent_state);
-        recorder.set_barrier_before();
-        recorder.set_buffer_write(0, buffers.recurrent_output, 0);
-        recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
-        recorder.set_buffer_read(2, buffers.conv_qkv, 0);
-        recorder.set_buffer_read(3, buffers.a, 0);
-        recorder.set_buffer_read(4, buffers.b, 0);
-        recorder.set_buffer_read(5, buffers.a_log, 0);
-        recorder.set_buffer_read(6, buffers.dt_bias, 0);
-        recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
-        recorder.set_buffer_read(8, buffers.flat_recurrent_state_write_slots, 0);
-        recorder.set_buffer_read(9, buffers.cu_tokens, 0);
-        recorder.set_f32(10, self.q_scale);
-        set_replay_u32(
-            recorder,
-            11,
-            num_active_reqs,
-            shape.num_total_reqs,
-            "GDN active request count",
-        );
-        recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        let thread_block = self.constants.kernels.candidate_recurrent_state.thread_block;
-        let num_threadblocks = self.constants.model.v_head_dim / thread_block.num_v_rows();
-        recorder.dispatch_threadblocks(
-            (
-                num_threadblocks as usize,
-                shape.num_total_reqs as usize * self.constants.model.num_v_heads as usize,
-                1,
-            ),
-            (
-                thread_block.num_qk_dim_threads as usize,
-                thread_block.num_simdgroups as usize,
-                1,
-            ),
-        );
-    }
-
     /// Output norm + gate execution:
     ///
     /// ```text
@@ -796,7 +713,13 @@ impl Operator for Invocation<'_> {
             self.num_active_tokens,
             true,
         );
-        variant.record_final_recurrent_state(recorder, self.shape, &self.buffers, self.num_active_reqs);
+        variant.record_final_recurrent_state(
+            recorder,
+            self.shape,
+            &self.buffers,
+            self.num_active_reqs,
+            ReplayU32::Fixed(0),
+        );
         variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
@@ -833,8 +756,96 @@ impl Operator for CandidateStateUpdateInvocation<'_> {
             self.num_active_reqs,
             self.num_active_tokens,
         );
-        variant.record_candidate_recurrent_state(recorder, self.shape, &self.buffers, self.num_active_reqs);
+        variant.record_candidate_recurrent_state(
+            recorder,
+            self.shape,
+            &self.buffers,
+            self.num_active_reqs,
+            ReplayU32::Fixed(0),
+        );
         variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
+    }
+}
+
+pub struct MixedInvocation<'a> {
+    variant: &'a Variant,
+    shape: Shape,
+    buffers: Buffers<'a>,
+    num_active_reqs: ReplayU32,
+    num_active_tokens: ReplayU32,
+    num_active_prefill_requests: ReplayU32,
+    write_candidate_states: bool,
+}
+
+impl Operator for MixedInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        let variant = self.variant;
+        variant.constants.validate_shape(self.shape);
+        validate_buffers(variant.constants, self.shape, &self.buffers);
+        if let (ReplayU32::Fixed(num_active_reqs), ReplayU32::Fixed(num_active_prefill_requests)) =
+            (self.num_active_reqs, self.num_active_prefill_requests)
+        {
+            assert!(num_active_prefill_requests <= num_active_reqs);
+        }
+        variant.record_short_conv(
+            recorder,
+            self.shape,
+            &self.buffers,
+            self.num_active_reqs,
+            self.num_active_tokens,
+            !self.write_candidate_states,
+        );
+        if self.write_candidate_states {
+            assert_u32_count_domain(
+                variant.constants.model.num_candidate_conv_state_values(self.shape),
+                "GDN candidate convolution state",
+            );
+            variant.record_candidate_conv_state(
+                recorder,
+                self.shape,
+                &self.buffers,
+                self.num_active_reqs,
+                self.num_active_tokens,
+            );
+        }
+        variant.record_chunkwise_state(
+            recorder,
+            self.shape,
+            &self.buffers,
+            self.num_active_prefill_requests,
+            self.write_candidate_states,
+        );
+        if self.write_candidate_states {
+            variant.record_candidate_recurrent_state(
+                recorder,
+                self.shape,
+                &self.buffers,
+                self.num_active_reqs,
+                self.num_active_prefill_requests,
+            );
+        } else {
+            variant.record_final_recurrent_state(
+                recorder,
+                self.shape,
+                &self.buffers,
+                self.num_active_reqs,
+                self.num_active_prefill_requests,
+            );
+        }
+        variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
+    }
+}
+
+fn set_prefill_count(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(
+                value <= max_value,
+                "GDN prefill request count exceeds recorded capacity"
+            );
+            recorder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 0, max_value),
     }
 }
 

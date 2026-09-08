@@ -257,7 +257,11 @@ because it contains one field.
 For each cached replay work domain, use `num_total_<domain>` for the recorded grid or capacity. Use
 `num_active_<domain>` for the logical work in one submission. Bind `num_active_<domain>` as a replay parameter. Keep
 the two values separate even when they are equal. Validate
-`0 < num_active_<domain> <= num_total_<domain>` before submission.
+`0 < num_active_<domain> <= num_total_<domain>` before submission for required work domains.
+An optional branch in a fixed graph can have zero active work. Its owner must validate
+`0 <= num_active_<domain> <= num_total_<domain>` and its relation to the containing active domain.
+Every inactive kernel must return before it accesses metadata or state, writes output, or enters a threadblock barrier.
+The recorded capacity remains positive. A derived suffix can use the containing active count and the prefix count.
 
 The capacity policy can select `num_total_<domain> == num_active_<domain>`. This identity policy is necessary when the
 recorded commands cannot execute inactive lanes safely. It does not change the replay parameter or cache-key contract.

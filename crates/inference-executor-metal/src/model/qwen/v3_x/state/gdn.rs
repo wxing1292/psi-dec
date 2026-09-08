@@ -188,12 +188,14 @@ impl Qwen3xGDNState {
     pub fn prepare_metadata(
         &self,
         cu_tokens: &[u32],
+        num_active_prefill_requests: u32,
         prepared: &GDNPreparedRequestState,
         num_total_tokens: u32,
     ) -> GDNReplayShape {
         self.backend().prepare(
             self.metadata(),
             cu_tokens,
+            num_active_prefill_requests,
             prepared,
             &self.replay_bucket_policy,
             num_total_tokens,
@@ -209,11 +211,19 @@ impl Qwen3xGDNState {
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_gdn_replay_arguments(self.metadata().replay_shape(), arguments);
+        add_gdn_replay_arguments(
+            self.metadata().replay_shape(),
+            self.metadata().num_active_prefill_requests(),
+            arguments,
+        );
     }
 
     pub fn add_private_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_gdn_private_replay_arguments(self.metadata().replay_shape(), arguments);
+        add_gdn_private_replay_arguments(
+            self.metadata().replay_shape(),
+            self.metadata().num_active_prefill_requests(),
+            arguments,
+        );
     }
 
     pub fn restore(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer) {

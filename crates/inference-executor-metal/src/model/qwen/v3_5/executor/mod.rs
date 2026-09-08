@@ -1198,9 +1198,19 @@ impl ReplayableDecoderModel for Qwen35Executor {
         );
         let gdn_states_elapsed = gdn_states_start.elapsed();
         let gdn_metadata_start = Instant::now();
-        let gdn_shape =
-            self.main_gdn_state
-                .prepare_metadata(microbatch.cu_tokens(), &gdn_prepared, num_main_total_tokens);
+        let num_active_prefill_requests = (0..microbatch.num_reqs())
+            .take_while(|&req_index| !microbatch.is_decode_req(req_index))
+            .count();
+        debug_assert!(
+            (num_active_prefill_requests..microbatch.num_reqs()).all(|req_index| microbatch.is_decode_req(req_index)),
+            "Qwen3.5 batch requests must have a prefill prefix"
+        );
+        let gdn_shape = self.main_gdn_state.prepare_metadata(
+            microbatch.cu_tokens(),
+            num_active_prefill_requests as u32,
+            &gdn_prepared,
+            num_main_total_tokens,
+        );
         let gdn_metadata_elapsed = gdn_metadata_start.elapsed();
         debug_assert_eq!(gdn_shape.num_tokens as usize, microbatch.total_tokens());
         debug_assert_eq!(gdn_shape.num_reqs as usize, microbatch.num_reqs());

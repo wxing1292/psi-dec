@@ -768,6 +768,7 @@ fn prepare_state(
     );
     metadata.update(
         cu_tokens,
+        0,
         &prepared.src_recurrent_state_slots,
         &prepared.src_conv_state_slots,
         &prepared.flat_recurrent_state_write_slots,
