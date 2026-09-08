@@ -29,6 +29,7 @@ where
     fn request_cost(&self) -> usize;
     fn token_cost(&self) -> usize;
 
+    /// Packs the selected requests. Implementations may reorder requests while preserving each request's identity.
     fn from_parts(seq: RawComputeSlotSeq, dev_reqs: Vec<DeviceReq>) -> Self;
     fn into_inner(self) -> (RawComputeSlotSeq, Vec<DeviceReq>);
 }
@@ -85,14 +86,14 @@ pub struct BatchDeviceRequest {
 }
 
 impl BatchDeviceRequest {
+    /// Packs Prefill requests before Decode requests and preserves order within each phase.
     pub fn new<I>(seq: RawComputeSlotSeq, dev_reqs: I) -> Self
     where
         I: IntoIterator<Item = DeviceRequest> + 'static,
     {
-        Self {
-            seq,
-            dev_reqs: dev_reqs.into_iter().collect(),
-        }
+        let mut dev_reqs: Vec<_> = dev_reqs.into_iter().collect();
+        dev_reqs.sort_by_key(|request| matches!(request.decoder_query_tokens, QueryTokens::Decode { .. }));
+        Self { seq, dev_reqs }
     }
 }
 
@@ -110,10 +111,13 @@ impl BatchDevReq<DeviceRequest> for BatchDeviceRequest {
     }
 
     fn from_parts(seq: RawComputeSlotSeq, dev_reqs: Vec<DeviceRequest>) -> Self {
-        Self { seq, dev_reqs }
+        Self::new(seq, dev_reqs)
     }
 
     fn into_inner(self) -> (RawComputeSlotSeq, Vec<DeviceRequest>) {
         (self.seq, self.dev_reqs)
     }
 }
+
+#[cfg(test)]
+mod tests;

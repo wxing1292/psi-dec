@@ -168,14 +168,6 @@ where
             Some(compute_slot_seq),
             "simple scheduler cancellation compute slot sequence mismatch"
         );
-        debug_assert!(
-            compute_slot
-                .sticky_req_ids_ref()
-                .iter()
-                .copied()
-                .eq(dev_reqs.iter().map(DevReq::id)),
-            "simple scheduler cancellation request IDs mismatch"
-        );
         compute_slot.reset();
         self.free_compute_slots.push_front(compute_slot);
 
@@ -193,14 +185,6 @@ where
             compute_slot.seq(),
             Some(compute_slot_seq),
             "simple scheduler commit compute slot sequence mismatch"
-        );
-        assert!(
-            compute_slot
-                .sticky_req_ids_ref()
-                .iter()
-                .copied()
-                .eq(dev_resps.iter().map(DevResp::id)),
-            "simple scheduler commit request IDs mismatch"
         );
         compute_slot.reset();
         self.free_compute_slots.push_back(compute_slot);
