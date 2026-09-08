@@ -1,6 +1,9 @@
 # Model State I/O Design
 
-This document defines the model-state I/O design. It separates current source from planned work.
+Model-state I/O moves mutable executor payload between backend memory and files.
+Whole-model Stop/Start preserves the live runtime object graph and its page IDs.
+Planned request and cache mobility can change physical placement.
+This document defines their separate lifecycles and shared I/O contracts.
 
 [`high_level.md`](high_level.md) defines the runtime-core and model-executor boundary.
 [`executor_hibernation.md`](executor_hibernation.md) describes the current whole-model Stop/Start path.
@@ -18,64 +21,6 @@ The repository has two model-state I/O projects.
 | Whole-model residency | Selected-state Stop/Start | Implemented with the v3 directory snapshot path |
 | Request and cache mobility | Per-request swap | Planned |
 | Request and cache mobility | Trie cache-block I/O | Planned |
-
-The Metal backend implements the standalone `BufferIO` primitive.
-The v3 model snapshot format uses `BufferIO` for each Metal buffer resource.
-
-The model executor uses one `FullStateIO` trait for component state:
-
-```rust
-pub trait FullStateIO {
-    type Files: Copy;
-
-    fn write_full_state(
-        &self,
-        writer: &mut StateSnapshotWriter,
-        files: Self::Files,
-    ) -> Result<(), ModelExecutorError>;
-
-    fn read_full_state(
-        &mut self,
-        reader: &mut StateSnapshotReader,
-        files: Self::Files,
-    ) -> Result<(), ModelExecutorError>;
-}
-```
-
-`PageArenaStateSnapshotFiles`, `GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify the files for each
-component. The same GQA implementation can serve Main, MTP, DSpark, or DFlash2. The executor therefore supplies the
-semantic file set at the model-role boundary.
-
-Each component keeps its `FullStateIO` implementation in an adjacent `file_io.rs` file. This layout keeps storage logic
-separate from forward execution and resource allocation.
-
-The same components implement the symmetric `SelectedStateIO` trait:
-
-```rust
-use std::ops::Range;
-
-pub trait SelectedStateIO: FullStateIO {
-    type ID;
-
-    fn write_selected_state(
-        &self,
-        writer: &mut StateSnapshotWriter,
-        files: Self::Files,
-        id_ranges: &[Range<Self::ID>],
-    ) -> Result<(), ModelExecutorError>;
-
-    fn read_selected_state(
-        &mut self,
-        reader: &mut StateSnapshotReader,
-        files: Self::Files,
-        id_ranges: &[Range<Self::ID>],
-    ) -> Result<(), ModelExecutorError>;
-}
-```
-
-The supertrait enforces one file identity for all-state and selected-state I/O. `PageArena` uses `RawPageID` as its
-`ID`. GQA and GDN owners use `RawRequestSlot`. These aliases expose the ID domain at each component API. The
-model owner passes each field to the component that owns its interpretation.
 
 ## Shared model
 
@@ -95,8 +40,8 @@ They do not share one lifecycle contract.
        runtime metadata is unchanged                    runtime updates placement
 ```
 
-This division produces two projects, not three projects.
-Full-state and selected-state I/O are two phases of whole-model residency.
+Full-state and selected-state I/O use the same whole-model lifecycle.
+They differ in which state entries the snapshot contains.
 
 ## Ownership
 
@@ -123,66 +68,10 @@ The Metal backend owns these concepts:
 - The `BufferIOFile` POSIX and Metal file handles.
 - File-to-buffer and buffer-to-file byte-range transfers.
 
-## `BufferIO`
-
-`BufferIO` is a concrete Metal backend component.
-It is not an executor-core trait.
-
-`BufferIO::new(&Device)` creates one serial `MTLIOCommandQueue`.
-This queue is independent from the `MTL4CommandQueue` in the compute `Stream`.
-`MetalRuntime` owns one compute `Stream` and one `BufferIO`.
-
-`BufferIO::create` creates a new output file with an explicit `BufferIOFileCacheMode`.
-`BufferIO::open` opens an existing input file with the same explicit mode.
-Both methods return one `BufferIOFile`.
-`BufferIOFile` retains one POSIX file handle and one `MTLIOFileHandle` for the same file.
-This owner prevents each range transfer from reopening the file.
-The public API does not accept `OpenOptions`.
-This restriction prevents append mode from breaking positional file offsets.
-
-`BufferIOFileCacheMode::Cached` uses the default macOS data cache.
-`BufferIOFileCacheMode::Uncached` applies `F_NOCACHE` and `F_GLOBAL_NOCACHE` before it creates the Metal file handle.
-`F_NOCACHE` selects the uncached positional-I/O path used by `buffer_to_file`.
-`F_GLOBAL_NOCACHE` applies the same cache policy to the Metal URL-backed file handle used by `file_to_buffer`.
-This mode bypasses the macOS data cache.
-It does not guarantee bypass of an SSD controller cache.
-
-The API has direction-based names:
-
-```text
-file_to_buffer(BufferIOFile, file_offset_bytes, Buffer, buffer_offset_bytes, len_bytes)
-buffer_to_file(Buffer, buffer_offset_bytes, BufferIOFile, file_offset_bytes, len_bytes)
-```
-
-Each method lists the source and its byte offset before the destination and its byte offset.
-Both methods use checked `u64` byte coordinates.
-Both methods return `std::io::Result`.
-The model executor must map a failure to `ModelExecutorError` at its boundary.
-
-`file_to_buffer` uses `MTLIOCommandBuffer::loadBuffer`. It divides ranges larger than 1 GiB into serial commands.
-Metal I/O rejects one command when its size reaches 2 GiB on the supported Apple Silicon path.
-The method waits for Metal I/O completion before it returns.
-
-`buffer_to_file` writes from `Buffer::contents()` with positional file I/O.
-The method does not allocate an application staging buffer.
-The method does not sync or publish the file.
-`BufferIOFile::sync_all` syncs the file when the snapshot owner requests it.
-
-The caller must complete earlier GPU access before either method starts.
-The caller owns later GPU synchronization, file sync, and snapshot publication.
-
-The two directions use different platform mechanisms:
-
-```text
-file -> shared Metal buffer     MTLIOCommandQueue
-shared Metal buffer -> file     positional file I/O
-```
-
-`MTL4CommandQueue` cannot use a filesystem file as a command source or destination.
-
 ## Whole-model full state
 
 The current full-state lifecycle is synchronous.
+[`executor_hibernation.md`](executor_hibernation.md#lifecycle-flow) defines the surrounding encoder and request-slot reset order.
 
 ```text
 runtime Stop
@@ -217,6 +106,7 @@ The snapshot layer uses symmetric buffer APIs:
 write_full_buffer / read_full_buffer
 write_selected_buffer / read_selected_buffer
 ```
+
 Local payload files do not contain checksums.
 
 ## Whole-model selected state
@@ -301,6 +191,27 @@ not own those page IDs.
 Each selected Metal file packs its selected entries without padding. The hibernation plan and component layout derive
 every file range. The format does not need a second per-entry index or resource-coordinate graph.
 
+For example, let the allocated `PageArena` IDs be `1`, `2`, and `5`.
+Let each page entry occupy `E` bytes.
+The canonical ID ranges are `[1, 3)` and `[5, 6)`.
+All byte ranges below have exclusive ends:
+
+```text
+                     Stop                         Start
+               device -> file                 file -> device
+
++---------+----------------+----------------+----------------+
+| Page ID | Source bytes   | Snapshot bytes | Restored bytes |
++---------+----------------+----------------+----------------+
+| 1       | [E, 2E)        | [0, E)         | [E, 2E)        |
+| 2       | [2E, 3E)       | [E, 2E)        | [2E, 3E)       |
+| 5       | [5E, 6E)       | [2E, 3E)       | [5E, 6E)       |
++---------+----------------+----------------+----------------+
+```
+
+The snapshot packs the payload. Restore returns each entry to its original page ID.
+The snapshot includes page `5` even when only a reusable trie block owns it.
+
 Selected Stop/Start does not change runtime state:
 
 ```text
@@ -381,7 +292,126 @@ Cross-node transfer can calculate SHA-256 while it reads the published state fil
 This whole-model lifecycle is not a process-restart checkpoint.
 It keeps runtime metadata in the live process while model residency is stopped.
 
+## Component state interfaces
+
+The Metal backend implements the standalone `BufferIO` primitive.
+The v3 model snapshot format uses `BufferIO` for each Metal buffer resource.
+
+The model executor uses one `FullStateIO` trait for component state:
+
+```rust
+pub trait FullStateIO {
+    type Files: Copy;
+
+    fn write_full_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        files: Self::Files,
+    ) -> Result<(), ModelExecutorError>;
+
+    fn read_full_state(
+        &mut self,
+        reader: &mut StateSnapshotReader,
+        files: Self::Files,
+    ) -> Result<(), ModelExecutorError>;
+}
+```
+
+`PageArenaStateSnapshotFiles`, `GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify the files for each
+component. The same GQA implementation can serve Main, MTP, DSpark, or DFlash2. The executor therefore supplies the
+semantic file set at the model-role boundary.
+
+Each component keeps its `FullStateIO` implementation in an adjacent `file_io.rs` file. This layout keeps storage logic
+separate from forward execution and resource allocation.
+
+The same components implement the symmetric `SelectedStateIO` trait:
+
+```rust
+use std::ops::Range;
+
+pub trait SelectedStateIO: FullStateIO {
+    type ID;
+
+    fn write_selected_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        files: Self::Files,
+        id_ranges: &[Range<Self::ID>],
+    ) -> Result<(), ModelExecutorError>;
+
+    fn read_selected_state(
+        &mut self,
+        reader: &mut StateSnapshotReader,
+        files: Self::Files,
+        id_ranges: &[Range<Self::ID>],
+    ) -> Result<(), ModelExecutorError>;
+}
+```
+
+The supertrait enforces one file identity for all-state and selected-state I/O. `PageArena` uses `RawPageID` as its
+`ID`. GQA and GDN owners use `RawRequestSlot`. These aliases expose the ID domain at each component API. The
+model owner passes each field to the component that owns its interpretation.
+
+## `BufferIO`
+
+`BufferIO` is a concrete Metal backend component.
+It is not an executor-core trait.
+
+`BufferIO::new(&Device)` creates one serial `MTLIOCommandQueue`.
+This queue is independent from the `MTL4CommandQueue` in the compute `Stream`.
+`MetalRuntime` owns one compute `Stream` and one `BufferIO`.
+
+`BufferIO::create` creates a new output file with an explicit `BufferIOFileCacheMode`.
+`BufferIO::open` opens an existing input file with the same explicit mode.
+Both methods return one `BufferIOFile`.
+`BufferIOFile` retains one POSIX file handle and one `MTLIOFileHandle` for the same file.
+This owner prevents each range transfer from reopening the file.
+The public API does not accept `OpenOptions`.
+This restriction prevents append mode from breaking positional file offsets.
+
+`BufferIOFileCacheMode::Cached` uses the default macOS data cache.
+`BufferIOFileCacheMode::Uncached` applies `F_NOCACHE` and `F_GLOBAL_NOCACHE` before it creates the Metal file handle.
+`F_NOCACHE` selects the uncached positional-I/O path used by `buffer_to_file`.
+`F_GLOBAL_NOCACHE` applies the same cache policy to the Metal URL-backed file handle used by `file_to_buffer`.
+This mode bypasses the macOS data cache.
+It does not guarantee bypass of an SSD controller cache.
+
+The API has direction-based names:
+
+```text
+file_to_buffer(BufferIOFile, file_offset_bytes, Buffer, buffer_offset_bytes, len_bytes)
+buffer_to_file(Buffer, buffer_offset_bytes, BufferIOFile, file_offset_bytes, len_bytes)
+```
+
+Each method lists the source and its byte offset before the destination and its byte offset.
+Both methods use checked `u64` byte coordinates.
+Both methods return `std::io::Result`.
+The model executor must map a failure to `ModelExecutorError` at its boundary.
+
+`file_to_buffer` uses `MTLIOCommandBuffer::loadBuffer`. It divides ranges larger than 1 GiB into serial commands.
+Metal I/O rejects one command when its size reaches 2 GiB on the supported Apple Silicon path.
+The method waits for Metal I/O completion before it returns.
+
+`buffer_to_file` writes from `Buffer::contents()` with positional file I/O.
+The method does not allocate an application staging buffer.
+The method does not sync or publish the file.
+`BufferIOFile::sync_all` syncs the file when the snapshot owner requests it.
+
+The caller must complete earlier GPU access before either method starts.
+The caller owns later GPU synchronization, file sync, and snapshot publication.
+
+The two directions use different platform mechanisms:
+
+```text
+file -> shared Metal buffer     MTLIOCommandQueue
+shared Metal buffer -> file     positional file I/O
+```
+
+`MTL4CommandQueue` cannot use a filesystem file as a command source or destination.
+
 ## Per-request swap
+
+Status: Planned. This section defines the intended contract, not a current service capability.
 
 Per-request swap is separate from whole-model residency.
 It changes runtime-visible placement and physical identity.
@@ -410,6 +440,8 @@ The request remains `Running` while it waits for a reservation.
 Reserve `Swapped` for state that is not device-resident.
 
 ## Trie cache-block I/O
+
+Status: Planned. This section defines the intended contract, not a current service capability.
 
 The trie is one logical cache across Device, Host, and Disk placement.
 

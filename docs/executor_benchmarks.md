@@ -40,6 +40,8 @@ inference-executor-metal
   real checkpoint weights and production component/layer/executor ownership
 ```
 
+For each executor component, include one-layer production forward perf and configurable setup/kernel/sub-op perf.
+
 Backend Criterion targets:
 
 ```text

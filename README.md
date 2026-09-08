@@ -1,6 +1,6 @@
 # psi-dec
 
-`psi-dec` is a production-quality Qwen inference engine for Apple Silicon.
+`psi-dec` is a Qwen inference engine for Apple Silicon.
 It combines a model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
 It supports text generation and Qwen3-ASR audio transcription.
 
@@ -20,7 +20,7 @@ Each layer has a separate owner:
 
 - **Runtime core:** Owns scheduling, request lifecycle, and cache ownership.
 - **Qwen executor:** Owns model layout, components, sampling, speculative model roles, and replay order.
-- **Metal backend:** Owns devices, buffers, kernels, recording, and ICB submission.
+- **Metal backend:** Owns devices, buffers, kernels, recording, and indirect command buffer (ICB) submission.
 
 ## Quick start
 
@@ -31,7 +31,12 @@ You need these items:
 - Xcode command-line tools
 - Hugging Face CLI with access to the model
 
-Download the Qwen3.8 dense and Qwen3.6 sparse Main and MTP checkpoints:
+Run the commands from the repository root. This example uses Qwen3.8 dense 27B with multi-token prediction (MTP).
+See [other service modes](#other-service-modes) for sparse, DSpark, and DFlash2 examples.
+
+### Download checkpoints
+
+Download the matching Main and MTP checkpoints:
 
 ```sh
 hf auth login
@@ -41,7 +46,59 @@ hf download mlx-community/Qwen3.8-27B-4bit \
 
 hf download mlx-community/Qwen3.8-27B-MTP-4bit \
   --local-dir models/Qwen3.8-27B-MTP-4bit
+```
 
+### Start the service
+
+Start the dense 27B service with MTP:
+
+```sh
+cargo run --release --bin qwen3_5_dense -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
+  --spec-type mtp \
+  --num-spec-tokens 1
+```
+
+The service unloads model state and weights after 300 seconds without executable model work.
+The next request reloads them automatically.
+
+### Send a request
+
+Stream an HTTP Chat Completions response:
+
+```sh
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
+    "stream": true,
+    "stream_options": {"include_usage": true},
+    "max_completion_tokens": 16,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "seed": 1,
+    "enable_thinking": false
+  }'
+```
+
+The [service guide](docs/service.md) also covers Main-only startup, Qwen3-ASR, gRPC, tool calls, and the HTTP APIs.
+
+## Other service modes
+
+The `qwen3_5_*` binaries support compatible Qwen3.5, Qwen3.6, and Qwen3.8 checkpoints.
+
+Each startup example uses the same listen addresses. Run one service at a time.
+
+### Sparse 35B-A3B with MTP
+
+Download the matching Main and MTP checkpoints:
+
+```sh
 hf download mlx-community/Qwen3.6-35B-A3B-4bit \
   --local-dir models/Qwen3.6-35B-A3B-4bit
 
@@ -49,9 +106,22 @@ hf download mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
   --local-dir models/Qwen3.6-35B-A3B-MTP-4bit
 ```
 
-The `qwen3_5_*` binaries support compatible Qwen3.5, Qwen3.6, and Qwen3.8 checkpoints.
+Start the sparse 35B-A3B service with MTP:
 
-### DSpark and DFlash2 checkpoints
+```sh
+cargo run --release --bin qwen3_5_sparse -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
+  --spec-type mtp \
+  --num-spec-tokens 1
+```
+
+### DSpark and DFlash2
+
+DSpark and DFlash2 support is experimental.
+See the [service guide](docs/service.md#binaries-and-checkpoints) for checkpoint and compatibility contracts.
 
 Download the BF16 speculative checkpoints from
 [RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) and
@@ -84,18 +154,6 @@ DFlash2 uses 6 bits for the selected layer 2 and layer 4 projections.
 Both formats store affine scales and biases as BF16.
 See the [service guide](docs/service.md) for the full conversion and startup contracts.
 
-Start the dense 27B service with MTP:
-
-```sh
-cargo run --release --bin qwen3_5_dense -- \
-  --grpc-listen-addr 127.0.0.1:50061 \
-  --http-listen-addr 127.0.0.1:8000 \
-  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
-  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
-  --spec-type mtp \
-  --num-spec-tokens 1
-```
-
 Start the dense 27B service with DSpark:
 
 ```sh
@@ -117,42 +175,6 @@ cargo run --release --bin qwen3_5_dense -- \
   --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-DFlash2-affine" \
   --spec-type dflash2
 ```
-
-Start the sparse 35B-A3B service with MTP:
-
-```sh
-cargo run --release --bin qwen3_5_sparse -- \
-  --grpc-listen-addr 127.0.0.1:50061 \
-  --http-listen-addr 127.0.0.1:8000 \
-  --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
-  --hf-spec-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
-  --spec-type mtp \
-  --num-spec-tokens 1
-```
-
-The service unloads model state and weights after 300 seconds without executable model work.
-The next request reloads them automatically.
-
-Stream an HTTP Chat Completions response:
-
-```sh
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "qwen3.8-27b",
-    "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
-    "stream": true,
-    "stream_options": {"include_usage": true},
-    "max_completion_tokens": 16,
-    "temperature": 0,
-    "top_k": 1,
-    "top_p": 1,
-    "seed": 1,
-    "enable_thinking": false
-  }'
-```
-
-The [service guide](docs/service.md) also covers Main-only startup, Qwen3-ASR, gRPC, tool calls, and the HTTP APIs.
 
 ## Reference performance
 

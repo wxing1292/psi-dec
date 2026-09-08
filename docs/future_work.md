@@ -84,6 +84,7 @@ remaining work is eviction policy and resumable model-state movement.
   Record snapshot bytes, write and read duration, effective bandwidth, and peak host-memory overhead before and after
   the change.
   Follow [`model_state_io.md`](model_state_io.md).
+
 ## Pipeline Parallelism
 
 - Fill all free compute slots while runnable work exists. The event loop currently calls `do_flush()` at most once for

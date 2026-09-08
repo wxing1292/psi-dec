@@ -11,6 +11,7 @@ Model owners live in:
 crates/inference-executor-metal/src/model/
   embedding.rs
   unembedding.rs
+  gather.rs
   rms_norm.rs
   residual_add.rs
 ```
@@ -32,7 +33,7 @@ crates/inference-backend-metal/src/operators/
   softmax.rs
 ```
 
-These components use the execution vocabulary in [GPU Execution Vocabulary](gpu_execution.md).
+These components use the vocabulary in [GPU Execution](gpu_execution.md).
 
 ## Embedding
 
@@ -91,10 +92,12 @@ input[row_indices[output_row], column]
     -> output[output_row, column]
 ```
 
-The private compile-time constants contain the dtype and `thread_block.required_threads = 256`. One non-persistent thread
-block processes a bounded flat range of `(output row, column)` coordinates. Fixed and parameterized active-row values
-use the same API and kernel. The total row count changes the grid. The active-row value controls the guard. Row gather has one current kernel for each
-supported dtype and does not need a registry or selector.
+The private compile-time constants contain the dtype and `thread_block.required_threads = 256`.
+One non-persistent thread block processes a bounded flat range of `(output row, column)` coordinates.
+Fixed and parameterized active-row values use the same API and kernel.
+The total row count changes the grid. The active-row value controls the guard.
+
+Row gather has one current kernel for each supported dtype. It does not need a registry or selector.
 
 ## RMSNorm
 

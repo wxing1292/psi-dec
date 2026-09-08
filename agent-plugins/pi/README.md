@@ -3,6 +3,9 @@
 This Pi extension connects Pi to the psi-dec `GenerateMessagesStream` gRPC API. One HTTP/2 gRPC stream owns one
 resident runtime session. Pi owns conversation history and compaction.
 
+Use this guide to install the extension, configure Pi, and verify a request.
+See the [service guide](../../docs/service.md) for checkpoint downloads and service configuration.
+
 ## Requirements
 
 Install these tools before you install the extension:
@@ -35,10 +38,16 @@ sed 's#../../../crates/inference-runtime-proto/proto/inference_runtime.proto#../
 )
 ```
 
-Pi discovers the extension under `~/.pi/agent/extensions/`. The install does not add a repository path to
-`~/.pi/agent/settings.json`.
+By default, Pi discovers the extension under `~/.pi/agent/extensions/`.
+If you set `PI_CODING_AGENT_DIR`, the install uses that directory instead of `~/.pi/agent`.
+The install does not add a repository path to `~/.pi/agent/settings.json`.
 
-Use a local-path package only for extension development:
+Repeat the detached install commands after an extension or protobuf change.
+After the copy completes, restart Pi or run `/reload`.
+
+### Extension development
+
+Use a local-path package only for extension development. Run these commands from the repository root:
 
 ```sh
 cd agent-plugins/pi
@@ -50,12 +59,10 @@ pi install "$PWD"
 Pi stores a local package as a path reference. It does not copy the package. Run `pi remove "$PWD"` before you use
 the detached global copy.
 
-Repeat the detached install commands after an extension or protobuf change. Restart Pi or run `/reload` after the
-copy completes.
-
 ## Start psi-dec
 
-Start one text-generation service with gRPC enabled. This example starts Qwen3.8 27B with MTP:
+Start one text-generation service with gRPC enabled.
+Run this example from the repository root to start Qwen3.8 27B with MTP:
 
 ```sh
 cargo run --release --bin qwen3_5_dense -- \
@@ -71,7 +78,10 @@ The resident provider uses the gRPC address. The OpenAI-compatible provider uses
 
 ## Configure Pi
 
-Add both providers to `~/.pi/agent/models.json` when you want resident and stateless access:
+The configuration below defines resident gRPC access and stateless HTTP access.
+Add the provider entries to `~/.pi/agent/models.json`.
+If you set `PI_CODING_AGENT_DIR`, use `models.json` in that directory.
+Keep any existing provider entries.
 
 ```json
 {
@@ -155,9 +165,7 @@ The resident provider uses these fields:
 | `id` | Pi uses this value for model selection. The running psi-dec service owns the loaded checkpoint. |
 | `contextWindow` | Pi uses this value for context accounting and compaction. It must not exceed the service limit. |
 | `maxTokens` | The extension sends this value as the default per-turn sampled-token limit. |
-| `temperature` | The extension sends this value for each turn. |
-| `top_k` | The extension sends this value for each turn. |
-| `top_p` | The extension sends this value for each turn. |
+| `temperature`, `top_k`, `top_p` | The extension sends these sampling values for each turn. |
 | `thinkingLevelMap` | Pi maps its thinking level before the extension maps the level to psi-dec reasoning effort. |
 
 Pi turn options override the model sampling defaults. The plugin does not read model settings from environment
@@ -177,14 +185,26 @@ Use the HTTP provider when you want a stateless request path:
 pi --model local/qwen3_5 --thinking high
 ```
 
-The resident provider sends the complete Pi context on the first turn. It records the submitted message cursor. Each
-later request sends only new user or tool-result messages. The same Pi session ID selects the same resident stream.
+### Resident session behavior
 
-The system prompt, tool definitions, and thinking configuration are fixed for one resident stream. The provider opens
-a new stream and sends the complete context when one of these values changes.
+Pi owns the complete conversation. A resident stream retains the runtime request across turns:
 
-An `AbortSignal` closes the full resident stream. Compaction, history rewrite, and branch do not reuse the resident
-session. Start a new Pi session with the complete context after one of these operations.
+```text
+Pi context                  Resident gRPC stream          Runtime request
+first turn: full context  -> create stream              -> materialize full prompt
+later turn: new messages  -> reuse stream               -> append prompt suffix
+```
+
+The provider records the submitted message cursor. Later messages contain only new user or tool-result content.
+These conditions control stream reuse:
+
+| Condition | Effect |
+| --- | --- |
+| Same endpoint, model ID, and Pi session ID | Reuse the stream while its configuration stays the same. |
+| No Pi session ID, or `cacheRetention` is `none` | Use a new stream for each request. |
+| System prompt, tool definitions, or thinking configuration changes | Open a new stream and send the complete context. |
+| `AbortSignal` | Close the full resident stream. |
+| Compaction, history rewrite, or branch | Do not reuse the resident session. Start a new Pi session with the complete context. |
 
 ## Verify
 
@@ -199,6 +219,3 @@ Run one request through the resident provider:
 ```sh
 pi --model psi-dec/qwen3_5 --thinking high --print "Reply with exactly: hello"
 ```
-
-The first request creates a runtime request and materializes the full prompt. A later turn in the same interactive Pi
-session appends only its new prompt suffix.

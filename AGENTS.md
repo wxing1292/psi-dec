@@ -1,63 +1,69 @@
 # Repository Instructions
 
-Start with `docs/high_level.md`. It defines shared repo rules and the runtime core vs model executor boundary.
+## Start here
 
-Focused docs:
+Read [high-level guidance](docs/high_level.md) first. It owns shared rules and runtime core / model executor boundaries.
+Use the [README](README.md) for setup and the crate map.
+Use the [documentation index](docs/README.md) to find the affected component. Read only the focused documents needed for the task.
 
-- `docs/technical_english.md`: ASD-STE100-informed writing rules for repository documentation.
-- `docs/engineering_conventions.md`: repository-wide naming, layouts, replay/resource safety, optimization, API, and test rules.
-- `docs/core.md`: runtime scheduling, lifecycle, page/cache ownership, executor notifications.
-- `docs/executor.md`: model executor architecture, symmetry, weights, and replay composition.
-- `docs/gpu_execution.md`: shared GPU launch, specialization, task, tile, layout, and planner vocabulary.
-- `docs/executor_sampling.md`: current sampling and sparse rejection source/contracts.
-- `docs/executor_benchmarks.md`: verification, benchmarks, profiling, and performance evidence.
-- `docs/service.md`: model download, server/client operation, logging, and end-to-end checks.
-- `docs/executor_gqa.md`: current GQA source layout and paths.
-- `docs/executor_gdn.md`: current Gated DeltaNet / GDN source layout and paths.
-- `docs/executor_dense_mlp.md`: current dense MLP source layout and paths.
-- `docs/executor_moe.md`: current MoE source layout and paths.
-- `docs/future_work.md`: active TODOs and future investigations.
+| Task | Required guidance |
+| --- | --- |
+| Source or API change | [Engineering conventions](docs/engineering_conventions.md) and the owning component document |
+| Rust navigation or refactoring | [Rust semantic workflow](docs/engineering_conventions.md#rust-semantic-workflow) |
+| Server, client, or logging change | [Service](docs/service.md) |
+| Metal correctness or performance | [Executor verification](docs/executor_benchmarks.md) |
+| Documentation change | [Technical English](docs/technical_english.md) |
 
-When changing GQA, Gated DeltaNet, dense MLP, MoE, sampling, or MTP source layout/default paths, update the matching `docs/executor_*.md` in the same change. When changing service commands or logging, update `docs/service.md`. Current-component docs should describe current `src`, not planned cleanup.
+## Critical constraints
 
-## Documentation style
+- Runtime core owns scheduling, requests, token/block metadata, page allocation/free, and cache lifecycle.
+  The model executor consumes metadata and page IDs. It owns model layout, computation, and component-local page interpretation.
+- Return the shared typed `Error` for recoverable failures, with caller-visible semantics.
+  Use assertions or panics for internal invariant violations.
+  Release `assert!` is limited to initialization, one-time structural/ownership boundaries, or contracts that release code must enforce.
+  Use `debug_assert!` for repeated internal checks that add release hot-path noise.
+- Keep items private unless an intentional API needs `pub`. Do not use `pub(crate)` or `pub(super)`.
+- Validate external inputs and configuration at the owning boundary.
+  Use ordinary arithmetic and direct lossless casts in the same owner's private path after validation proves the domain.
+  Keep checked arithmetic at real runtime, allocation, file, snapshot, narrowing, shader-domain, and state-version boundaries.
+- Cached replay takes `num_active_*` at submission. Its key contains `num_total_*`, topology, and other record-time static facts.
+  Keep active and total counts separate even when equal.
+- Match peer ownership and APIs when contracts match. Do not add entities only for visual symmetry.
+  Do not reshape production `src` only to make benchmarks easier.
 
-- Use the ASD-STE100-informed style in `docs/technical_english.md` for new and revised documentation.
-- Preserve technical meaning, requirement strength, code, commands, paths, identifiers, API names, equations, and numeric values.
-- Do not claim certified or full ASD-STE100 compliance without an authorized review.
+## Verification
 
-## Shared hard constraints
+Run commands from the repository root. Match checks to the changed contract:
 
-- Use `panic!`, `assert!`, and `debug_assert!` for internal invariant or contract violations. Use release `assert!` only at init-time, one-time structural or ownership boundaries, or contracts whose enforcement is absolutely necessary in release. Repeated internal bug checks that would add release hot-path noise belong in `debug_assert!`; cover them with tests and debug builds. Classify by lifecycle and cost instead of converting checks mechanically.
-- Use the shared typed `Error` for recoverable failures, choosing the variant by caller-visible semantics. Internal invariant violations remain assertions or panics.
-- Do not use `pub(crate)` or `pub(super)`. Keep items private unless intentionally exported with `pub`.
-- Prefer transferable symmetry across peer components. Use the same owner boundaries, API vocabulary, and structure when
-  the contracts match. Zero duplication is not a goal. Do not add a type, trait, wrapper, field, or lifecycle operation
-  only to create visual symmetry.
-- Validate external input and configuration limits at the owning boundary. Use ordinary arithmetic and direct lossless
-  casts in the same owner's private path after that boundary proves the result. Keep checked arithmetic at real runtime,
-  allocation, file, snapshot, narrowing, shader-domain, and state-version boundaries.
-- For each cached replay work domain, supply `num_active_*` as a submission parameter. Put `num_total_*`, topology, and
-  other record-time static facts in the replay key. Keep `num_active_*` and `num_total_*` separate even when their values
-  are equal. Follow `docs/engineering_conventions.md` for replay tests and capacity selection.
-- When working with Rust, use rust-analyzer semantic operations whenever applicable: definition/reference lookup, type and diagnostic inspection, rename, and refactoring. Prefer them over textual heuristics for symbol identity and bindings; use `rg` for textual discovery, not as a substitute for semantic analysis. Rename each binding or item independently when the same spelling appears in multiple scopes. Rust-analyzer does not cover Metal, generated source strings, docs, inactive configurations, or host↔shader ABI correspondence, so audit those boundaries separately and still check for shadowing, stale references, and semantic-equivalence regressions.
-- Run Rust formatting as `cargo +nightly fmt`.
-- Do not reshape production `src` only to make benchmarks easier.
+| Change | Verification |
+| --- | --- |
+| Documentation only | Check links, source references, command accuracy, and `git diff --check` |
+| Source behavior | Run focused owner tests, then relevant package tests |
+| Broad Rust change | Run all compile gates below before handoff |
+| Runtime, executor, or RPC acceptance | Exercise the production path through an external caller, following the service and executor guides |
 
-## Runtime core vs model executor
+Format Rust with `cargo +nightly fmt`. The compile gates are:
 
-Runtime core owns scheduling, request lifecycle, token/block metadata, KV/state page allocation/free, page ownership, and cache/state lifecycle notifications.
+```sh
+cargo +nightly fmt --all -- --check
+cargo check --workspace --all-targets --all-features
+cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
+git diff --check
+```
 
-The model executor owns model execution, model layout parsing, backend-side tensor/state objects, GQA, Gated DeltaNet, dense MLP, MoE, component-local page interpretation, profiling, and benchmarking.
+Run Metal/GPU and perf/bench commands one at a time across agents and processes.
+Do not use parallel workspace tests as a GPU gate.
+Before a performance claim, record commit, dirty state, model, command, environment, metric, baseline, current result, and verdict.
+Keep force-sync/profile-summary results separate from normal wall-clock throughput.
 
-The executor consumes runtime-provided metadata and page IDs. It should not become the scheduler. Runtime core should not parse model-specific tensor layout.
+## Documentation and handoff
 
-## Performance work
+Use ASD-STE100-informed prose. Preserve technical meaning, requirement strength, and exact technical text.
+Update the owning component document in the same change when source layout or default paths change.
+This includes GQA, GDN, dense MLP, MoE, sampling, and MTP.
+Update `docs/service.md` when service commands or logging change.
+Current-component documents describe current `src`. Put active follow-up work in `docs/future_work.md`.
 
-For Metal executor/backend performance work:
-
-- Do not claim a gain or degradation without recording commit, dirty state, model, command, environment, metric, baseline, current result, and verdict.
-- Keep force-sync/profile-summary data separate from normal wall-clock throughput.
-- Run perf/bench commands one at a time. Do not parallelize them; memory pressure and GPU contention can invalidate results.
-- Follow `docs/executor_benchmarks.md`: per executor component, include one-layer production forward perf and configurable setup/kernel/sub-op perf.
-- Bench keys should include only dimensions with clear comparison value. Do not include default `layer0`, generic words like `detail`, or values already available as metadata.
+Preserve unrelated work. Keep delegated scopes separate and coordinate shared resources.
+Follow the [definition of done](docs/high_level.md#definition-of-done).
+Report the change, verification results, and remaining limitations.

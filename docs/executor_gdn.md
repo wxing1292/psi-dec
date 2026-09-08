@@ -3,6 +3,16 @@
 This document describes the current GDN implementation. It covers tensor geometry, state transactions, Metal
 projection, short convolution, ragged recurrence, and state-page I/O.
 
+Use these sections for common tasks:
+
+| Task | Section |
+| --- | --- |
+| Locate implementation files and tensor definitions | [Source layout](#source-layout) and [Tensor and axis vocabulary](#tensor-and-axis-vocabulary) |
+| Check host/Metal metadata contracts | [Canonical metadata and host/Metal ABI](#canonical-metadata-and-hostmetal-abi) |
+| Trace state ownership and replay | [Ownership](#ownership), [Replay contract](#replay-contract), and [State data flow](#state-data-flow) |
+| Select correctness checks and benchmarks | [Tests and benches](#tests-and-benches) |
+| Review measured storage and replay changes | [BF16 storage conversion evidence](#bf16-storage-conversion-evidence) and [Fixed mixed replay verification](#fixed-mixed-replay-verification-2026-09-07) |
+
 ## Source layout
 
 ```text

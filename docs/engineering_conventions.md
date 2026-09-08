@@ -46,6 +46,15 @@ must not change only to reduce test setup or expose an implementation detail.
 Runtime core must not own model-specific GQA, GDN, MLP, MoE, sampling, MTP, or DSpark policy. The model executor owns
 these semantics. The Metal backend owns their reusable kernels and dispatch implementation.
 
+## Rust semantic workflow
+
+Use rust-analyzer semantic operations when applicable: definitions, references, types, diagnostics, rename, and refactoring.
+Use `rg` for textual discovery. Do not substitute text matching for symbol identity or binding analysis.
+Rename each binding or item independently when the same spelling occurs in multiple scopes.
+
+Audit Metal, generated source strings, documentation, inactive configurations, and host↔shader ABI correspondence separately.
+Rust-analyzer does not cover these boundaries. Check shadowing, stale references, and semantic-equivalence regressions.
+
 ## Naming and coordinate domains
 
 Recommendation: Names show their domain semantics. Use established component abbreviations as type prefixes. Examples
@@ -63,6 +72,8 @@ and state coordinates. Keep these names when the implementation sends the values
 
 Use `num_*` for a valid typed work count. Use `total_*` for a padded dispatch, replay, scratch, or capacity extent.
 Name the item that the value counts.
+For cached replay domains, use the specific `num_active_<domain>` and `num_total_<domain>` names defined under
+[Runtime shapes and persistent layouts](#runtime-shapes-and-persistent-layouts).
 
 Do not use `element` or an unqualified `size` for a tensor or domain. Use `*_bytes` for these byte values:
 
@@ -249,6 +260,8 @@ Keep runtime or replay shapes separate from initialization capacity and storage 
 
 `*ReplayShape` contains only values that define one recording. These values include recorded capacities, topology, and
 static geometry. Submission input contains the active counts and other dynamic values.
+The replay shape does not contain initialization capacities, persistent-buffer strides, or storage coordinates.
+A replay capacity can equal an initialization limit, but it has a different owner and meaning.
 
 A reusable leaf component may use one `*Shape` for exact and bucketed invocations. Keep this shape when it owns shape
 validation or derived execution extents, or when it preserves the contract of peer components. Do not remove it only
@@ -269,9 +282,6 @@ Use `num_<domain>` only when the component has no replayed active and total dist
 
 Remove an exact API or a shared shape only after a repository-wide reference audit confirms that production does not
 use it. Tests and benchmarks are not sufficient evidence of production ownership.
-
-It does not contain initialization capacities, persistent-buffer strides, or storage coordinates. A replay capacity
-can equal an initialization limit, but it has a different owner and meaning.
 
 Use `*Layout` for an object that primarily describes persistent tensor dimensions. Do not name this object `*Shape`.
 

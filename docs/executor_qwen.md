@@ -90,7 +90,7 @@ crates/inference-executor-metal/src/
         gqa.rs              Qwen3 Main ungated GQA weights, state, load, and record
         layer.rs            fixed Qwen3MainLayer and Qwen3MainLayerScratch
         output.rs           Qwen3 gather/unembed component and replay key
-        plan.rs             Qwen3 QKV GQA and dense-MLP core/Metal configuration
+        component_config.rs Qwen3 QKV GQA and dense-MLP core/Metal configuration
       executor/
         mod.rs              Qwen3Executor, private pending transactions, and runtime integration
         load.rs             separate Vanilla and DSpark top-down load
@@ -115,7 +115,7 @@ crates/inference-executor-metal/src/
         mod.rs              supported one-layer Qwen35MTP owner and replay key
         embed.rs            Qwen35MTPEmbed and its replay key
         layer.rs            Qwen35MTPLayer and role-specific scratch
-      plan.rs               Qwen35 component configuration and MTP validation
+      component_config.rs   Qwen35 component configuration and MTP validation
       executor/
         mod.rs              Qwen35Executor fields and ReplayableDecoderModel integration
         load.rs             layer count pass and separate Vanilla/MTP/DSpark/DFlash2 top-down load
