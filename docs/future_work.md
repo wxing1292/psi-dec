@@ -225,10 +225,8 @@ component path as the design.
 
 ## Model and Backend Investigations
 
-- Extend the independent GDN recurrent/conv version maps for C4 only after the owner can late-bind recurrent slots.
-  The selected recurrent version is not known at `begin_txn(...)`. Commit 2 must bind one replay destination slot to
-  the accepted state version and to each known publish target that replay satisfies. It must not register every
-  candidate version in `recurrent_materialized_state_versions`. That behavior would recreate C0 recurrent capacity.
+- Measure the GDN short-input routing threshold and per-forward replay commit with controlled old/new runs.
+  Current commit materializes only the accepted final state and cache boundaries. Keep that capacity bound.
 - Audit Qwen3 and Qwen3.5 tensor-level quantization overrides outside MoE routing.
   Their current Main and MTP GQA, GDN, and MLP builders use model-level affine defaults.
   Confirm the supported checkpoint contracts before changing the loaders.

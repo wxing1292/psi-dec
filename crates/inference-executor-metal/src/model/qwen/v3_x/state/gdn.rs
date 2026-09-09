@@ -7,7 +7,6 @@ use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
-use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::backend::GDN;
@@ -45,7 +44,7 @@ pub struct Qwen3xGDNState {
     replay_bucket_policy: GDNReplayBucketPolicy,
     request_state_table: GDNRequestStateTable,
     state_restore: Replay<GDNStateRestore>,
-    pending_publish: Option<MetalReplaySubmission>,
+    pending_commit: Option<MetalReplaySubmission>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -125,6 +124,7 @@ impl Qwen3xGDNState {
             num_tokens_per_block,
             num_cache_pages,
             page_bytes,
+            max_tokens,
         );
         let backend = Rc::new(GDN::new(device, representative.clone(), metal));
         let max_requests = num_req_slots
@@ -143,7 +143,7 @@ impl Qwen3xGDNState {
             replay_bucket_policy,
             request_state_table,
             state_restore: Replay::new("qwen3.x GDN state restore", GDNStateRestore),
-            pending_publish: None,
+            pending_commit: None,
         }
     }
 
@@ -172,7 +172,8 @@ impl Qwen3xGDNState {
         block_indices: &[usize],
         token_indices: &[u32],
         cu_tokens: &[u32],
-        state_txns: &[GDNStateTxn],
+        num_spec_tokens: &[u32],
+        num_chunkwise_requests: usize,
         state_page_ids_by_req: &[Vec<Vec<u32>>],
     ) -> GDNPreparedRequestState {
         self.request_state_table.prepare(
@@ -180,7 +181,8 @@ impl Qwen3xGDNState {
             block_indices,
             token_indices,
             cu_tokens,
-            state_txns,
+            num_spec_tokens,
+            num_chunkwise_requests,
             state_page_ids_by_req,
         )
     }
@@ -207,7 +209,7 @@ impl Qwen3xGDNState {
     }
 
     pub fn replay_topology(&self) -> GDNReplayTopology {
-        self.backend().replay_topology(self.metadata(), true)
+        self.backend().replay_topology(self.metadata())
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
@@ -247,27 +249,29 @@ impl Qwen3xGDNState {
 
     pub fn commit(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer, state_versions: &[u32]) {
         assert!(
-            self.pending_publish.is_none(),
-            "GDN cache publish cannot overlap a previous publish"
+            self.pending_commit.is_none(),
+            "GDN commit cannot overlap a previous commit"
         );
-        self.request_state_table.commit(state_versions);
+        let jobs = self.request_state_table.commit(state_versions);
         let mut recorder = runtime.create_recorder();
-        if self.request_state_table.record_publish(&mut recorder, pages) {
-            self.pending_publish = Some(runtime.submit_replay(&recorder.build()));
+        let has_commit = self.request_state_table.record_commit(&mut recorder, &jobs);
+        let has_publish = self.request_state_table.record_publish(&mut recorder, pages);
+        if has_commit || has_publish {
+            self.pending_commit = Some(runtime.submit_replay(&recorder.build()));
         }
     }
 
-    pub fn finish_publish(&mut self) {
-        if let Some(submission) = self.pending_publish.take() {
+    pub fn finish_commit(&mut self) {
+        if let Some(submission) = self.pending_commit.take() {
             submission.wait();
         }
-        self.request_state_table.finish_publish();
+        self.request_state_table.finish_commit();
     }
 
     pub fn clear_replay_cache(&mut self) {
         assert!(
-            self.pending_publish.is_none(),
-            "GDN replay cache cannot be cleared while a state publish is pending"
+            self.pending_commit.is_none(),
+            "GDN replay cache cannot be cleared while a state commit is pending"
         );
         self.state_restore.clear();
     }

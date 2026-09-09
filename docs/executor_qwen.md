@@ -984,14 +984,14 @@ The generic `GQARequestPageTable` exposes only per-layer entry access for page I
 `Qwen35MTP` keeps its separate runtime lane-to-GQA-layer mapping.
 
 `Qwen3xGDNState` groups a backend, scratch, request state table, metadata, cached restore replay, and one optional
-asynchronous publish.
+asynchronous state commit and publication.
 The current Qwen3.5 executor must own one `Qwen3xGDNState`.
 The executor thread prepares it synchronously:
 
 ```text
 Main GQA write_page_ids
 Main GQA prepare_metadata
-Main GDN prepare_states(req_slots, block_indices, token_indices, cu_tokens, state_txns, state_page_ids_by_req)
+Main GDN prepare_states(req_slots, block_indices, token_indices, cu_tokens, num_spec_tokens, num_chunkwise_requests, state_page_ids_by_req)
 Main GDN prepare_metadata(cu_tokens, prepared_states)
 Qwen3.5 MTP page-table prepare
 optional GDN restore + wait
@@ -1005,24 +1005,24 @@ No prepare worker, channel, or receiver exists.
 GDN restore refreshes page-I/O staging on every batch.
 It records only on a replay miss and waits before Main.
 Commit selects verified state versions.
-It starts an uncached publish when jobs exist.
+It reconstructs replay states and publishes cache pages in one uncached submission when jobs exist.
 
 MTP keeps the GDN current version aligned with the Main runtime cache frontier.
 For one request, Main calculates `num_fixed_tokens = num_total_tokens - num_spec_tokens`.
 It commits `input_state_version + num_fixed_tokens + num_accepted_tokens`.
 `num_spec_tokens` does not directly adjust this state version.
 The next Main call starts at that selected state version. It does not replay verified tail tokens.
-The transaction keeps `S + 1` candidates for a request that verifies `S` speculative tokens.
+A replay transaction permits `S + 1` accepted-prefix choices for `S` speculative tokens. It retains deltas until commit.
 DSpark, DFlash2, and MTP use the same unshifted Main state-version domain.
 Cache-boundary versions are an independent materialization requirement.
-The final Main state is always a candidate. Rejection can select an earlier candidate and discard later states.
+Commit materializes the selected final state and accepted cache boundaries. It does not materialize rejected prefixes.
 The next newly sampled token index remains the verified state version.
 Runtime can represent a full prompt as `QueryTokens::Decode` when the prompt fits the token budget, so this rule also
 applies to that zero-spec warm-up.
 `QueryTokens::Prefill` commits its full window.
 
-Runtime core can receive the response while publish continues.
-The next prepare or reset waits before it reuses shared page-I/O or live-state resources.
+Runtime core can receive the response while state reconstruction and publication continue.
+The next prepare or reset waits before it reuses replay logs, page-I/O staging, or live-state resources.
 
 Whole-request reset enters through `Qwen35Executor::reset_req_slots`.
 It fans out to sampling, Main GQA, the selected Spec owner, and Main GDN.
@@ -1083,11 +1083,9 @@ Main K/V and persistent DSpark context K/V share one runtime cache-block lifecyc
 The executor owns separate page tables and splits each runtime page span.
 Proposal-local Q/K/V and attention partials remain in executor-owned `BiDiBlockGQAScratch`.
 
-Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
-For DSpark, `num_spec_tokens` is the checkpoint `block_size`.
-For DFlash2, `num_spec_tokens` is the checkpoint `block_size - 1`.
-MTP uses the same decision-candidate count without a state-version shift.
-Each mode also reserves cache-block boundary state slots.
+Qwen3.5 GDN uses the same accepted-prefix replay commit for MTP, DSpark, and DFlash2.
+It retains per-forward deltas and materializes only the accepted final state and crossed cache boundaries.
+The state-slot capacity does not grow with speculative width. See [`executor_gdn.md`](executor_gdn.md).
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, DSpark, and DFlash2.
 These state buffers remain allocated and reusable while model state is loaded.
 `unload_state` writes persistent cache state to SSD and releases its loaded resources.

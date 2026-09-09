@@ -50,7 +50,6 @@ use inference_backend_metal::metal::ReplayExecution;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
-use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::backend::runtime::Runtime;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::ModelOutputTiming;
@@ -770,7 +769,7 @@ impl Qwen35Executor {
     }
 
     pub fn clear_replay_cache(&mut self) {
-        self.finish_cache_publish();
+        self.finish_gdn_commit();
         self.main_text_embed.clear();
         if let Some(main_resource_embed) = &mut self.main_resource_embed {
             main_resource_embed.clear();
@@ -831,7 +830,7 @@ impl Qwen35Executor {
     }
 
     fn write_state(&mut self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError> {
-        self.finish_cache_publish();
+        self.finish_gdn_commit();
         assert!(
             self.pending_transactions.is_empty(),
             "qwen3.5 state snapshots require all pending model transactions to complete"
@@ -1088,7 +1087,7 @@ impl ReplayableDecoderModel for Qwen35Executor {
     }
 
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
-        self.finish_cache_publish();
+        self.finish_gdn_commit();
         self.request_sampling.reset(request_slots);
         self.main_gqa_state.reset_req_slots(request_slots);
         self.speculator.reset_req_slots(request_slots);
@@ -1116,7 +1115,7 @@ impl ReplayableDecoderModel for Qwen35Executor {
     }
 
     fn prepare_batch(&mut self, core_batch_req: &mut BatchDeviceRequest) -> Self::ModelBatchRequest {
-        self.finish_cache_publish();
+        self.finish_gdn_commit();
         let batch_seq = core_batch_req.seq;
         self.validate_input(core_batch_req);
         let gdn = self.main_gdn_state.backend();
@@ -1201,17 +1200,6 @@ impl ReplayableDecoderModel for Qwen35Executor {
                 "text-only Qwen3.5 does not accept resource placements"
             );
         }
-        let gdn_states_start = Instant::now();
-        let gdn_prepared = self.main_gdn_state.prepare_states(
-            microbatch.req_slots(),
-            microbatch.block_indices(),
-            microbatch.token_indices(),
-            microbatch.cu_tokens(),
-            microbatch.gdn_state_txns(),
-            microbatch.gdn_state_page_ids_by_req(),
-        );
-        let gdn_states_elapsed = gdn_states_start.elapsed();
-        let gdn_metadata_start = Instant::now();
         let num_active_chunkwise_requests = (0..microbatch.num_reqs())
             .take_while(|&req_index| {
                 !microbatch.is_decode_req(req_index)
@@ -1231,6 +1219,20 @@ impl ReplayableDecoderModel for Qwen35Executor {
             }),
             "Qwen3.5 batch requests must have a chunkwise prefix"
         );
+        let gdn_states_start = Instant::now();
+        let gdn_prepared = self.main_gdn_state.prepare_states(
+            microbatch.req_slots(),
+            microbatch.block_indices(),
+            microbatch.token_indices(),
+            microbatch.cu_tokens(),
+            &(0..microbatch.num_reqs())
+                .map(|req_index| microbatch.num_spec_tokens(req_index))
+                .collect::<Vec<_>>(),
+            num_active_chunkwise_requests,
+            microbatch.gdn_state_page_ids_by_req(),
+        );
+        let gdn_states_elapsed = gdn_states_start.elapsed();
+        let gdn_metadata_start = Instant::now();
         let gdn_shape = self.main_gdn_state.prepare_metadata(
             microbatch.cu_tokens(),
             num_active_chunkwise_requests as u32,

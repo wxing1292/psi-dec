@@ -141,15 +141,14 @@ impl Qwen35Executor {
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         self.main_gdn_state
             .commit(&runtime, self.pages.buffer(), &dst_state_versions);
-        // Publish is submitted asynchronously here and overlaps returning the
-        // response to runtime core. The next prepare/reset waits before reusing
-        // the shared GDN page-I/O staging and live-state resources.
+        // State reconstruction and publish share one asynchronous submission.
+        // The next prepare/reset waits before reusing logs, state slots, or page staging.
     }
 
-    fn finish_cache_publish(&mut self) {
+    fn finish_gdn_commit(&mut self) {
         let start = Instant::now();
-        self.main_gdn_state.finish_publish();
-        trace::qwen35_state(|| format!("event=cache_publish_wait elapsed_us={}", start.elapsed().as_micros()));
+        self.main_gdn_state.finish_commit();
+        trace::qwen35_state(|| format!("event=gdn_commit_wait elapsed_us={}", start.elapsed().as_micros()));
     }
 
     fn write_token_ids(&self, token_ids: &[i32]) {

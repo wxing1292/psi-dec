@@ -16,8 +16,8 @@ pub struct GDNRequestSlots {
     current_state_versions: Vec<u32>,
     free_recurrent_state_slots: VecDeque<u32>,
     free_conv_state_slots: VecDeque<u32>,
-    txn_recurrent_state_slots: Vec<Vec<(u32, u32)>>,
-    txn_conv_state_slots: Vec<Vec<(u32, u32)>>,
+    materialized_recurrent_state_slots: Vec<Vec<(u32, u32)>>,
+    materialized_conv_state_slots: Vec<Vec<(u32, u32)>>,
     pending_publish_pages: Vec<Vec<(u32, Vec<u32>)>>,
     num_state_slots_per_req: usize,
 }
@@ -30,7 +30,7 @@ impl GDNRequestSlots {
         );
         assert!(
             num_state_slots_per_req >= 2,
-            "GDN request state table requires at least current and candidate states"
+            "GDN request state table requires at least current and destination states"
         );
         let num_state_slots_usize = num_req_slots
             .checked_mul(num_state_slots_per_req)
@@ -60,8 +60,8 @@ impl GDNRequestSlots {
             current_state_versions: vec![0; num_req_slots],
             free_recurrent_state_slots,
             free_conv_state_slots,
-            txn_recurrent_state_slots: vec![Vec::new(); num_req_slots],
-            txn_conv_state_slots: vec![Vec::new(); num_req_slots],
+            materialized_recurrent_state_slots: vec![Vec::new(); num_req_slots],
+            materialized_conv_state_slots: vec![Vec::new(); num_req_slots],
             pending_publish_pages: vec![Vec::new(); num_req_slots],
             num_state_slots_per_req,
         };
@@ -87,70 +87,59 @@ impl GDNRequestSlots {
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
-    pub fn begin_txn(
+    pub fn prepare_states(
         &mut self,
         req_slot: u32,
         recurrent_materialized_state_versions: &[u32],
         conv_materialized_state_versions: &[u32],
-        publish_pages: Vec<GDNStatePages>,
     ) {
         let raw_req_slot = req_slot;
         let req_slot_index = self.req_slot_index(req_slot);
         trace::gdn_state(|| {
-            let publish_versions = publish_pages
-                .iter()
-                .map(|pages| pages.state_version)
-                .collect::<Vec<_>>();
             format!(
-                "event=gdn_table_begin_txn req_slot={} current_recurrent_slot={} current_conv_slot={} \
-                 current_version={} materialized_versions={:?} publish_versions={:?} free_recurrent_slots={} \
-                 free_conv_slots={}",
+                "event=gdn_table_prepare_states req_slot={} current_recurrent_slot={} current_conv_slot={} \
+                 current_version={} materialized_versions={:?} free_recurrent_slots={} free_conv_slots={}",
                 raw_req_slot,
                 self.current_recurrent_state_slots[req_slot_index],
                 self.current_conv_state_slots[req_slot_index],
                 self.current_state_versions[req_slot_index],
                 (recurrent_materialized_state_versions, conv_materialized_state_versions),
-                publish_versions,
                 self.free_recurrent_state_slots.len(),
                 self.free_conv_state_slots.len()
             )
         });
         assert!(
-            self.txn_recurrent_state_slots[req_slot_index].is_empty(),
-            "GDN request state table cannot begin a txn with live recurrent candidate state slots"
+            self.materialized_recurrent_state_slots[req_slot_index].is_empty(),
+            "GDN request state table cannot prepare states with live recurrent destinations"
         );
         assert!(
-            self.txn_conv_state_slots[req_slot_index].is_empty(),
-            "GDN request state table cannot begin a txn with live convolution candidate state slots"
+            self.materialized_conv_state_slots[req_slot_index].is_empty(),
+            "GDN request state table cannot prepare states with live convolution destinations"
         );
         let current_state_version = self.current_state_versions[req_slot_index];
-        allocate_txn_state_slots(
+        allocate_state_slots(
             current_state_version,
             recurrent_materialized_state_versions,
             self.num_state_slots_per_req,
             &mut self.free_recurrent_state_slots,
-            &mut self.txn_recurrent_state_slots[req_slot_index],
+            &mut self.materialized_recurrent_state_slots[req_slot_index],
             "recurrent",
         );
-        allocate_txn_state_slots(
+        allocate_state_slots(
             current_state_version,
             conv_materialized_state_versions,
             self.num_state_slots_per_req,
             &mut self.free_conv_state_slots,
-            &mut self.txn_conv_state_slots[req_slot_index],
+            &mut self.materialized_conv_state_slots[req_slot_index],
             "convolution",
         );
-        self.pending_publish_pages[req_slot_index].retain(|(state_version, _)| *state_version > current_state_version);
-        for pages in publish_pages {
-            self.set_pending_publish_pages(req_slot_index, pages.state_version, pages.page_ids);
-        }
         trace::gdn_state(|| {
             format!(
-                "event=gdn_table_begin_txn_done req_slot={} txn_recurrent_slots={:?} txn_conv_slots={:?} \
-                 queued_publish_versions={:?} free_recurrent_slots={} free_conv_slots={}",
+                "event=gdn_table_prepare_states_done req_slot={} materialized_recurrent_slots={:?} \
+                 materialized_conv_slots={:?} queued_publish_versions={:?} free_recurrent_slots={} free_conv_slots={}",
                 raw_req_slot,
-                self.txn_recurrent_state_slots[req_slot_index],
-                self.txn_conv_state_slots[req_slot_index],
+                self.materialized_recurrent_state_slots[req_slot_index],
+                self.materialized_conv_state_slots[req_slot_index],
                 self.pending_publish_pages[req_slot_index]
                     .iter()
                     .map(|(state_version, _)| *state_version)
@@ -161,49 +150,58 @@ impl GDNRequestSlots {
         });
     }
 
-    fn candidate_state_slot(
+    pub fn set_publish_pages(&mut self, req_slot: u32, publish_pages: Vec<GDNStatePages>) {
+        let req_slot_index = self.req_slot_index(req_slot);
+        let current_state_version = self.current_state_versions[req_slot_index];
+        self.pending_publish_pages[req_slot_index].retain(|(state_version, _)| *state_version > current_state_version);
+        for pages in publish_pages {
+            self.set_pending_publish_pages(req_slot_index, pages.state_version, pages.page_ids);
+        }
+    }
+
+    fn materialized_state_slot(
         &self,
         req_slot: u32,
         candidate_state_version: u32,
         current_state_slots: &[u32],
-        txn_state_slots: &[Vec<(u32, u32)>],
+        materialized_state_slots: &[Vec<(u32, u32)>],
     ) -> u32 {
         let req_slot_index = self.req_slot_index(req_slot);
         assert!(
             candidate_state_version >= self.current_state_versions[req_slot_index],
-            "GDN candidate state_version must not precede current state_version"
+            "GDN materialized state_version must not precede current state_version"
         );
         if candidate_state_version == self.current_state_versions[req_slot_index] {
             return current_state_slots[req_slot_index];
         }
-        if let Some((_, state_slot)) = txn_state_slots[req_slot_index]
+        if let Some((_, state_slot)) = materialized_state_slots[req_slot_index]
             .iter()
             .find(|&&(state_version, _)| state_version == candidate_state_version)
         {
             return *state_slot;
         }
-        panic!("GDN candidate state_version must be registered when beginning txn");
+        panic!("GDN materialized state_version must have a prepared destination");
     }
 
-    pub fn candidate_recurrent_state_slot(&self, req_slot: u32, candidate_state_version: u32) -> u32 {
-        self.candidate_state_slot(
+    pub fn materialized_recurrent_state_slot(&self, req_slot: u32, candidate_state_version: u32) -> u32 {
+        self.materialized_state_slot(
             req_slot,
             candidate_state_version,
             &self.current_recurrent_state_slots,
-            &self.txn_recurrent_state_slots,
+            &self.materialized_recurrent_state_slots,
         )
     }
 
-    pub fn candidate_conv_state_slot(&self, req_slot: u32, candidate_state_version: u32) -> u32 {
-        self.candidate_state_slot(
+    pub fn materialized_conv_state_slot(&self, req_slot: u32, candidate_state_version: u32) -> u32 {
+        self.materialized_state_slot(
             req_slot,
             candidate_state_version,
             &self.current_conv_state_slots,
-            &self.txn_conv_state_slots,
+            &self.materialized_conv_state_slots,
         )
     }
 
-    pub fn txn_publish_state_versions(&self, req_slot: u32) -> impl Iterator<Item = u32> + '_ {
+    pub fn pending_publish_state_versions(&self, req_slot: u32) -> impl Iterator<Item = u32> + '_ {
         self.pending_publish_pages[self.req_slot_index(req_slot)]
             .iter()
             .map(|(state_version, _)| *state_version)
@@ -222,23 +220,23 @@ impl GDNRequestSlots {
         trace::gdn_state(|| {
             format!(
                 "event=gdn_table_reset_req_slot req_slot={} old_current_recurrent_slot={} old_current_conv_slot={} \
-                 old_current_version={} txn_recurrent_slots={:?} txn_conv_slots={:?}",
+                 old_current_version={} materialized_recurrent_slots={:?} materialized_conv_slots={:?}",
                 raw_req_slot,
                 self.current_recurrent_state_slots[req_slot_index],
                 self.current_conv_state_slots[req_slot_index],
                 self.current_state_versions[req_slot_index],
-                self.txn_recurrent_state_slots[req_slot_index],
-                self.txn_conv_state_slots[req_slot_index]
+                self.materialized_recurrent_state_slots[req_slot_index],
+                self.materialized_conv_state_slots[req_slot_index]
             )
         });
         self.free_recurrent_state_slots
             .push_back(self.current_recurrent_state_slots[req_slot_index]);
         self.free_conv_state_slots
             .push_back(self.current_conv_state_slots[req_slot_index]);
-        for (_, state_slot) in self.txn_recurrent_state_slots[req_slot_index].drain(..) {
+        for (_, state_slot) in self.materialized_recurrent_state_slots[req_slot_index].drain(..) {
             self.free_recurrent_state_slots.push_back(state_slot);
         }
-        for (_, state_slot) in self.txn_conv_state_slots[req_slot_index].drain(..) {
+        for (_, state_slot) in self.materialized_conv_state_slots[req_slot_index].drain(..) {
             self.free_conv_state_slots.push_back(state_slot);
         }
         self.current_recurrent_state_slots[req_slot_index] = self
@@ -254,34 +252,34 @@ impl GDNRequestSlots {
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
-    pub fn commit_txn(&mut self, req_slot: u32, state_version: u32) -> Vec<GDNStatePublish> {
+    pub fn commit(&mut self, req_slot: u32, state_version: u32) -> Vec<GDNStatePublish> {
         let raw_req_slot = req_slot;
         let req_slot_index = self.req_slot_index(req_slot);
         trace::gdn_state(|| {
             format!(
-                "event=gdn_table_commit_txn req_slot={} requested_version={} current_recurrent_slot={} \
-                 current_conv_slot={} current_version={} txn_recurrent_slots={:?} txn_conv_slots={:?}",
+                "event=gdn_table_commit req_slot={} requested_version={} current_recurrent_slot={} \
+                 current_conv_slot={} current_version={} materialized_recurrent_slots={:?} \
+                 materialized_conv_slots={:?}",
                 raw_req_slot,
                 state_version,
                 self.current_recurrent_state_slots[req_slot_index],
                 self.current_conv_state_slots[req_slot_index],
                 self.current_state_versions[req_slot_index],
-                self.txn_recurrent_state_slots[req_slot_index],
-                self.txn_conv_state_slots[req_slot_index]
+                self.materialized_recurrent_state_slots[req_slot_index],
+                self.materialized_conv_state_slots[req_slot_index]
             )
         });
         if state_version == self.current_state_versions[req_slot_index] {
-            for (_, state_slot) in self.txn_recurrent_state_slots[req_slot_index].drain(..) {
+            for (_, state_slot) in self.materialized_recurrent_state_slots[req_slot_index].drain(..) {
                 self.free_recurrent_state_slots.push_back(state_slot);
             }
-            for (_, state_slot) in self.txn_conv_state_slots[req_slot_index].drain(..) {
+            for (_, state_slot) in self.materialized_conv_state_slots[req_slot_index].drain(..) {
                 self.free_conv_state_slots.push_back(state_slot);
             }
             trace::gdn_state(|| {
                 format!(
-                    "event=gdn_table_commit_txn_done req_slot={} new_current_recurrent_slot={} \
-                     new_current_conv_slot={} new_current_version={} publishes=0 free_recurrent_slots={} \
-                     free_conv_slots={}",
+                    "event=gdn_table_commit_done req_slot={} new_current_recurrent_slot={} new_current_conv_slot={} \
+                     new_current_version={} publishes=0 free_recurrent_slots={} free_conv_slots={}",
                     raw_req_slot,
                     self.current_recurrent_state_slots[req_slot_index],
                     self.current_conv_state_slots[req_slot_index],
@@ -292,15 +290,15 @@ impl GDNRequestSlots {
             });
             Vec::new()
         } else {
-            let new_current_recurrent_state_slot = txn_state_slot(
-                &self.txn_recurrent_state_slots[req_slot_index],
+            let new_current_recurrent_state_slot = find_materialized_state_slot(
+                &self.materialized_recurrent_state_slots[req_slot_index],
                 state_version,
-                "GDN commit state_version must select a recurrent txn candidate state slot",
+                "GDN commit state_version must select a materialized recurrent state slot",
             );
-            let new_current_conv_state_slot = txn_state_slot(
-                &self.txn_conv_state_slots[req_slot_index],
+            let new_current_conv_state_slot = find_materialized_state_slot(
+                &self.materialized_conv_state_slots[req_slot_index],
                 state_version,
-                "GDN commit state_version must select a convolution txn candidate state slot",
+                "GDN commit state_version must select a materialized convolution state slot",
             );
             let mut publishes = Vec::new();
             let mut remaining_publish_pages = Vec::new();
@@ -314,15 +312,15 @@ impl GDNRequestSlots {
                             )
                         } else {
                             (
-                                txn_state_slot(
-                                    &self.txn_recurrent_state_slots[req_slot_index],
+                                find_materialized_state_slot(
+                                    &self.materialized_recurrent_state_slots[req_slot_index],
                                     publish_state_version,
-                                    "GDN publish state_version must select a materialized recurrent txn state slot",
+                                    "GDN publish state_version must select a materialized recurrent state slot",
                                 ),
-                                txn_state_slot(
-                                    &self.txn_conv_state_slots[req_slot_index],
+                                find_materialized_state_slot(
+                                    &self.materialized_conv_state_slots[req_slot_index],
                                     publish_state_version,
-                                    "GDN publish state_version must select a materialized convolution txn state slot",
+                                    "GDN publish state_version must select a materialized convolution state slot",
                                 ),
                             )
                         };
@@ -342,12 +340,14 @@ impl GDNRequestSlots {
                 .push_back(self.current_recurrent_state_slots[req_slot_index]);
             self.free_conv_state_slots
                 .push_back(self.current_conv_state_slots[req_slot_index]);
-            for (candidate_state_version, state_slot) in self.txn_recurrent_state_slots[req_slot_index].drain(..) {
+            for (candidate_state_version, state_slot) in
+                self.materialized_recurrent_state_slots[req_slot_index].drain(..)
+            {
                 if candidate_state_version != state_version {
                     self.free_recurrent_state_slots.push_back(state_slot);
                 }
             }
-            for (candidate_state_version, state_slot) in self.txn_conv_state_slots[req_slot_index].drain(..) {
+            for (candidate_state_version, state_slot) in self.materialized_conv_state_slots[req_slot_index].drain(..) {
                 if candidate_state_version != state_version {
                     self.free_conv_state_slots.push_back(state_slot);
                 }
@@ -357,9 +357,9 @@ impl GDNRequestSlots {
             self.current_state_versions[req_slot_index] = state_version;
             trace::gdn_state(|| {
                 format!(
-                    "event=gdn_table_commit_txn_done req_slot={} new_current_recurrent_slot={} \
-                     new_current_conv_slot={} new_current_version={} publishes={} publish_versions={:?} \
-                     free_recurrent_slots={} free_conv_slots={}",
+                    "event=gdn_table_commit_done req_slot={} new_current_recurrent_slot={} new_current_conv_slot={} \
+                     new_current_version={} publishes={} publish_versions={:?} free_recurrent_slots={} \
+                     free_conv_slots={}",
                     raw_req_slot,
                     self.current_recurrent_state_slots[req_slot_index],
                     self.current_conv_state_slots[req_slot_index],
@@ -383,9 +383,9 @@ impl GDNRequestSlots {
         let dst_recurrent_state_slot = self.current_recurrent_state_slots[req_slot_index];
         let dst_conv_state_slot = self.current_conv_state_slots[req_slot_index];
         assert!(
-            self.txn_recurrent_state_slots[req_slot_index].is_empty()
-                && self.txn_conv_state_slots[req_slot_index].is_empty(),
-            "GDN restore cannot replace recurrent or convolution state during a live transaction"
+            self.materialized_recurrent_state_slots[req_slot_index].is_empty()
+                && self.materialized_conv_state_slots[req_slot_index].is_empty(),
+            "GDN restore cannot replace recurrent or convolution state with live destinations"
         );
         assert!(
             state_version > self.current_state_versions[req_slot_index],
@@ -427,7 +427,7 @@ impl GDNRequestSlots {
     fn set_pending_publish_pages(&mut self, req_slot: usize, state_version: u32, page_ids: Vec<u32>) {
         assert!(
             state_version > self.current_state_versions[req_slot],
-            "GDN txn publish pages must target a future state_version"
+            "GDN pending publish pages must target a future state_version"
         );
         let publish_pages = &mut self.pending_publish_pages[req_slot];
         match publish_pages.binary_search_by_key(&state_version, |(publish_state_version, _)| *publish_state_version) {
@@ -442,8 +442,14 @@ impl GDNRequestSlots {
             self.current_state_versions.len()
         );
         debug_assert_eq!(self.current_conv_state_slots.len(), self.current_state_versions.len());
-        debug_assert_eq!(self.txn_recurrent_state_slots.len(), self.current_state_versions.len());
-        debug_assert_eq!(self.txn_conv_state_slots.len(), self.current_state_versions.len());
+        debug_assert_eq!(
+            self.materialized_recurrent_state_slots.len(),
+            self.current_state_versions.len()
+        );
+        debug_assert_eq!(
+            self.materialized_conv_state_slots.len(),
+            self.current_state_versions.len()
+        );
         debug_assert_eq!(self.pending_publish_pages.len(), self.current_state_versions.len());
         let num_state_slots = self
             .num_req_slots()
@@ -453,7 +459,7 @@ impl GDNRequestSlots {
             &self.current_state_versions,
             &self.current_recurrent_state_slots,
             &self.free_recurrent_state_slots,
-            &self.txn_recurrent_state_slots,
+            &self.materialized_recurrent_state_slots,
             self.num_state_slots_per_req,
             num_state_slots,
             "recurrent",
@@ -462,7 +468,7 @@ impl GDNRequestSlots {
             &self.current_state_versions,
             &self.current_conv_state_slots,
             &self.free_conv_state_slots,
-            &self.txn_conv_state_slots,
+            &self.materialized_conv_state_slots,
             self.num_state_slots_per_req,
             num_state_slots,
             "convolution",
@@ -481,12 +487,12 @@ impl GDNRequestSlots {
     }
 }
 
-fn allocate_txn_state_slots(
+fn allocate_state_slots(
     current_state_version: u32,
     materialized_state_versions: &[u32],
     num_state_slots_per_req: usize,
     free_state_slots: &mut VecDeque<u32>,
-    txn_state_slots: &mut Vec<(u32, u32)>,
+    materialized_state_slots: &mut Vec<(u32, u32)>,
     state_domain: &str,
 ) {
     debug_assert!(
@@ -504,18 +510,18 @@ fn allocate_txn_state_slots(
             continue;
         }
         assert!(
-            txn_state_slots.len() + 1 < num_state_slots_per_req,
-            "GDN request {state_domain} state txn exceeds per-request capacity"
+            materialized_state_slots.len() + 1 < num_state_slots_per_req,
+            "GDN request {state_domain} destinations exceed per-request capacity"
         );
         let state_slot = free_state_slots
             .pop_front()
             .unwrap_or_else(|| panic!("GDN request state table free {state_domain} state slots exhausted"));
-        txn_state_slots.push((materialized_state_version, state_slot));
+        materialized_state_slots.push((materialized_state_version, state_slot));
     }
 }
 
-fn txn_state_slot(txn_state_slots: &[(u32, u32)], state_version: u32, error: &str) -> u32 {
-    txn_state_slots
+fn find_materialized_state_slot(materialized_state_slots: &[(u32, u32)], state_version: u32, error: &str) -> u32 {
+    materialized_state_slots
         .iter()
         .find(|&&(candidate_state_version, _)| candidate_state_version == state_version)
         .map(|&(_, state_slot)| state_slot)
@@ -527,7 +533,7 @@ fn sanity_check_state_slot_domain(
     current_state_versions: &[u32],
     current_state_slots: &[u32],
     free_state_slots: &VecDeque<u32>,
-    txn_state_slots: &[Vec<(u32, u32)>],
+    materialized_state_slots: &[Vec<(u32, u32)>],
     num_state_slots_per_req: usize,
     num_state_slots: usize,
     state_domain: &str,
@@ -551,19 +557,19 @@ fn sanity_check_state_slot_domain(
     for &state_slot in free_state_slots {
         claim(state_slot, "free");
     }
-    for (req_slot, txn_slots) in txn_state_slots.iter().enumerate() {
+    for (req_slot, txn_slots) in materialized_state_slots.iter().enumerate() {
         debug_assert!(
             txn_slots.len() < num_state_slots_per_req,
-            "GDN request {state_domain} txn exceeds its state-slot capacity"
+            "GDN request {state_domain} destinations exceed state-slot capacity"
         );
         let mut previous_version = current_state_versions[req_slot];
         for &(state_version, state_slot) in txn_slots {
             debug_assert!(
                 state_version > previous_version,
-                "GDN {state_domain} txn state versions must be unique and increasing"
+                "GDN {state_domain} materialized state versions must be unique and increasing"
             );
             previous_version = state_version;
-            claim(state_slot, "candidate");
+            claim(state_slot, "materialized");
         }
     }
     debug_assert!(

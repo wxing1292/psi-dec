@@ -333,7 +333,6 @@ mod tests {
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::Stream;
-    use inference_executor_core::attn::gdn::state::GDNStateTxn;
     use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
     use inference_executor_core::sampling::SamplerConfig;
     use inference_executor_core::sampling::SparseRejectionSamplingShape;
@@ -363,12 +362,6 @@ mod tests {
             vec![5, 8, 11, 15],
             vec![10, 11, 20, 30, 31, 32, 40, 41],
             vec![0, 2, 3, 6, 8],
-            vec![
-                GDNStateTxn::new(5, 2, 0),
-                GDNStateTxn::new(8, 1, 0),
-                GDNStateTxn::new(11, 3, 2),
-                GDNStateTxn::new(15, 2, 1),
-            ],
             vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             vec![SamplerConfig::default(); 4],
             vec![false, false, true, true, true, true, true, true],

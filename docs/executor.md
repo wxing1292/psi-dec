@@ -526,8 +526,9 @@ Normal forward, output, and sampling commands can share one ordered command buff
 
 Qwen3 and Qwen3.5 DSpark, and Qwen3.5 DFlash2, record Main, rejection sampling, Spec Decode prepare, Spec
 Prefill, Spec Decode, and proposal sampling in one ordered GPU submission. Qwen3.5 MTP retains its established
-Spec lifecycle boundary. GDN state candidate preparation and cache-boundary publication retain their transaction
-lifecycle when their GPU work is replayed.
+Spec lifecycle boundary. GDN chunkwise forward writes final and cache-boundary states. GDN replay Decode retains
+per-forward deltas and reconstructs the accepted state after sampling. Reconstruction and page publication share one
+post-forward submission. See [`executor_gdn.md`](executor_gdn.md) for the state lifecycle.
 
 The generic executor lifecycle uses role-qualified Main and Spec hooks:
 
@@ -574,7 +575,7 @@ The decoder executor prepares a batch, executes it, obtains the result, and comm
 Audio and Vision encoder executors use independent workers and Metal streams.
 They can execute while the decoder worker processes unrelated requests.
 
-Replay caches, scratch owners, request-slot state, and pending GDN transactions therefore remain executor-owned. They
+Replay caches, scratch owners, request-slot state, and pending GDN commits therefore remain executor-owned. They
 remain confined to one thread unless an API explicitly states otherwise.
 
 Runtime core still owns the durable request and cache lifecycle. The executor reports sampled decisions and component
@@ -619,7 +620,8 @@ The final owner releases the shared Metal resource.
 `unload_state` writes the selected `PageArena`, GQA, and GDN payloads to SSD before it releases their buffers.
 Direct callers can still select `ExecutorHibernationPlan::All`.
 The snapshot also stores durable GDN request state and future publish page IDs.
-The executor finishes or clears transient restore, publish, and batch transactions before it writes the snapshot.
+The executor finishes pending GDN reconstruction and publication before it writes the snapshot. Transient replay logs
+are not part of the snapshot.
 
 State-bearing components implement the symmetric `FullStateIO` and `SelectedStateIO` traits.
 `PageArenaStateSnapshotFiles`, `GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify their semantic files.
@@ -661,7 +663,7 @@ force the same lifecycle on components that have different ownership contracts.
 
 - GDN metadata tests exercise exact, bucketed, and caller-owned token-capacity APIs. The GDN numerical replay test
   sweeps all active counts for a total capacity of `8` and checks persistent state.
-- GDN state tests exercise mixed commit modes, unshifted MTP candidate selection, deferred publish, restore, and selective reset.
+- GDN state tests exercise mixed chunkwise/replay commits, accepted-prefix reconstruction, deferred publish, restore, and selective reset.
 - GQA metadata tests exercise single-query and tiled-query paths with exact, bucketed, and caller-owned capacity APIs.
 - GQA page-table tests exercise selected state I/O and selective reset without reproducing KV-kernel math.
 - MoE component tests protect execution-variant selection. Isolated replay tests compare token-major, expert-major,

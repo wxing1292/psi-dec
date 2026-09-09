@@ -289,13 +289,6 @@ impl Qwen35Executor {
         }
         debug_assert_eq!(sample_index, num_sample_rows);
         debug_assert!(flat_token_ids.len() <= self.config.max_tokens);
-        let gdn_state_txns = token_indices
-            .iter()
-            .enumerate()
-            .map(|(req_index, &token_index)| {
-                GDNStateTxn::new(token_index, cu_tokens[req_index + 1] - cu_tokens[req_index], 0)
-            })
-            .collect::<Vec<_>>();
         Qwen35MTPBatch {
             microbatch: Qwen35Microbatch::new(
                 requests.iter().map(|request| request.req_slot).collect(),
@@ -303,7 +296,6 @@ impl Qwen35Executor {
                 token_indices,
                 flat_token_ids,
                 cu_tokens,
-                gdn_state_txns,
                 vec![Vec::new(); requests.len()],
                 requests.iter().map(|request| request.sampler_config).collect(),
                 flat_sample_mask,
