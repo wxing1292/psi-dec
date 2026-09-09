@@ -1,5 +1,8 @@
 mod chunkwise;
 mod recurrent;
+mod replay;
+
+pub use replay::ReplayBuffers;
 
 use crate::components::assert_u32_count_domain;
 use crate::components::checked_product;
@@ -429,9 +432,10 @@ fn source(variant_constants: VariantConstants) -> String {
     );
     let common_source = GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &source_constants, 1);
     format!(
-        "{common_source}\n{}\n{}",
+        "{common_source}\n{}\n{}\n{}",
         recurrent::source(variant_constants),
         chunkwise::source(variant_constants),
+        replay::source(variant_constants),
     )
 }
 
@@ -477,6 +481,8 @@ struct Variant {
     q_scale: f32,
     norm_eps: f32,
     short_conv: CompiledKernel,
+    short_conv_replay: CompiledKernel,
+    replay: CompiledKernel,
     candidate_conv_state: CompiledKernel,
     final_recurrent_state: CompiledKernel,
     chunkwise_state: CompiledKernel,
@@ -497,6 +503,8 @@ impl Registry {
             q_scale: config.q_scale,
             norm_eps: config.norm_eps,
             short_conv: CompiledKernel::new(device, &source, "gdn_compute_short_conv_bf16"),
+            short_conv_replay: CompiledKernel::new(device, &source, "gdn_compute_short_conv_replay_bf16"),
+            replay: CompiledKernel::new(device, &source, "gdn_compute_replay_bf16"),
             candidate_conv_state: CompiledKernel::new(device, &source, "gdn_compute_candidate_conv_state_bf16"),
             final_recurrent_state: CompiledKernel::new(device, &source, "gdn_compute_final_recurrent_state_bf16"),
             chunkwise_state: CompiledKernel::new(device, &source, "gdn_compute_chunkwise_state_bf16"),
@@ -615,6 +623,30 @@ impl Variant {
         write_final_conv_state: bool,
     ) {
         recorder.set_kernel(&self.short_conv);
+        self.record_short_conv_bindings(
+            recorder,
+            shape,
+            buffers,
+            num_active_reqs,
+            num_active_tokens,
+            write_final_conv_state,
+        );
+        recorder.set_buffer_write(13, buffers.conv_qkv, 0);
+        recorder.set_u64(14, 0);
+        recorder.set_u32(15, 0);
+        self.dispatch_short_conv(recorder, shape);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_short_conv_bindings(
+        &self,
+        recorder: &CommandRecorder,
+        shape: Shape,
+        buffers: &Buffers<'_>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
+        write_final_conv_state: bool,
+    ) {
         recorder.set_buffer_write(0, buffers.conv_qkv, 0);
         recorder.set_buffer_write(1, buffers.next_conv_state, 0);
         recorder.set_buffer_read(2, buffers.qkv, 0);
@@ -627,6 +659,9 @@ impl Variant {
         recorder.set_u64(10, buffers.conv_state_offset_bytes);
         recorder.set_u64(11, buffers.next_conv_state_offset_bytes);
         recorder.set_u32(12, u32::from(write_final_conv_state));
+    }
+
+    fn dispatch_short_conv(&self, recorder: &CommandRecorder, shape: Shape) {
         let total_short_conv_threads = self
             .constants
             .model

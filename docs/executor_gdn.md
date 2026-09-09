@@ -56,13 +56,17 @@ crates/inference-backend-metal/src/components/
     compute/
       chunkwise.rs      fused chunkwise source specialization and command recording
       recurrent.rs      final/candidate recurrent source specialization and command recording
+      replay.rs         per-forward replay-log compute and mixed recording
     compute_test.rs     GDN compute reference and selection tests
     qkvabz_split.rs     reusable QKVABZ split component
     state_pages.rs      reusable GDN state-page read/write helpers
+    state_replay.rs     all-layer accepted-prefix state materialization
   metal/
     gdn_compute.metal           shared short-convolution and output-norm/gate source
     gdn_compute_chunkwise.metal fused sequential chunkwise state kernel
     gdn_compute_recurrent.metal final/candidate recurrent state kernels
+    gdn_compute_replay.metal    recurrent output and F32 replay-log kernel
+    gdn_state_replay.metal      recurrent and convolution commit kernels
     gdn_qkvabz_split.metal  QKVABZ split source
     gdn_state_page_read.metal
     gdn_state_page_write.metal
@@ -74,6 +78,26 @@ The source fragments compile into one Metal library. Source separation does not 
 
 `crates/inference-executor-core` owns the backend-neutral GDN semantic metadata. `crates/inference-executor-metal` owns
 the Metal replay wiring and request state table.
+
+## Per-forward replay backend
+
+`compute::Compute::invoke_with_replay` records chunkwise execution for a request prefix and replay-log execution
+for the suffix. The two cores can overlap. Output normalization waits for both cores. This backend API does not
+change the executor's default path until the request-state lifecycle supplies its log and commit jobs.
+
+The replay core retains F32 state fragments while it produces the normal outputs. It writes F32 decay `alpha`,
+normalized `k`, and update `u` for each input token. The update already includes `beta`. Short convolution also
+writes raw BF16 QKV to the per-layer log in the same dispatch. Forward does not write full replay-request states.
+
+`state_replay::Commit` consumes accepted-prefix jobs across all GDN layers. Each job selects source and destination
+recurrent/conv slots, a flat input start, and a processed-token count. It applies `S = alpha * S + u * k` in token
+order and writes one BF16 recurrent state. Conv commit takes the final `Ks` inputs from the source history and raw
+QKV log. Source slots must remain live and distinct from all destination slots until the submission completes.
+
+The log lasts for one forward and its commit. It is not a circular history or a persistent cache snapshot.
+The backend test compares two layers, grouped K heads, disjoint recurrent/conv source slots, inactive capacity,
+and all selected prefixes against the candidate recurrent kernel. It also checks that forward preserves every
+unselected full state slot.
 
 ## Tensor and axis vocabulary
 
