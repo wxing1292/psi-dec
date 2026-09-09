@@ -12,6 +12,22 @@ use crate::metal::ReplayU32;
 
 const GDN_COMPUTE_SOURCE: &str = include_str!("../metal/gdn_compute.metal");
 
+// Initial short-input policy. This limit is independent of the chunkwise tile width.
+const MAX_FIXED_REPLAY_TOKENS: usize = 8;
+
+/// Maximum replay inputs per request, including fixed and speculative tokens.
+/// Call at initialization or input validation, where the token-count domain is established.
+pub fn max_replay_tokens_per_request(num_spec_tokens: usize) -> usize {
+    MAX_FIXED_REPLAY_TOKENS
+        .checked_add(num_spec_tokens)
+        .expect("GDN replay token capacity must fit usize")
+}
+
+/// Selects chunkwise execution for a committed segment with no selectable suffix.
+pub fn uses_chunkwise(num_tokens: usize, num_spec_tokens: usize) -> bool {
+    num_spec_tokens == 0 && num_tokens > MAX_FIXED_REPLAY_TOKENS
+}
+
 const SHORT_CONV_REQUIRED_THREADS: u32 = 256;
 const FINAL_RECURRENT_STATE_NUM_QK_DIM_THREADS: u32 = 32;
 const CANDIDATE_RECURRENT_STATE_NUM_QK_DIM_THREADS: u32 = 32;

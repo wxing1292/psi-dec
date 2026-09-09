@@ -150,6 +150,8 @@ device batch must contain each request ID at most once.
 `BatchDeviceRequest::new` packs `QueryTokens::Prefill` requests before `QueryTokens::Decode` requests.
 `BatchDevReq::from_parts` uses the same constructor. Packing preserves request order within each phase and keeps each
 request's metadata together. This packing order does not change the scheduler's request selection or sticky order.
+The model executor can further reorder complete requests during `prepare_batch`, before it constructs component metadata.
+The same order reaches model commit and response construction. Runtime core continues to resolve responses by request ID.
 
 `SimpleScheduler` resolves only runnable sticky IDs. It skips IDs that are pending, terminal, swapped, or absent. It
 first creates immutable `ReqTokenInventory` values. It then allocates minimum validated, maximum validated, and

@@ -4,6 +4,9 @@ The model executor turns runtime-owned batch metadata and page IDs into model ex
 weights, component state, replay composition, and sampling. It does not schedule requests or allocate globally owned
 cache pages.
 
+`ReplayableDecoderModel::prepare_batch` can reorder complete requests before it constructs model and component metadata.
+The caller retains that order through `commit_batch`. Request IDs preserve the response identity across this reorder.
+
 Read this document after the top-level [README](../README.md) and [`core.md`](core.md). It explains the stable executor
 mental model. Component documents describe current source and algorithms. Workflow documents contain shared commands
 and cross-component measurement rules.

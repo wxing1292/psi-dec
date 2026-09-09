@@ -624,7 +624,7 @@ impl ReplayableDecoderModel for Qwen3Executor {
         Qwen3Executor::load_state(self, snapshot_path, plan)
     }
 
-    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+    fn prepare_batch(&mut self, core_batch_req: &mut BatchDeviceRequest) -> Self::ModelBatchRequest {
         self.validate_input(core_batch_req);
         let sampler_configs = core_batch_req
             .dev_reqs
@@ -1038,7 +1038,7 @@ mod tests {
             bytes.copy_from_slice(&replacement.to_ne_bytes());
         }
         let page_ids = vec![0; loaded.executor.num_kv_page_ids_per_block()];
-        let core_batch = BatchDeviceRequest::new(
+        let mut core_batch = BatchDeviceRequest::new(
             0,
             [DeviceRequest::new(
                 0,
@@ -1059,7 +1059,7 @@ mod tests {
                 SamplingConfig::default(),
             )],
         );
-        let model_batch = loaded.executor.prepare_batch(&core_batch);
+        let model_batch = loaded.executor.prepare_batch(&mut core_batch);
         let mut recorder = loaded.executor.begin_ops_recording(&model_batch);
         let hidden = loaded.executor.embed_main(&mut recorder, &model_batch);
         loaded.executor.forward_main(&mut recorder, &model_batch, hidden);

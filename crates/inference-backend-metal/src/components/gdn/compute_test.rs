@@ -33,6 +33,13 @@ const NUM_ACTIVE_PREFILL_REQUESTS: ReplayParameterKey =
     ReplayParameterKey::new("test.gdn_compute.num_active_prefill_requests");
 
 #[test]
+fn test_execution_segments() {
+    for (num_tokens, num_spec_tokens, chunkwise) in [(1, 0, false), (8, 0, false), (9, 0, true), (9, 1, false)] {
+        assert_eq!(super::uses_chunkwise(num_tokens, num_spec_tokens), chunkwise);
+    }
+}
+
+#[test]
 fn test_selector_returns_registered_mixed_variant() {
     let device = Device::system_default();
     let registry = Registry::new(&device, fixture_config());

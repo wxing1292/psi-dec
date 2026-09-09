@@ -176,6 +176,10 @@ The existing recurrent invocation methods record the recurrent graph for isolate
 The current inputs pack ragged request segments on one flat token axis and use `cu_tokens` to recover each segment.
 The recurrent algorithm also processes multi-token Decode request segments. Request phase comes from the runtime
 `QueryTokens` enum, not from query length. `BatchDeviceRequest` packs Prefill requests before Decode requests.
+Before it packs model metadata, Qwen3.5 orders requests as Prefill, long non-speculative Decode, and remaining Decode.
+The GDN backend owns the initial short-input limit of eight tokens. This limit is independent of the chunkwise tile width.
+All speculative Decode inputs stay in the final group. Each group preserves its input order.
+The request enum and sampling semantics do not change when the executor reorders the batch.
 
 The current variant constants have this hierarchy:
 

@@ -158,6 +158,14 @@ pub struct GDN {
 }
 
 impl GDN {
+    pub fn max_replay_tokens_per_request(num_spec_tokens: usize) -> usize {
+        backend_compute::max_replay_tokens_per_request(num_spec_tokens)
+    }
+
+    pub fn uses_chunkwise(&self, num_tokens: usize, num_spec_tokens: usize) -> bool {
+        backend_compute::uses_chunkwise(num_tokens, num_spec_tokens)
+    }
+
     pub fn new(device: &Device, core: GDNCore, config: GDNMetalConfig) -> Self {
         core.validate();
         config.validate();

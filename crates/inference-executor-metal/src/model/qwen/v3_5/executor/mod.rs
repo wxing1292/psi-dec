@@ -82,6 +82,7 @@ use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::ExecutorHibernationPlan;
+use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -1114,10 +1115,23 @@ impl ReplayableDecoderModel for Qwen35Executor {
         Qwen35Executor::load_state(self, snapshot_path, plan)
     }
 
-    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+    fn prepare_batch(&mut self, core_batch_req: &mut BatchDeviceRequest) -> Self::ModelBatchRequest {
         self.finish_cache_publish();
         let batch_seq = core_batch_req.seq;
         self.validate_input(core_batch_req);
+        let gdn = self.main_gdn_state.backend();
+        core_batch_req.dev_reqs.sort_by_key(|request| {
+            match &request.decoder_query_tokens {
+                QueryTokens::Prefill { .. } => 0,
+                query => {
+                    if gdn.uses_chunkwise(query.token_consumption(), query.num_spec_tokens()) {
+                        1
+                    } else {
+                        2
+                    }
+                },
+            }
+        });
         let sampler_configs = core_batch_req
             .dev_reqs
             .iter()

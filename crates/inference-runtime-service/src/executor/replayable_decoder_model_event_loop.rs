@@ -322,7 +322,7 @@ where
         }
     }
 
-    fn execute(&mut self, batch_req: BatchDeviceRequest) -> BatchDeviceResponse {
+    fn execute(&mut self, mut batch_req: BatchDeviceRequest) -> BatchDeviceResponse {
         let batch_seq = batch_req.seq;
         let batch_summary = summarize_batch_device_request(&batch_req);
         tracing::debug!(
@@ -349,7 +349,7 @@ where
 
         let model_batch_req = {
             let _span = profiling::span("prepare_batch");
-            self.model.prepare_batch(&batch_req)
+            self.model.prepare_batch(&mut batch_req)
         };
 
         let mut recorder = self.model.begin_ops_recording(&model_batch_req);
@@ -758,7 +758,7 @@ mod tests {
             Ok(())
         }
 
-        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+        fn prepare_batch(&mut self, _core_batch_req: &mut BatchDeviceRequest) -> Self::ModelBatchRequest {
             panic!("test model must not execute a non-empty batch")
         }
 
@@ -921,7 +921,7 @@ mod tests {
             unreachable!()
         }
 
-        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+        fn prepare_batch(&mut self, _core_batch_req: &mut BatchDeviceRequest) -> Self::ModelBatchRequest {
             self.push(SpecLifecycleEvent::PrepareBatch);
         }
 
