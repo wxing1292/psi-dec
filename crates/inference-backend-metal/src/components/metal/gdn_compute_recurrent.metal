@@ -25,7 +25,7 @@ kernel void gdn_compute_final_recurrent_state_bf16(
     constant float& q_scale [[buffer(10)]],
     constant uint& num_active_reqs [[buffer(11)]],
     constant ulong& recurrent_state_offset_bytes [[buffer(12)]],
-    constant uint& num_active_prefill_requests [[buffer(13)]],
+    constant uint& num_active_chunkwise_requests [[buffer(13)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadblock [[thread_position_in_threadgroup]]
 ) {
@@ -40,7 +40,7 @@ kernel void gdn_compute_final_recurrent_state_bf16(
     const uint req_index = req_v_head_linear_index / num_v_heads;
     const uint v_dim_index =
         v_row_range_index * final_recurrent_state_num_v_rows + v_row_index_in_range;
-    if (req_index < num_active_prefill_requests || req_index >= num_active_reqs) {
+    if (req_index < num_active_chunkwise_requests || req_index >= num_active_reqs) {
         return;
     }
 
@@ -182,7 +182,7 @@ kernel void gdn_compute_candidate_recurrent_state_bf16(
     constant float& q_scale [[buffer(10)]],
     constant uint& num_active_reqs [[buffer(11)]],
     constant ulong& recurrent_state_offset_bytes [[buffer(12)]],
-    constant uint& num_active_prefill_requests [[buffer(13)]],
+    constant uint& num_active_chunkwise_requests [[buffer(13)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadblock [[thread_position_in_threadgroup]]
 ) {
@@ -199,7 +199,7 @@ kernel void gdn_compute_candidate_recurrent_state_bf16(
     const uint req_index = req_v_head_linear_index / num_v_heads;
     const uint v_dim_base =
         v_row_range_index * candidate_recurrent_state_num_v_rows_per_simdgroup;
-    if (req_index < num_active_prefill_requests || req_index >= num_active_reqs
+    if (req_index < num_active_chunkwise_requests || req_index >= num_active_reqs
         || v_dim_base + candidate_recurrent_state_num_v_rows_per_simdgroup > v_head_dim) {
         return;
     }

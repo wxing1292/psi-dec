@@ -21,8 +21,8 @@ use crate::def::replay_op::ReplayOp;
 
 pub const GDN_NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("gdn.num_active_requests");
 pub const GDN_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("gdn.num_active_tokens");
-pub const GDN_NUM_ACTIVE_PREFILL_REQUESTS: ReplayParameterKey =
-    ReplayParameterKey::new("gdn.num_active_prefill_requests");
+pub const GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("gdn.num_active_chunkwise_requests");
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GDNReplayTopology {
@@ -33,22 +33,22 @@ pub struct GDNReplayTopology {
 
 pub fn add_gdn_replay_arguments(
     shape: GDNReplayShape,
-    num_active_prefill_requests: u32,
+    num_active_chunkwise_requests: u32,
     arguments: &mut ReplayArguments,
 ) {
-    add_gdn_private_replay_arguments(shape, num_active_prefill_requests, arguments);
+    add_gdn_private_replay_arguments(shape, num_active_chunkwise_requests, arguments);
     arguments.set_u32(GDN_NUM_ACTIVE_TOKENS, shape.num_tokens);
 }
 
 pub fn add_gdn_private_replay_arguments(
     shape: GDNReplayShape,
-    num_active_prefill_requests: u32,
+    num_active_chunkwise_requests: u32,
     arguments: &mut ReplayArguments,
 ) {
     shape.validate();
-    debug_assert!(num_active_prefill_requests <= shape.num_reqs);
+    debug_assert!(num_active_chunkwise_requests <= shape.num_reqs);
     arguments.set_u32(GDN_NUM_ACTIVE_REQUESTS, shape.num_reqs);
-    arguments.set_u32(GDN_NUM_ACTIVE_PREFILL_REQUESTS, num_active_prefill_requests);
+    arguments.set_u32(GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS, num_active_chunkwise_requests);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -208,7 +208,7 @@ impl GDN {
         &self,
         metadata: &GDNMetadataBuffers,
         cu_tokens: &[u32],
-        num_active_prefill_requests: u32,
+        num_active_chunkwise_requests: u32,
         state: &GDNPreparedRequestState,
         policy: &GDNReplayBucketPolicy,
         num_total_tokens: u32,
@@ -225,7 +225,7 @@ impl GDN {
             u32::try_from(state.src_recurrent_state_slots.len()).expect("GDN active request count must fit u32");
         metadata.update(
             cu_tokens,
-            num_active_prefill_requests,
+            num_active_chunkwise_requests,
             &state.src_recurrent_state_slots,
             &state.src_conv_state_slots,
             &state.flat_recurrent_state_write_slots,
@@ -312,7 +312,7 @@ impl ReplayLayer for GDN {
                     "GDN active-token key must differ from the private active-request key"
                 );
                 assert_ne!(
-                    key, GDN_NUM_ACTIVE_PREFILL_REQUESTS,
+                    key, GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS,
                     "GDN active-token key must differ from the private prefill-request key"
                 );
                 self.validate_token_capacity(shape.num_tokens, shape.num_total_tokens);
@@ -331,9 +331,9 @@ impl ReplayLayer for GDN {
         };
         let active_tokens = input.num_active_tokens;
         let active_prefill_requests = if matches!(active_tokens, ReplayU32::Parameter(_)) {
-            ReplayU32::Parameter(GDN_NUM_ACTIVE_PREFILL_REQUESTS)
+            ReplayU32::Parameter(GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS)
         } else {
-            ReplayU32::Fixed(batch_metadata.num_active_prefill_requests())
+            ReplayU32::Fixed(batch_metadata.num_active_chunkwise_requests())
         };
         let qkvabz = self.qkvabz.invoke(
             shape.num_total_tokens,

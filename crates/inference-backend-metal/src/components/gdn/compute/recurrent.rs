@@ -2,7 +2,7 @@ use super::Buffers;
 use super::Shape;
 use super::Variant;
 use super::VariantConstants;
-use super::set_prefill_count;
+use super::set_chunkwise_count;
 use super::set_replay_u32;
 use crate::metal::CommandRecorder;
 use crate::metal::ReplayU32;
@@ -51,7 +51,7 @@ impl Variant {
         shape: Shape,
         buffers: &Buffers<'_>,
         num_active_reqs: ReplayU32,
-        num_active_prefill_requests: ReplayU32,
+        num_active_chunkwise_requests: ReplayU32,
     ) {
         recorder.set_kernel(&self.final_recurrent_state);
         recorder.set_buffer_write(0, buffers.recurrent_output, 0);
@@ -73,7 +73,7 @@ impl Variant {
             "GDN active request count",
         );
         recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        set_prefill_count(recorder, 13, num_active_prefill_requests, shape.num_total_reqs);
+        set_chunkwise_count(recorder, 13, num_active_chunkwise_requests, shape.num_total_reqs);
         let thread_block = self.constants.kernels.final_recurrent_state.thread_block;
         let num_v_row_ranges = self.constants.model.v_head_dim / thread_block.num_v_rows;
         recorder.dispatch_threadblocks(
@@ -110,7 +110,7 @@ impl Variant {
         shape: Shape,
         buffers: &Buffers<'_>,
         num_active_reqs: ReplayU32,
-        num_active_prefill_requests: ReplayU32,
+        num_active_chunkwise_requests: ReplayU32,
     ) {
         recorder.set_kernel(&self.candidate_recurrent_state);
         recorder.set_buffer_write(0, buffers.recurrent_output, 0);
@@ -132,7 +132,7 @@ impl Variant {
             "GDN active request count",
         );
         recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        set_prefill_count(recorder, 13, num_active_prefill_requests, shape.num_total_reqs);
+        set_chunkwise_count(recorder, 13, num_active_chunkwise_requests, shape.num_total_reqs);
         let thread_block = self.constants.kernels.candidate_recurrent_state.thread_block;
         let num_threadblocks = self.constants.model.v_head_dim / thread_block.num_v_rows();
         recorder.dispatch_threadblocks(

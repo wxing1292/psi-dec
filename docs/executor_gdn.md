@@ -455,7 +455,7 @@ short convolution
 
 prefill chunkwise state
   buffers 0..9: same binding domains as final recurrent state
-  scalars 10..13: q_scale, num_active_prefill_requests, recurrent_state_offset_bytes, write_candidate_states
+  scalars 10..13: q_scale, num_active_chunkwise_requests, recurrent_state_offset_bytes, write_candidate_states
   grid: (Dv / kernels.chunkwise_state.thread_block.num_v_rows,
          num_total_reqs * Hv, 1)
   threads: (32, kernels.chunkwise_state.thread_block.num_simdgroups, 1)
@@ -465,7 +465,7 @@ final recurrent state
                 a_log, dt_bias, src_recurrent_state_slots,
                 flat_recurrent_state_write_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
-  scalars 10..13: q_scale, num_active_reqs, recurrent_state_offset_bytes, num_active_prefill_requests
+  scalars 10..13: q_scale, num_active_reqs, recurrent_state_offset_bytes, num_active_chunkwise_requests
   grid: (Dv / kernels.final_recurrent_state.thread_block.num_v_rows,
          num_total_reqs * Hv, 1)
   threads: (kernels.final_recurrent_state.thread_block.num_qk_dim_threads,
@@ -759,7 +759,7 @@ submission parameters:
 ```text
 gdn.num_active_requests  u32 [1, num_total_reqs]
 gdn.num_active_tokens    u32 [1, num_total_tokens]
-gdn.num_active_prefill_requests u32 [0, num_total_reqs]
+gdn.num_active_chunkwise_requests u32 [0, num_total_reqs]
 ```
 
 A composite stage can supply its own token key so all token consumers share one active-token parameter. The stage sets
@@ -876,11 +876,13 @@ Main owns the complete forward replay cache. Each GDN layer records the same com
 
 1. Project and split all active tokens.
 2. Run short convolution and the required convolution-state materialization for all active requests.
-3. Run fused sequential chunkwise state updates for the prefill prefix and recurrent state updates for the decode suffix.
+3. Run fused sequential chunkwise state updates for the chunkwise prefix and recurrent state updates for the remaining requests.
    These two commands can overlap.
 4. Join both branches before output normalization and gating. Project all active outputs.
 
 `MixedInvocation::record` declares disjoint accesses to `recurrent_output` and `recurrent_state_arena` within the two core commands.
+The chunkwise prefix includes Prefill and non-speculative Decode requests with more than eight tokens.
+The remaining Decode requests use the recurrent branch. All requests retain their sampling semantics.
 The request prefix and `cu_tokens` select disjoint output rows.
 The request-state table gives each request separate current and candidate state slots, including scattered physical slots.
 This ownership contract already permits requests within one recurrent dispatch to execute in parallel.

@@ -21,7 +21,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
     device const uint* flat_recurrent_state_write_slots [[buffer(8)]],
     device const uint* cu_tokens [[buffer(9)]],
     constant float& q_scale [[buffer(10)]],
-    constant uint& num_active_prefill_requests [[buffer(11)]],
+    constant uint& num_active_chunkwise_requests [[buffer(11)]],
     constant ulong& recurrent_state_offset_bytes [[buffer(12)]],
     constant uint& write_candidate_states [[buffer(13)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
@@ -38,7 +38,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
     const uint req_v_head_linear_index = threadblock_position.y;
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
-    if (req_index >= num_active_prefill_requests) {
+    if (req_index >= num_active_chunkwise_requests) {
         return;
     }
 

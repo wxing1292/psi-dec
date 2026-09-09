@@ -571,9 +571,9 @@ impl Compute {
         }
     }
 
-    /// Record a fixed mixed graph whose prefill and decode cores can overlap.
+    /// Record a fixed mixed graph whose chunkwise and recurrent cores can overlap.
     ///
-    /// The first `num_active_prefill_requests` requests are prefill. Both
+    /// The first `num_active_chunkwise_requests` requests use chunkwise execution. Both
     /// branches retain the full recorded request capacity. Either branch may
     /// have zero active requests. Each active request must have a token.
     /// Candidate mode writes every supplied state destination. Final-only
@@ -584,7 +584,7 @@ impl Compute {
         buffers: Buffers<'a>,
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
-        num_active_prefill_requests: ReplayU32,
+        num_active_chunkwise_requests: ReplayU32,
         write_candidate_states: bool,
     ) -> MixedInvocation<'a> {
         let (_, variant) = self.select(shape);
@@ -594,7 +594,7 @@ impl Compute {
             buffers,
             num_active_reqs,
             num_active_tokens,
-            num_active_prefill_requests,
+            num_active_chunkwise_requests,
             write_candidate_states,
         }
     }
@@ -789,7 +789,7 @@ pub struct MixedInvocation<'a> {
     buffers: Buffers<'a>,
     num_active_reqs: ReplayU32,
     num_active_tokens: ReplayU32,
-    num_active_prefill_requests: ReplayU32,
+    num_active_chunkwise_requests: ReplayU32,
     write_candidate_states: bool,
 }
 
@@ -798,10 +798,10 @@ impl Operator for MixedInvocation<'_> {
         let variant = self.variant;
         variant.constants.validate_shape(self.shape);
         validate_buffers(variant.constants, self.shape, &self.buffers);
-        if let (ReplayU32::Fixed(num_active_reqs), ReplayU32::Fixed(num_active_prefill_requests)) =
-            (self.num_active_reqs, self.num_active_prefill_requests)
+        if let (ReplayU32::Fixed(num_active_reqs), ReplayU32::Fixed(num_active_chunkwise_requests)) =
+            (self.num_active_reqs, self.num_active_chunkwise_requests)
         {
-            assert!(num_active_prefill_requests <= num_active_reqs);
+            assert!(num_active_chunkwise_requests <= num_active_reqs);
         }
         variant.record_short_conv(
             recorder,
@@ -833,7 +833,7 @@ impl Operator for MixedInvocation<'_> {
                     recorder,
                     self.shape,
                     &self.buffers,
-                    self.num_active_prefill_requests,
+                    self.num_active_chunkwise_requests,
                     self.write_candidate_states,
                 );
                 if self.write_candidate_states {
@@ -842,7 +842,7 @@ impl Operator for MixedInvocation<'_> {
                         self.shape,
                         &self.buffers,
                         self.num_active_reqs,
-                        self.num_active_prefill_requests,
+                        self.num_active_chunkwise_requests,
                     );
                 } else {
                     variant.record_final_recurrent_state(
@@ -850,7 +850,7 @@ impl Operator for MixedInvocation<'_> {
                         self.shape,
                         &self.buffers,
                         self.num_active_reqs,
-                        self.num_active_prefill_requests,
+                        self.num_active_chunkwise_requests,
                     );
                 }
             },
@@ -859,12 +859,12 @@ impl Operator for MixedInvocation<'_> {
     }
 }
 
-fn set_prefill_count(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32) {
+fn set_chunkwise_count(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32) {
     match value {
         ReplayU32::Fixed(value) => {
             assert!(
                 value <= max_value,
-                "GDN prefill request count exceeds recorded capacity"
+                "GDN chunkwise request count exceeds recorded capacity"
             );
             recorder.set_u32(index, value);
         },

@@ -29,8 +29,8 @@ use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_requests");
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_tokens");
-const NUM_ACTIVE_PREFILL_REQUESTS: ReplayParameterKey =
-    ReplayParameterKey::new("test.gdn_compute.num_active_prefill_requests");
+const NUM_ACTIVE_CHUNKWISE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("test.gdn_compute.num_active_chunkwise_requests");
 
 #[test]
 fn test_execution_segments() {
@@ -808,7 +808,7 @@ impl Operator for SerialMixedInvocation<'_> {
             recorder,
             invocation.shape,
             &invocation.buffers,
-            invocation.num_active_prefill_requests,
+            invocation.num_active_chunkwise_requests,
             invocation.write_candidate_states,
         );
         recorder.record_with_barrier_before(SerialDecodeInvocation(&invocation));
@@ -832,7 +832,7 @@ impl Operator for SerialDecodeInvocation<'_> {
                 invocation.shape,
                 &invocation.buffers,
                 invocation.num_active_reqs,
-                invocation.num_active_prefill_requests,
+                invocation.num_active_chunkwise_requests,
             );
         } else {
             invocation.variant.record_final_recurrent_state(
@@ -840,7 +840,7 @@ impl Operator for SerialDecodeInvocation<'_> {
                 invocation.shape,
                 &invocation.buffers,
                 invocation.num_active_reqs,
-                invocation.num_active_prefill_requests,
+                invocation.num_active_chunkwise_requests,
             );
         }
     }
@@ -925,7 +925,7 @@ fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens
                     buffers,
                     ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
                     ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-                    ReplayU32::Parameter(NUM_ACTIVE_PREFILL_REQUESTS),
+                    ReplayU32::Parameter(NUM_ACTIVE_CHUNKWISE_REQUESTS),
                     write_candidate_states,
                 );
                 if serialized {
@@ -977,7 +977,7 @@ fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens
             let arguments = ReplayArguments::new()
                 .with_u32(NUM_ACTIVE_REQUESTS, request_lengths.len() as u32)
                 .with_u32(NUM_ACTIVE_TOKENS, num_tokens as u32)
-                .with_u32(NUM_ACTIVE_PREFILL_REQUESTS, num_prefill);
+                .with_u32(NUM_ACTIVE_CHUNKWISE_REQUESTS, num_prefill);
             let (replay, hit) = cache.record(false, || unreachable!());
             assert!(hit);
             stream.submit_replay_with_arguments(replay, &arguments).wait();

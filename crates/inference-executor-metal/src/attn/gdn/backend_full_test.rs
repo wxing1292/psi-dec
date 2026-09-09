@@ -86,7 +86,7 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
     ];
 
     for materialize_candidate_states in [false, true] {
-        for &(counts, num_active_prefill_requests) in cases {
+        for &(counts, num_active_chunkwise_requests) in cases {
             let cu_tokens = cumulative_tokens(counts);
             let num_active_tokens = *cu_tokens.last().unwrap();
             let num_active_requests = counts.len() as u32;
@@ -113,7 +113,7 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
             let shape = replay.component().0.prepare(
                 &metadata,
                 &cu_tokens,
-                num_active_prefill_requests,
+                num_active_chunkwise_requests,
                 &prepared,
                 &policy,
                 num_total_tokens,
@@ -143,7 +143,7 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
             let previous_recurrent = read_bf16_values(&recurrent_state_arena, initial_recurrent_arena.len());
             let previous_output = read_bf16_values(&next_hidden, hidden_values.len());
             let mut arguments = ReplayArguments::new();
-            add_gdn_replay_arguments(shape, num_active_prefill_requests, &mut arguments);
+            add_gdn_replay_arguments(shape, num_active_chunkwise_requests, &mut arguments);
             runtime
                 .submit_replay_with_arguments(replay.replay(&key), &arguments)
                 .wait();

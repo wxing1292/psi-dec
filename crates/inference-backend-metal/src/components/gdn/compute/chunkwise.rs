@@ -2,7 +2,7 @@ use super::Buffers;
 use super::Shape;
 use super::Variant;
 use super::VariantConstants;
-use super::set_prefill_count;
+use super::set_chunkwise_count;
 use crate::metal::CommandRecorder;
 use crate::metal::ReplayU32;
 
@@ -27,7 +27,7 @@ impl Variant {
         recorder: &CommandRecorder,
         shape: Shape,
         buffers: &Buffers<'_>,
-        num_active_prefill_requests: ReplayU32,
+        num_active_chunkwise_requests: ReplayU32,
         write_candidate_states: bool,
     ) {
         recorder.set_kernel(&self.chunkwise_state);
@@ -43,7 +43,7 @@ impl Variant {
         recorder.set_buffer_read(8, buffers.flat_recurrent_state_write_slots, 0);
         recorder.set_buffer_read(9, buffers.cu_tokens, 0);
         recorder.set_f32(10, self.q_scale);
-        set_prefill_count(recorder, 11, num_active_prefill_requests, shape.num_total_reqs);
+        set_chunkwise_count(recorder, 11, num_active_chunkwise_requests, shape.num_total_reqs);
         recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
         recorder.set_u32(13, u32::from(write_candidate_states));
         let thread_block = self.constants.kernels.chunkwise_state.thread_block;
