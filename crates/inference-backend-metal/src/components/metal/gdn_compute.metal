@@ -11,7 +11,8 @@ constant uint GDN_INVALID_STATE_SLOT_ID = 0xffffffffu;
 // Short convolution operates independently along Cqkv; conv_kernel_size is
 // its temporal kernel extent, not a tensor-channel dimension.
 
-kernel void gdn_compute_short_conv_bf16(
+template <bool SaveReplay>
+kernel void gdn_compute_short_conv(
     device bfloat16_t* conv_qkv [[buffer(0)]],
     device bfloat16_t* next_conv_state [[buffer(1)]],
     device const bfloat16_t* qkv [[buffer(2)]],
@@ -25,6 +26,9 @@ kernel void gdn_compute_short_conv_bf16(
     constant ulong& conv_state_offset_bytes [[buffer(10)]],
     constant ulong& next_conv_state_offset_bytes [[buffer(11)]],
     constant uint& write_final_conv_state [[buffer(12)]],
+    device bfloat16_t* replay_qkv [[buffer(13)]],
+    constant ulong& replay_token_offset [[buffer(14)]],
+    constant uint& num_active_chunkwise_requests [[buffer(15)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
     const ulong conv_state_base = conv_state_offset_bytes / sizeof(bfloat16_t);
@@ -62,6 +66,12 @@ kernel void gdn_compute_short_conv_bf16(
             const uint weight_offset = channel_index * conv_kernel_size + kernel_index;
             acc += x * float(conv_weight[weight_offset]);
         }
+        if constexpr (SaveReplay) {
+            if (req_index >= num_active_chunkwise_requests) {
+                const uint replay_token_index = flat_token_index - cu_tokens[num_active_chunkwise_requests];
+                replay_qkv[(replay_token_offset + replay_token_index) * qkv_dim + channel_index] = qkv[global_linear_index];
+            }
+        }
         conv_qkv[global_linear_index] = bfloat16_t(acc / (1.0f + metal::exp(-acc)));
     }
 
@@ -93,6 +103,11 @@ kernel void gdn_compute_short_conv_bf16(
         }
     }
 }
+
+template [[host_name("gdn_compute_short_conv_bf16")]] [[kernel]]
+decltype(gdn_compute_short_conv<false>) gdn_compute_short_conv<false>;
+template [[host_name("gdn_compute_short_conv_replay_bf16")]] [[kernel]]
+decltype(gdn_compute_short_conv<true>) gdn_compute_short_conv<true>;
 
 kernel void gdn_compute_candidate_conv_state_bf16(
     device bfloat16_t* next_conv_state [[buffer(0)]],

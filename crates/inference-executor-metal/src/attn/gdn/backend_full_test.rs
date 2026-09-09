@@ -67,6 +67,19 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
     let initial_recurrent_arena = state_arena(&source_recurrent, recurrent_stride);
     let conv_state_arena = bf16_buffer(&device, &initial_conv_arena);
     let recurrent_state_arena = bf16_buffer(&device, &initial_recurrent_arena);
+    let replay_alpha =
+        Buffer::new_zeroed_elements(&device, NUM_TOTAL_TOKENS as usize * core.num_v_heads, Dtype::Float32);
+    let replay_k = Buffer::new_zeroed_elements(
+        &device,
+        NUM_TOTAL_TOKENS as usize * core.num_qk_heads * core.qk_head_dim,
+        Dtype::Float32,
+    );
+    let replay_u = Buffer::new_zeroed_elements(
+        &device,
+        NUM_TOTAL_TOKENS as usize * core.num_v_heads * core.v_head_dim,
+        Dtype::Float32,
+    );
+    let replay_qkv = Buffer::new_zeroed_elements(&device, NUM_TOTAL_TOKENS as usize * core.qkv_dim(), Dtype::Bfloat16);
     let mut replay = Replay::new("test GDN", TestGDN(component));
     let mut recorded_keys = HashSet::new();
     let cases: &[(&[u32], u32)] = &[
@@ -93,7 +106,7 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
             let source_slots = (0..num_active_requests).collect::<Vec<_>>();
             let mut recurrent_write_slots = vec![u32::MAX; num_active_tokens as usize];
             let mut conv_write_slots = recurrent_write_slots.clone();
-            for window in cu_tokens.windows(2) {
+            for window in cu_tokens.windows(2).take(num_active_chunkwise_requests as usize) {
                 for token_index in window[0]..window[1] {
                     let is_final = token_index + 1 == window[1];
                     if is_final || (materialize_candidate_states && token_index % 3 != 1) {
@@ -130,8 +143,15 @@ fn test_replay_matches_cpu_reference_across_independent_active_domains() {
                     next_conv_state_offset_bytes: 0,
                     recurrent_state_arena: &recurrent_state_arena,
                     recurrent_state_arena_offset_bytes: 0,
+                    replay: inference_backend_metal::components::gdn::compute::ReplayBuffers {
+                        alpha: &replay_alpha,
+                        k: &replay_k,
+                        u: &replay_u,
+                        qkv: &replay_qkv,
+                        token_offset: 0,
+                        num_total_tokens: NUM_TOTAL_TOKENS,
+                    },
                 },
-                materialize_candidate_states,
                 weights: weights.bindings(),
                 num_active_tokens: ReplayU32::Parameter(GDN_NUM_ACTIVE_TOKENS),
             };
@@ -197,8 +217,7 @@ impl ReplayComponent for TestGDN {
         (
             shape.num_total_reqs,
             shape.num_total_tokens,
-            self.0
-                .replay_topology(input.batch_metadata, input.materialize_candidate_states),
+            self.0.replay_topology(input.batch_metadata),
         )
     }
 

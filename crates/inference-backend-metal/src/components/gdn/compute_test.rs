@@ -1788,3 +1788,6 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         actual[max_error_index],
     );
 }
+
+#[path = "compute_replay_test.rs"]
+mod replay;

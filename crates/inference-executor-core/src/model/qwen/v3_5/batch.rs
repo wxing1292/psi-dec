@@ -9,7 +9,6 @@ use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::Token;
 use ordered_float::NotNan;
 
-use crate::attn::gdn::state::GDNStateTxn;
 use crate::sampling::SamplerConfig;
 use crate::sampling::SpecMicrobatch;
 
@@ -31,7 +30,6 @@ pub struct Qwen35Microbatch {
     token_indices: Vec<u32>,
     flat_token_ids_by_lane: Vec<Vec<i32>>,
     cu_tokens_by_lane: Vec<Vec<u32>>,
-    gdn_state_txns: Vec<GDNStateTxn>,
     gdn_state_page_ids_by_req: Vec<Vec<Vec<u32>>>,
     sampler_configs: Vec<SamplerConfig>,
     flat_sample_mask: Vec<bool>,
@@ -75,13 +73,11 @@ impl Qwen35Microbatch {
         token_indices: Vec<u32>,
         flat_token_ids: Vec<i32>,
         cu_tokens: Vec<u32>,
-        gdn_state_txns: Vec<GDNStateTxn>,
         gdn_state_page_ids_by_req: Vec<Vec<Vec<u32>>>,
         sampler_configs: Vec<SamplerConfig>,
         flat_sample_mask: Vec<bool>,
     ) -> Self {
         validate_batch_fields(&req_slots, &block_indices, &token_indices, &flat_token_ids, &cu_tokens);
-        validate_gdn_state_txns(&token_indices, &cu_tokens, &gdn_state_txns);
         assert_eq!(
             gdn_state_page_ids_by_req.len(),
             req_slots.len(),
@@ -92,7 +88,7 @@ impl Qwen35Microbatch {
             req_slots.len(),
             "qwen3.5 request requires one sampler_config entry per request"
         );
-        validate_flat_sample_mask(&cu_tokens, &gdn_state_txns, &flat_sample_mask);
+        validate_flat_sample_mask(&cu_tokens, &flat_sample_mask);
 
         Self {
             req_slots,
@@ -100,7 +96,6 @@ impl Qwen35Microbatch {
             token_indices,
             flat_token_ids_by_lane: vec![flat_token_ids],
             cu_tokens_by_lane: vec![cu_tokens],
-            gdn_state_txns,
             gdn_state_page_ids_by_req,
             sampler_configs,
             flat_sample_mask,
@@ -134,7 +129,6 @@ impl Qwen35Microbatch {
             .expect("qwen3.5 cumulative-token capacity must fit usize");
         let mut flat_token_ids_by_lane = vec![Vec::new(); num_lanes];
         let mut cu_tokens_by_lane = vec![Vec::with_capacity(cu_capacity); num_lanes];
-        let mut gdn_state_txns = Vec::with_capacity(requests.len());
         let mut gdn_state_page_ids_by_req = Vec::with_capacity(requests.len());
         let mut flat_sample_mask = Vec::new();
 
@@ -214,7 +208,6 @@ impl Qwen35Microbatch {
             req_slots.push(request.req_slot);
             block_indices.push(request.decoder_sync_blocks.block_index());
             token_indices.push(token_index);
-            gdn_state_txns.push(GDNStateTxn::new(token_index, num_total_tokens, num_req_spec_tokens));
             gdn_state_page_ids_by_req.push(gdn_state_page_ids);
         }
 
@@ -224,7 +217,6 @@ impl Qwen35Microbatch {
             token_indices,
             flat_token_ids_by_lane,
             cu_tokens_by_lane,
-            gdn_state_txns,
             gdn_state_page_ids_by_req,
             sampler_configs,
             flat_sample_mask,
@@ -236,8 +228,7 @@ impl Qwen35Microbatch {
             batch.flat_token_ids(),
             batch.cu_tokens(),
         );
-        validate_gdn_state_txns(batch.token_indices(), batch.cu_tokens(), batch.gdn_state_txns());
-        validate_flat_sample_mask(batch.cu_tokens(), batch.gdn_state_txns(), batch.flat_sample_mask());
+        validate_flat_sample_mask(batch.cu_tokens(), batch.flat_sample_mask());
         batch
     }
 
@@ -280,10 +271,6 @@ impl Qwen35Microbatch {
 
     pub fn num_total_tokens(&self, req_index: usize) -> u32 {
         self.cu_tokens()[req_index + 1] - self.cu_tokens()[req_index]
-    }
-
-    pub fn gdn_state_txns(&self) -> &[GDNStateTxn] {
-        &self.gdn_state_txns
     }
 
     pub fn gdn_state_page_ids_by_req(&self) -> &[Vec<Vec<u32>>] {
@@ -492,14 +479,8 @@ pub fn sample_decisions_from_sampled_tokens(sampled_tokens: &Qwen35SampledTokens
 }
 
 pub fn verified_state_versions(microbatch: &Qwen35Microbatch) -> Vec<u32> {
-    microbatch
-        .gdn_state_txns()
-        .iter()
-        .map(|txn| {
-            txn.dst_end_state_version()
-                .checked_sub(1)
-                .expect("qwen3.5 GDN destination state range must not be empty")
-        })
+    (0..microbatch.num_reqs())
+        .map(|req_index| microbatch.token_indices()[req_index] + microbatch.num_total_tokens(req_index))
         .collect()
 }
 
@@ -510,7 +491,6 @@ pub fn verified_state_versions_for_decisions(
     let mut decision_iter = decisions.iter();
     let mut state_versions = Vec::with_capacity(microbatch.num_reqs());
     for req_index in 0..microbatch.num_reqs() {
-        let txn = microbatch.gdn_state_txns()[req_index];
         let num_spec_tokens = microbatch.num_spec_tokens(req_index);
         if num_spec_tokens == 0 {
             if microbatch.is_decode_req(req_index) {
@@ -518,11 +498,7 @@ pub fn verified_state_versions_for_decisions(
                     .next()
                     .expect("qwen3.5 commit requires one decision per sampled request");
             }
-            state_versions.push(
-                txn.dst_end_state_version()
-                    .checked_sub(1)
-                    .expect("qwen3.5 GDN destination state range must not be empty"),
-            );
+            state_versions.push(microbatch.token_indices()[req_index] + microbatch.num_total_tokens(req_index));
             continue;
         }
 
@@ -543,14 +519,7 @@ pub fn verified_state_versions_for_decisions(
             num_accepted_tokens <= num_spec_tokens,
             "qwen3.5 commit accepted more spec tokens than provided"
         );
-        let verified_state_version = microbatch.token_indices()[req_index]
-            .checked_add(num_fixed_tokens)
-            .and_then(|state_version| state_version.checked_add(num_accepted_tokens))
-            .expect("qwen3.5 verified state version must fit u32");
-        assert!(
-            txn.contains_dst_state_version(verified_state_version),
-            "qwen3.5 verified state version must select the transaction's destination range"
-        );
+        let verified_state_version = microbatch.token_indices()[req_index] + num_fixed_tokens + num_accepted_tokens;
         state_versions.push(verified_state_version);
     }
     assert!(
@@ -648,40 +617,19 @@ fn validate_batch_fields(
             start < end,
             "qwen3.5 request requires strictly increasing cu_tokens, req_index={req_index}, start={start}, end={end}"
         );
+        token_indices[req_index]
+            .checked_add(end - start)
+            .expect("qwen3.5 state version must fit u32");
     }
 }
 
-fn validate_gdn_state_txns(token_indices: &[u32], cu_tokens: &[u32], gdn_state_txns: &[GDNStateTxn]) {
-    assert_eq!(
-        token_indices.len(),
-        gdn_state_txns.len(),
-        "qwen3.5 request requires one GDN state txn per request"
-    );
-    for req_index in 0..token_indices.len() {
-        let txn = gdn_state_txns[req_index];
-        let num_total_tokens = cu_tokens[req_index + 1] - cu_tokens[req_index];
-        assert!(
-            txn.dst_start_state_version() >= token_indices[req_index],
-            "qwen3.5 GDN candidate start must not precede the source state"
-        );
-        assert_eq!(
-            txn.dst_end_state_version(),
-            token_indices[req_index]
-                .checked_add(num_total_tokens)
-                .and_then(|version| version.checked_add(1))
-                .expect("qwen3.5 GDN state range must fit u32"),
-            "qwen3.5 GDN candidate end must follow the final forward state"
-        );
-    }
-}
-
-fn validate_flat_sample_mask(cu_tokens: &[u32], gdn_state_txns: &[GDNStateTxn], flat_sample_mask: &[bool]) {
+fn validate_flat_sample_mask(cu_tokens: &[u32], flat_sample_mask: &[bool]) {
     assert_eq!(
         flat_sample_mask.len(),
         *cu_tokens.last().expect("qwen3.5 sample mask requires cu_tokens") as usize,
         "qwen3.5 flat_sample_mask requires one entry per flat token"
     );
-    for req_index in 0..gdn_state_txns.len() {
+    for req_index in 0..cu_tokens.len() - 1 {
         let token_start = cu_tokens[req_index] as usize;
         let token_end = cu_tokens[req_index + 1] as usize;
         let req_flat_sample_mask = &flat_sample_mask[token_start..token_end];
@@ -689,11 +637,6 @@ fn validate_flat_sample_mask(cu_tokens: &[u32], gdn_state_txns: &[GDNStateTxn], 
         if num_req_main_output_rows == 0 {
             continue;
         }
-        let num_candidate_states = gdn_state_txns[req_index].num_candidate_states() as usize;
-        assert_eq!(
-            num_req_main_output_rows, num_candidate_states,
-            "qwen3.5 decode request requires one sample row per speculative token plus one"
-        );
         assert!(
             req_flat_sample_mask[..req_flat_sample_mask.len() - num_req_main_output_rows]
                 .iter()
@@ -819,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mtp_gdn_transaction_uses_the_unshifted_candidate_suffix() {
+    fn test_mtp_main_inputs_use_the_unshifted_speculative_suffix() {
         let requests = vec![device_request(
             10,
             0,
@@ -833,15 +776,13 @@ mod tests {
         )];
 
         let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
-        let txn = batch.gdn_state_txns()[0];
 
-        assert_eq!(txn.dst_start_state_version(), 11);
-        assert_eq!(txn.dst_end_state_version(), 14);
-        assert_eq!(txn.num_candidate_states(), 3);
+        assert_eq!(batch.num_spec_tokens(0), 2);
+        assert_eq!(verified_state_versions(&batch), vec![13]);
     }
 
     #[test]
-    fn test_dspark_and_mtp_use_the_same_candidate_count() {
+    fn test_dspark_and_mtp_use_the_same_speculative_suffix() {
         let dspark_requests = vec![device_request(
             10,
             0,
@@ -869,10 +810,9 @@ mod tests {
             Qwen35Microbatch::from_requests_with_spec_tokens(&dspark_requests, 0, vec![SamplerConfig::default()]);
         let mtp = Qwen35Microbatch::from_requests_with_spec_tokens(&mtp_requests, 2, vec![SamplerConfig::default()]);
 
-        assert_eq!(dspark.gdn_state_txns()[0].num_candidate_states(), 3);
-        assert_eq!(mtp.gdn_state_txns()[0].num_candidate_states(), 3);
-        assert_eq!(dspark.gdn_state_txns()[0].dst_state_versions(), 11..14);
-        assert_eq!(mtp.gdn_state_txns()[0].dst_state_versions(), 11..14);
+        assert_eq!(dspark.num_spec_tokens(0), 2);
+        assert_eq!(mtp.num_spec_tokens(0), 2);
+        assert_eq!(verified_state_versions(&dspark), verified_state_versions(&mtp));
     }
 
     #[test]
@@ -890,10 +830,7 @@ mod tests {
         )];
 
         let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
-        let txn = batch.gdn_state_txns()[0];
 
-        assert_eq!(txn.dst_start_state_version(), 14);
-        assert_eq!(txn.dst_end_state_version(), 15);
         assert_eq!(verified_state_versions(&batch), vec![14]);
     }
 
@@ -917,10 +854,7 @@ mod tests {
             sampled_prob: 0.2,
             ..Qwen35DecodeDecision::default()
         };
-        let txn = batch.gdn_state_txns()[0];
 
-        assert_eq!(txn.dst_start_state_version(), 11);
-        assert_eq!(txn.dst_end_state_version(), 12);
         assert_eq!(
             verified_state_versions_for_decisions(&batch, std::slice::from_ref(&decision)),
             vec![11]
@@ -935,7 +869,6 @@ mod tests {
             vec![8],
             vec![10, 11, 12, 20, 21],
             vec![0, 5],
-            vec![GDNStateTxn::new(8, 5, 2)],
             vec![Vec::new()],
             vec![SamplerConfig::default()],
             vec![false, false, true, true, true],
@@ -954,7 +887,6 @@ mod tests {
             vec![8],
             vec![10, 11, 12],
             vec![0, 3],
-            vec![GDNStateTxn::new(8, 3, 1)],
             vec![Vec::new()],
             vec![SamplerConfig::default()],
             vec![true, false, true],
@@ -981,7 +913,6 @@ mod tests {
             vec![0, 0],
             vec![11, 12, 13, 21, 22],
             vec![0, 3, 5],
-            vec![GDNStateTxn::new(0, 3, 2), GDNStateTxn::new(0, 2, 1)],
             vec![Vec::new(), Vec::new()],
             vec![first, second],
             vec![true; 5],

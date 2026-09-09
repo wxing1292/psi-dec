@@ -97,7 +97,6 @@ pub fn run(args: Args) {
                 &num_tokens_per_req,
                 args.prefill_requests,
                 existing_context_len,
-                args.candidate_states,
                 &weights,
             );
             println!(
@@ -123,7 +122,6 @@ struct RealGDNFixture<'a> {
     num_reqs: u32,
     num_prefill_requests: u32,
     existing_context_len: u32,
-    materialize_candidate_states: bool,
     next_hidden_state: Buffer,
     replay: ReplayProgram,
     hidden_state: Buffer,
@@ -139,6 +137,10 @@ struct RealGDNFixture<'a> {
     conv_qkv: Buffer,
     recurrent_output: Buffer,
     norm_gated_output: Buffer,
+    replay_alpha: Buffer,
+    replay_k: Buffer,
+    replay_u: Buffer,
+    replay_qkv: Buffer,
     weights: &'a RealGDNWeights,
 }
 
@@ -148,7 +150,6 @@ impl<'a> RealGDNFixture<'a> {
         num_tokens_per_req: &[u32],
         num_prefill_requests: u32,
         existing_context_len: u32,
-        materialize_candidate_states: bool,
         weights: &'a RealGDNWeights,
     ) -> Self {
         let num_tokens = num_tokens_per_req.iter().sum();
@@ -187,25 +188,8 @@ impl<'a> RealGDNFixture<'a> {
             .map(|value| value as u32)
             .collect::<Vec<_>>();
         let mut flat_materialized_state_slots = vec![u32::MAX; num_tokens as usize];
-        if materialize_candidate_states {
-            for (req_index, window) in cu_tokens.windows(2).enumerate() {
-                let first_write = if req_index < num_prefill_requests as usize {
-                    window[1] - 1
-                } else {
-                    window[0]
-                };
-                for flat_token_index in first_write..window[1] {
-                    flat_materialized_state_slots[flat_token_index as usize] = num_reqs
-                        .checked_add(flat_token_index)
-                        .expect("GDN bench candidate state slot ID must fit u32");
-                }
-            }
-        } else {
-            for (req_index, &flat_end) in cu_tokens.iter().skip(1).enumerate() {
-                flat_materialized_state_slots[flat_end as usize - 1] = num_reqs
-                    .checked_add(u32::try_from(req_index).expect("GDN bench request index must fit u32"))
-                    .expect("GDN bench final state slot ID must fit u32");
-            }
+        for (req_index, &flat_end) in cu_tokens.iter().skip(1).take(num_prefill_requests as usize).enumerate() {
+            flat_materialized_state_slots[flat_end as usize - 1] = num_reqs + req_index as u32;
         }
         batch_metadata.update(
             &cu_tokens,
@@ -217,15 +201,9 @@ impl<'a> RealGDNFixture<'a> {
             num_reqs,
             num_tokens,
         );
-        let num_state_slots = if materialize_candidate_states {
-            num_reqs
-                .checked_add(num_tokens)
-                .expect("GDN bench candidate state-slot count must fit u32")
-        } else {
-            num_reqs
-                .checked_mul(2)
-                .expect("GDN bench source and destination state-slot count must fit u32")
-        };
+        let num_state_slots = num_reqs
+            .checked_mul(2)
+            .expect("GDN bench state-slot count must fit u32");
         let conv_state = Buffer::from_slice(
             device,
             &gdn_conv_state_fixture(
@@ -254,6 +232,14 @@ impl<'a> RealGDNFixture<'a> {
         let conv_qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<u16>());
         let recurrent_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<u16>());
         let norm_gated_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<u16>());
+        let replay_alpha = Buffer::new_zeroed_elements(device, num_tokens as usize * GDN_V_HEADS, Dtype::Float32);
+        let replay_k = Buffer::new_zeroed_elements(
+            device,
+            num_tokens as usize * GDN_QK_HEADS * GDN_QK_HEAD_DIM,
+            Dtype::Float32,
+        );
+        let replay_u = Buffer::new_zeroed_elements(device, num_tokens as usize * GDN_V_DIM, Dtype::Float32);
+        let replay_qkv = Buffer::new_zeroed_elements(device, num_tokens as usize * GDN_CONV_DIM, Dtype::Bfloat16);
         let mut recorder = MetalReplayRuntime::new(&stream).create_recorder();
         let _ = <GDN as ReplayLayer>::record(
             &backend,
@@ -279,8 +265,15 @@ impl<'a> RealGDNFixture<'a> {
                     next_conv_state_offset_bytes: 0,
                     recurrent_state_arena: &recurrent_state_arena,
                     recurrent_state_arena_offset_bytes: 0,
+                    replay: inference_backend_metal::components::gdn::compute::ReplayBuffers {
+                        alpha: &replay_alpha,
+                        k: &replay_k,
+                        u: &replay_u,
+                        qkv: &replay_qkv,
+                        token_offset: 0,
+                        num_total_tokens: num_tokens,
+                    },
                 },
-                materialize_candidate_states,
                 weights: weights.as_borrowed(),
                 num_active_tokens: ReplayU32::Fixed(num_tokens),
             },
@@ -293,7 +286,6 @@ impl<'a> RealGDNFixture<'a> {
             num_reqs,
             num_prefill_requests,
             existing_context_len,
-            materialize_candidate_states,
             next_hidden_state,
             replay,
             hidden_state,
@@ -309,6 +301,10 @@ impl<'a> RealGDNFixture<'a> {
             conv_qkv,
             recurrent_output,
             norm_gated_output,
+            replay_alpha,
+            replay_k,
+            replay_u,
+            replay_qkv,
             weights,
         };
         fixture.run();
@@ -326,11 +322,7 @@ impl<'a> RealGDNFixture<'a> {
             self.num_tokens,
             self.num_reqs,
             Some(self.existing_context_len),
-            Some(if self.materialize_candidate_states {
-                "mixed_candidate_state"
-            } else {
-                "mixed"
-            }),
+            Some("mixed_replay"),
             iters,
             &samples,
         );
@@ -373,7 +365,7 @@ impl<'a> RealGDNFixture<'a> {
         assert_eq!(
             &actual_hidden[prefill_tokens * HIDDEN_DIM..],
             &expected_hidden[prefill_tokens * HIDDEN_DIM..],
-            "the unchanged recurrent decode branch must preserve output bits",
+            "replay forward must preserve the recurrent output bits",
         );
         let state_stride = GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM;
         let write_slots = self
@@ -416,12 +408,10 @@ impl<'a> RealGDNFixture<'a> {
             );
         }
         println!(
-            "bench_compare component=gdn baseline_commands={} mixed_commands={} prefill_requests={} \
-             candidate_states={} order=alternating",
+            "bench_compare component=gdn baseline_commands={} mixed_commands={} prefill_requests={} order=alternating",
             recurrent.command_count(),
             self.replay.command_count(),
             self.num_prefill_requests,
-            self.materialize_candidate_states
         );
         let mut samples = [Vec::with_capacity(runs), Vec::with_capacity(runs)];
         for run_index in 0..runs {
@@ -536,21 +526,13 @@ impl<'a> RealGDNFixture<'a> {
             recurrent_output: &self.recurrent_output,
             norm_gated_output: &self.norm_gated_output,
         };
-        if self.materialize_candidate_states {
-            builder.record_with_barrier_before(compute.invoke_with_candidate_state_update(
-                compute_shape,
-                compute_buffers,
-                ReplayU32::Fixed(self.num_reqs),
-                ReplayU32::Fixed(self.num_tokens),
-            ))
-        } else {
-            builder.record_with_barrier_before(compute.invoke(
-                compute_shape,
-                compute_buffers,
-                ReplayU32::Fixed(self.num_reqs),
-                ReplayU32::Fixed(self.num_tokens),
-            ))
-        }
+        // Reference recurrence uses the same full-state write map; decode writes no full state.
+        builder.record_with_barrier_before(compute.invoke_with_candidate_state_update(
+            compute_shape,
+            compute_buffers,
+            ReplayU32::Fixed(self.num_reqs),
+            ReplayU32::Fixed(self.num_tokens),
+        ));
         builder.record_with_barrier_before(output.invoke(
             self.num_tokens,
             ReplayU32::Fixed(self.num_tokens),
@@ -648,13 +630,20 @@ impl<'a> RealGDNFixture<'a> {
         };
         let compute_replay = build_single_invocation_replay(
             &self.stream,
-            compute.invoke_mixed(
+            compute.invoke_with_replay(
                 compute_shape,
                 compute_buffers,
+                backend_compute::ReplayBuffers {
+                    alpha: &self.replay_alpha,
+                    k: &self.replay_k,
+                    u: &self.replay_u,
+                    qkv: &self.replay_qkv,
+                    token_offset: 0,
+                    num_total_tokens: self.num_tokens,
+                },
                 ReplayU32::Fixed(self.num_reqs),
                 ReplayU32::Fixed(self.num_tokens),
                 ReplayU32::Fixed(self.num_prefill_requests),
-                self.materialize_candidate_states,
             ),
         );
         let output_replay = build_single_invocation_replay(
@@ -677,17 +666,7 @@ impl<'a> RealGDNFixture<'a> {
 
         self.measure_subcomponent("qkvabz", &qkvabz_replay, warmup_iters, iters, runs);
         self.measure_subcomponent("qkvabz-to-qkv-a-b-z", &split_replay, warmup_iters, iters, runs);
-        self.measure_subcomponent(
-            if self.materialize_candidate_states {
-                "compute_mixed_candidate_state"
-            } else {
-                "compute_mixed"
-            },
-            &compute_replay,
-            warmup_iters,
-            iters,
-            runs,
-        );
+        self.measure_subcomponent("compute_mixed_replay", &compute_replay, warmup_iters, iters, runs);
         self.measure_subcomponent("output", &output_replay, warmup_iters, iters, runs);
     }
 

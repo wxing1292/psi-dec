@@ -26,7 +26,6 @@ pub const GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS: ReplayParameterKey =
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GDNReplayTopology {
-    pub materialize_candidate_states: bool,
     pub qkvabz_affine: affine_quantized::KernelKind,
     pub output_affine: affine_quantized::KernelKind,
 }
@@ -90,6 +89,7 @@ pub struct GDNLayerStateBindings<'a> {
     pub next_conv_state_offset_bytes: u64,
     pub recurrent_state_arena: &'a Buffer,
     pub recurrent_state_arena_offset_bytes: u64,
+    pub replay: backend_compute::ReplayBuffers<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -115,7 +115,6 @@ pub struct GDNInput<'a> {
     pub scratch: GDNScratchBindings<'a>,
     pub batch_metadata: &'a GDNMetadataBuffers,
     pub state: GDNLayerStateBindings<'a>,
-    pub materialize_candidate_states: bool,
     pub weights: GDNWeights<'a>,
     pub num_active_tokens: ReplayU32,
 }
@@ -248,24 +247,15 @@ impl GDN {
         GDNReplayBucketPolicy::new(max_requests, max_tokens, &boundaries)
     }
 
-    pub fn replay_topology(
-        &self,
-        batch_metadata: &GDNMetadataBuffers,
-        materialize_candidate_states: bool,
-    ) -> GDNReplayTopology {
+    pub fn replay_topology(&self, batch_metadata: &GDNMetadataBuffers) -> GDNReplayTopology {
         let shape = batch_metadata.replay_shape();
         shape.validate();
-        self.replay_topology_for_token_capacity(shape.num_total_tokens, materialize_candidate_states)
+        self.replay_topology_for_token_capacity(shape.num_total_tokens)
     }
 
-    fn replay_topology_for_token_capacity(
-        &self,
-        num_total_tokens: u32,
-        materialize_candidate_states: bool,
-    ) -> GDNReplayTopology {
+    fn replay_topology_for_token_capacity(&self, num_total_tokens: u32) -> GDNReplayTopology {
         assert!(num_total_tokens > 0, "GDN replay topology requires token capacity");
         GDNReplayTopology {
-            materialize_candidate_states,
             qkvabz_affine: self.qkvabz.topology(num_total_tokens),
             output_affine: self.output.topology(num_total_tokens),
         }
@@ -277,8 +267,8 @@ impl GDN {
             num_tokens <= num_total_tokens,
             "GDN active token count must not exceed the total token count"
         );
-        let active_topology = self.replay_topology_for_token_capacity(num_tokens, true);
-        let selected_topology = self.replay_topology_for_token_capacity(num_total_tokens, true);
+        let active_topology = self.replay_topology_for_token_capacity(num_tokens);
+        let selected_topology = self.replay_topology_for_token_capacity(num_total_tokens);
         assert_eq!(
             active_topology.qkvabz_affine, selected_topology.qkvabz_affine,
             "GDN total token count must preserve the QKVABZ affine topology"
@@ -330,7 +320,7 @@ impl ReplayLayer for GDN {
             ReplayU32::Fixed(shape.num_reqs)
         };
         let active_tokens = input.num_active_tokens;
-        let active_prefill_requests = if matches!(active_tokens, ReplayU32::Parameter(_)) {
+        let active_chunkwise_requests = if matches!(active_tokens, ReplayU32::Parameter(_)) {
             ReplayU32::Parameter(GDN_NUM_ACTIVE_CHUNKWISE_REQUESTS)
         } else {
             ReplayU32::Fixed(batch_metadata.num_active_chunkwise_requests())
@@ -389,13 +379,13 @@ impl ReplayLayer for GDN {
             norm_gated_output: scratch.norm_gated_output,
         };
         let compute_shape = compute_shape(shape);
-        let compute = self.compute.invoke_mixed(
+        let compute = self.compute.invoke_with_replay(
             compute_shape,
             compute_buffers,
+            state.replay,
             active_reqs,
             active_tokens,
-            active_prefill_requests,
-            input.materialize_candidate_states,
+            active_chunkwise_requests,
         );
         recorder.record_with_barrier_before(ReplayOp::opaque(compute));
         let output = self.output.invoke(

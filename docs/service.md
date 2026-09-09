@@ -439,40 +439,22 @@ Every submitted request owns one request slot. The request channel capacity equa
 
 Admission assigns a slot before a request enters the scheduler.
 GQA page tables, GDN request state, sampling state, and request-indexed workspaces use the same slot domain.
-For Qwen3.5 DSpark or DFlash2, GDN retains one candidate state for every possible accepted proposal prefix in each
-slot.
-Thus, `--max-requests` also bounds the persistent GDN candidate-state arena.
+GDN retains the current state and destinations for the accepted final state and cache-block boundaries.
+Decode writes transient per-forward deltas. It does not reserve a full state for every speculative prefix.
 Buffers, scratch allocations, replay resources, and resident model resources remain reusable.
 
-Qwen3.5 wiring derives this request-local GDN slot count:
+Qwen3.5 derives the same request-local GDN slot count for Vanilla, MTP, DSpark, and DFlash2:
 
 ```text
-decision_candidate_states = match mode {
-  Vanilla => 1,
-  MTP { num_spec_tokens } => num_spec_tokens + 1,
-  DSpark { num_spec_tokens } => num_spec_tokens + 1,
-  DFlash2 { num_spec_tokens } => num_spec_tokens + 1,
-}
-block_boundary_candidates = ceil(max_tokens_per_request / num_tokens_per_block)
-candidate_states = decision_candidate_states + block_boundary_candidates
-state_slots = 1 + candidate_states
+block_boundary_states = ceil(max_tokens_per_request / num_tokens_per_block)
+materialized_states = 1 + block_boundary_states
+state_slots = 1 + materialized_states
 ```
 
-The leading slot stores the current state.
-Candidate slots store decision prefixes and logical cache-block boundary states.
-The two sets can be disjoint when a request contains more than one fixed token.
-MTP shifts the complete decision-candidate version range by `num_spec_tokens - 1`.
-The shift changes the physical replay frontier. It does not change the candidate count.
-Qwen verification calculates the shifted range. GDN commit receives one selected physical version as its next source.
+The first slot stores the current state. Materialized destinations store the accepted final state and crossed boundaries.
 The total arena scales with `--max-requests * state_slots * full_model_state_bytes`.
-
-For the Qwen3.6-27B checkpoint, one full-model GDN state is 149.625 MiB.
-With the default `--max-requests 2`, one-step MTP uses four state slots for each request and allocates
-approximately 1.17 GiB for the arena.
-Two-step MTP uses five state slots for each request and allocates approximately 1.46 GiB.
-Four-step MTP uses seven state slots for each request and allocates approximately 2.05 GiB.
-A DSpark checkpoint with `block_size=15` uses 18 state slots for each request and allocates approximately 5.26 GiB.
-These values do not include model weights, cache pages, or other executor workspaces.
+The separate replay log scales with GDN layer count, `--max-tokens`, and the per-token delta/QKV widths.
+Its allocation includes unused chunkwise-prefix rows. See [`executor_gdn.md`](executor_gdn.md) for layouts and commit ordering.
 
 One default batch has these scheduler limits:
 
@@ -1073,7 +1055,8 @@ percentiles.
 Set `PSI_QWEN35_STATE_TRACE=1` to write executor lifecycle lines to standard error. These lines include:
 
 - Replay cache hit or miss keys
-- GDN restore and publish decisions
+- GDN restore and commit/publish decisions
+- `gdn_commit_wait` for pending state reconstruction and page publication
 - Synchronous `prepare_sync` timing
 
 The timing fields are `gqa_us`, `gdn_states_us`, dependent `gdn_metadata_us`, and total `wall_us`.

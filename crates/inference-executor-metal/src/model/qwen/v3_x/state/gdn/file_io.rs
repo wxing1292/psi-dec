@@ -14,6 +14,10 @@ impl FullStateIO for Qwen3xGDNState {
     type Files = GDNStateSnapshotFiles;
 
     fn write_full_state(&self, writer: &mut StateSnapshotWriter, files: Self::Files) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.pending_commit.is_none(),
+            "GDN state I/O requires a completed commit"
+        );
         self.request_state_table.write_full_state(writer, files)
     }
 
@@ -22,6 +26,10 @@ impl FullStateIO for Qwen3xGDNState {
         reader: &mut StateSnapshotReader,
         files: Self::Files,
     ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.pending_commit.is_none(),
+            "GDN state I/O requires a completed commit"
+        );
         self.request_state_table.read_full_state(reader, files)
     }
 }
@@ -35,6 +43,10 @@ impl SelectedStateIO for Qwen3xGDNState {
         files: Self::Files,
         request_slot_ranges: &[Range<RawRequestSlot>],
     ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.pending_commit.is_none(),
+            "GDN state I/O requires a completed commit"
+        );
         self.request_state_table
             .write_selected_state(writer, files, request_slot_ranges)
     }
@@ -45,6 +57,10 @@ impl SelectedStateIO for Qwen3xGDNState {
         files: Self::Files,
         request_slot_ranges: &[Range<RawRequestSlot>],
     ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.pending_commit.is_none(),
+            "GDN state I/O requires a completed commit"
+        );
         self.request_state_table
             .read_selected_state(reader, files, request_slot_ranges)
     }

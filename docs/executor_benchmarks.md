@@ -172,13 +172,14 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
     -> Markov correction + sampling
   ```
 
-- `qwen35_gdn` measures the production fixed prefill-chunkwise/decode-recurrent GDN graph with the 35B-A3B profile.
-  `--tokens-per-req` selects an explicit ragged request layout. `--prefill-requests` identifies its prefill prefix.
-  `--candidate-states` uses the production candidate graph. It materializes each Decode row and the final Prefill row.
-  `--compare-recurrent` records the previous recurrent graph in the benchmark and compares it with the production graph.
-  Both graphs share weights, inputs, and initial state. An untimed check compares outputs and materialized state.
-  Timed iterations alternate their order and report relative wall-time changes.
-  `--subcomponents` retains the existing isolated operation measurements.
+- `qwen35_gdn` measures the production chunkwise/replay GDN forward with the 35B-A3B profile.
+  It excludes accepted-state commit and cache publication.
+  `--tokens-per-req` selects a ragged request layout. `--prefill-requests` selects the chunkwise prefix.
+  The prefix writes final states. The suffix writes per-token F32 replay logs.
+  `--compare-recurrent` compares an all-recurrent forward with the same full-state write map and no replay log.
+  This reference is not the previous complete model lifecycle. Both graphs share weights, inputs, and initial state.
+  The untimed check compares outputs and requested snapshots. Timed iterations alternate their order.
+  `--subcomponents` uses the same forward contract.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_main_layers` records only selected `Qwen35MainLayer` owners.
   It accepts `layer0`, `layer3`, `layer4`, `first4`, `all_layers`, or `layersSTART-END`.

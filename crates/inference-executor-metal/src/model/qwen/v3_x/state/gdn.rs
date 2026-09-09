@@ -5,9 +5,9 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
+use inference_backend_metal::metal::Stream;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
-use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::backend::GDN;
@@ -33,6 +33,10 @@ mod file_io;
 
 const GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS: ReplayParameterKey =
     ReplayParameterKey::new("qwen3x.gdn_state_restore.num_active_requests");
+const GDN_STATE_COMMIT_NUM_ACTIVE_JOBS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.gdn_state_commit.num_active_jobs");
+const GDN_STATE_COMMIT_NUM_ACTIVE_PUBLISHES: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.gdn_state_commit.num_active_publishes");
 
 pub struct Qwen3xGDNState {
     backend: Option<Rc<GDN>>,
@@ -45,48 +49,79 @@ pub struct Qwen3xGDNState {
     replay_bucket_policy: GDNReplayBucketPolicy,
     request_state_table: GDNRequestStateTable,
     state_restore: Replay<GDNStateRestore>,
-    pending_publish: Option<MetalReplaySubmission>,
+    state_commit: Replay<GDNStateCommit>,
+    commit_stream: Stream,
+    pending_commit: Option<MetalReplaySubmission>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct GDNStateRestoreKey {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GDNStateCommitKey {
+    num_total_replay_jobs: u32,
+    num_total_state_io_requests: u32,
+}
+
+struct GDNStateCommitInput<'a> {
+    request_state_table: &'a GDNRequestStateTable,
+    pages: &'a Buffer,
+    key: GDNStateCommitKey,
+}
+
+struct GDNStateCommit;
+
+impl ReplayComponent for GDNStateCommit {
+    type Key = GDNStateCommitKey;
+    type Input<'a> = GDNStateCommitInput<'a>;
+
+    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+        input.key
+    }
+
+    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
+        if input.key.num_total_replay_jobs > 0 {
+            input.request_state_table.record_commit(
+                recorder,
+                input.key.num_total_replay_jobs,
+                ReplayU32::Parameter(GDN_STATE_COMMIT_NUM_ACTIVE_JOBS),
+            );
+        }
+        if input.key.num_total_state_io_requests > 0 {
+            input.request_state_table.record_publish(
+                recorder,
+                input.pages,
+                input.key.num_total_state_io_requests,
+                ReplayU32::Parameter(GDN_STATE_COMMIT_NUM_ACTIVE_PUBLISHES),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GDNStateRestoreKey {
     num_total_state_io_requests: u32,
 }
 
 #[derive(Clone, Copy)]
-pub struct GDNStateRestoreInput<'a> {
+struct GDNStateRestoreInput<'a> {
     request_state_table: &'a GDNRequestStateTable,
     pages: &'a Buffer,
+    key: GDNStateRestoreKey,
 }
 
-pub struct GDNStateRestore;
+struct GDNStateRestore;
 
 impl ReplayComponent for GDNStateRestore {
     type Key = GDNStateRestoreKey;
     type Input<'a> = GDNStateRestoreInput<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        let num_total_state_io_requests = input
-            .request_state_table
-            .restores()
-            .len()
-            .try_into()
-            .expect("GDN restore I/O request count must fit u32");
-        assert!(
-            num_total_state_io_requests > 0,
-            "GDN restore replay requires restore jobs"
-        );
-        GDNStateRestoreKey {
-            num_total_state_io_requests,
-        }
+        input.key
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        let key = self.replay_key(input);
         input.request_state_table.record_restore(
             recorder,
             input.pages,
-            key.num_total_state_io_requests,
+            input.key.num_total_state_io_requests,
             ReplayU32::Parameter(GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS),
         );
     }
@@ -125,6 +160,7 @@ impl Qwen3xGDNState {
             num_tokens_per_block,
             num_cache_pages,
             page_bytes,
+            max_tokens,
         );
         let backend = Rc::new(GDN::new(device, representative.clone(), metal));
         let max_requests = num_req_slots
@@ -143,7 +179,9 @@ impl Qwen3xGDNState {
             replay_bucket_policy,
             request_state_table,
             state_restore: Replay::new("qwen3.x GDN state restore", GDNStateRestore),
-            pending_publish: None,
+            state_commit: Replay::new("qwen3.x GDN state commit", GDNStateCommit),
+            commit_stream: Stream::new(device),
+            pending_commit: None,
         }
     }
 
@@ -172,7 +210,8 @@ impl Qwen3xGDNState {
         block_indices: &[usize],
         token_indices: &[u32],
         cu_tokens: &[u32],
-        state_txns: &[GDNStateTxn],
+        num_spec_tokens: &[u32],
+        num_chunkwise_requests: usize,
         state_page_ids_by_req: &[Vec<Vec<u32>>],
     ) -> GDNPreparedRequestState {
         self.request_state_table.prepare(
@@ -180,7 +219,8 @@ impl Qwen3xGDNState {
             block_indices,
             token_indices,
             cu_tokens,
-            state_txns,
+            num_spec_tokens,
+            num_chunkwise_requests,
             state_page_ids_by_req,
         )
     }
@@ -207,7 +247,7 @@ impl Qwen3xGDNState {
     }
 
     pub fn replay_topology(&self) -> GDNReplayTopology {
-        self.backend().replay_topology(self.metadata(), true)
+        self.backend().replay_topology(self.metadata())
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
@@ -227,49 +267,74 @@ impl Qwen3xGDNState {
     }
 
     pub fn restore(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer) {
-        if !self.request_state_table.prepare_restore() {
+        let num_active_state_io_requests = self.request_state_table.prepare_restore(pages);
+        if num_active_state_io_requests == 0 {
             trace::gdn_state(|| "event=gdn_restore skipped=true".to_string());
             return;
         }
         let input = GDNStateRestoreInput {
             request_state_table: &self.request_state_table,
             pages,
+            key: GDNStateRestoreKey {
+                num_total_state_io_requests: num_active_state_io_requests,
+            },
         };
         let (key, cache_hit) = self.state_restore.record(runtime, &input);
         trace::gdn_state(|| format!("event=gdn_restore key={key:?} cache_hit={cache_hit}"));
         let arguments =
-            ReplayArguments::new().with_u32(GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS, key.num_total_state_io_requests);
+            ReplayArguments::new().with_u32(GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS, num_active_state_io_requests);
         runtime
             .submit_replay_with_arguments(self.state_restore.replay(&key), &arguments)
             .wait();
         self.request_state_table.finish_restore();
     }
 
-    pub fn commit(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer, state_versions: &[u32]) {
+    pub fn commit(&mut self, pages: &Buffer, state_versions: &[u32]) {
         assert!(
-            self.pending_publish.is_none(),
-            "GDN cache publish cannot overlap a previous publish"
+            self.pending_commit.is_none(),
+            "GDN commit cannot overlap a previous commit"
         );
-        self.request_state_table.commit(state_versions);
-        let mut recorder = runtime.create_recorder();
-        if self.request_state_table.record_publish(&mut recorder, pages) {
-            self.pending_publish = Some(runtime.submit_replay(&recorder.build()));
+        let jobs = self.request_state_table.commit(state_versions);
+        let num_active_replay_jobs = jobs.len() as u32;
+        let num_active_state_io_requests = self.request_state_table.prepare_publish(pages);
+        if num_active_replay_jobs == 0 && num_active_state_io_requests == 0 {
+            return;
         }
+        let input = GDNStateCommitInput {
+            request_state_table: &self.request_state_table,
+            pages,
+            key: GDNStateCommitKey {
+                num_total_replay_jobs: num_active_replay_jobs,
+                num_total_state_io_requests: num_active_state_io_requests,
+            },
+        };
+        let runtime = MetalReplayRuntime::new(&self.commit_stream);
+        let (key, cache_hit) = self.state_commit.record(&runtime, &input);
+        trace::gdn_state(|| format!("event=gdn_commit key={key:?} cache_hit={cache_hit}"));
+        let mut arguments = ReplayArguments::new();
+        if num_active_replay_jobs > 0 {
+            arguments.set_u32(GDN_STATE_COMMIT_NUM_ACTIVE_JOBS, num_active_replay_jobs);
+        }
+        if num_active_state_io_requests > 0 {
+            arguments.set_u32(GDN_STATE_COMMIT_NUM_ACTIVE_PUBLISHES, num_active_state_io_requests);
+        }
+        self.pending_commit = Some(runtime.submit_replay_with_arguments(self.state_commit.replay(&key), &arguments));
     }
 
-    pub fn finish_publish(&mut self) {
-        if let Some(submission) = self.pending_publish.take() {
+    pub fn finish_commit(&mut self) {
+        if let Some(submission) = self.pending_commit.take() {
             submission.wait();
         }
-        self.request_state_table.finish_publish();
+        self.request_state_table.finish_commit();
     }
 
     pub fn clear_replay_cache(&mut self) {
         assert!(
-            self.pending_publish.is_none(),
-            "GDN replay cache cannot be cleared while a state publish is pending"
+            self.pending_commit.is_none(),
+            "GDN replay cache cannot be cleared while a state commit is pending"
         );
         self.state_restore.clear();
+        self.state_commit.clear();
     }
 
     pub fn release_resources(&mut self) {

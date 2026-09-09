@@ -16,6 +16,12 @@ Use these sections for specific questions:
 | Where are the implementation and verification paths? | [Source and verification](#source-and-verification) |
 | How does runtime core commit CPU token metadata? | [Scheduler cache commit](#scheduler-cache-commit) |
 
+After Main completes, rejection decisions fix the accepted GDN prefix.
+Before MTP embedding, the executor submits [GDN state commit](executor_gdn.md#state-data-flow) on a separate Metal stream.
+MTP can run while this stream reconstructs Main state and publishes accepted snapshots.
+The next Main preparation waits before it reuses GDN logs, state slots, or page staging.
+The scheduler response remains after the MTP proposal. This change does not advance the runtime core's token commit.
+
 ## Hidden-state buffer
 
 After Decode, the executor retains these BF16 hidden outputs for each request:

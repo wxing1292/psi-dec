@@ -56,7 +56,6 @@ struct Args {
     warmup_iters: usize,
     runs: usize,
     subcomponents: bool,
-    candidate_states: bool,
     compare_recurrent: bool,
 }
 
@@ -73,7 +72,6 @@ impl Args {
             warmup_iters: 20,
             runs: 1,
             subcomponents: false,
-            candidate_states: false,
             compare_recurrent: false,
         };
         let mut values = std::env::args().skip(1);
@@ -90,7 +88,6 @@ impl Args {
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--runs" => args.runs = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--subcomponents" => args.subcomponents = true,
-                "--candidate-states" => args.candidate_states = true,
                 "--compare-recurrent" => args.compare_recurrent = true,
                 "--bench" => {},
                 other => panic!("unknown argument {other:?}; pass --help for usage"),
@@ -180,7 +177,6 @@ fn print_help_and_exit() -> ! {
 --num-reqs 1,2,4
 --tokens-per-req 9,7,1,4  (overrides --tokens and --num-reqs)
 --prefill-requests N      (first N requests; default 0)
---candidate-states       (all decode rows; final prefill row only)
 --compare-recurrent      (old full graph, interleaved with the mixed graph)
 --subcomponents
 --iters N
