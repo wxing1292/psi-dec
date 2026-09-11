@@ -1160,6 +1160,39 @@ Pass explicit `_k1`, `_k2`, `_k3`, `_k4`, or `_k8` case names to compare other b
 
 The 27B cases use output limits 256 and 1024. The 35B cases use output limits 256 and 1024.
 
+Recommendation: Use this setup for a 32 GiB Apple Silicon Mac.
+Install the Hugging Face CLI with Homebrew:
+
+```sh
+brew install hf
+```
+
+Download both Main checkpoints and their matching MTP checkpoints:
+
+```sh
+mkdir -p "$HOME/Workspace/models" && (for m in Qwen3.8-27B-4bit Qwen3.8-27B-MTP-4bit Qwen3.6-35B-A3B-4bit Qwen3.6-35B-A3B-MTP-4bit; do hf download "mlx-community/$m" --local-dir "$HOME/Workspace/models/$m" || exit; done)
+```
+
+Run these commands from the repository root after the [setup prerequisites](../README.md#quick-start) are installed.
+Run the three-case check with explicit memory settings:
+
+```sh
+scripts/qwen35_e2e_decode_perf.sh \
+  --cases 27b_off,35b_mtp1,35b_mtp2 --runs 3 --case-cooldown-secs 60 \
+  --num-cache-pages 65536 --max-requests 1 --no-reference
+```
+
+Add `27b_mtp1` to `--cases` to include 27B with MTP.
+The helper defaults to 65,536 shared pages and one running request.
+It passes these values to every server case, overriding the service defaults.
+The shared KV/GDN arena uses 2 GiB instead of the helper's previous 12 GiB allocation.
+Weights, executor scratch, and active GDN state use additional memory.
+The page count is not a token count or a request context limit.
+An 8,192-token context includes prompt and generated tokens.
+These Main/MTP checkpoints fit that context in this arena with room for additional cache blocks.
+The fixed benchmark prompts and output limits use less context than this budget.
+Use `--num-cache-pages` and `--max-requests` to select larger capacities explicitly.
+
 The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
 Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
 The default `representative2` workload contains one fixed GSM8K prompt and the Chinese travel prompt (`chat`).
@@ -1212,7 +1245,7 @@ Run `python3 scripts/qwen35_e2e_decode_perf_test.py` for CPU-only script contrac
 The Qwen3 helper does not contain a checked-in reference run. Record its comparison results outside the script with the
 complete provenance required by [`executor_benchmarks.md`](executor_benchmarks.md).
 
-The current default uses four running requests.
+The Qwen3 helper defaults to two running requests. The Qwen3.5/3.6/3.8 helper defaults to one running request.
 
 Summaries report these metrics:
 

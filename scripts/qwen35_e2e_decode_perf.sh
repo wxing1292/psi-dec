@@ -42,8 +42,9 @@ SEED=42
 TEMPERATURE=0.7
 TOP_K=20
 TOP_P=0.8
-NUM_CACHE_PAGES=393216
-MAX_REQUESTS=4
+# The helper sends one request at a time. Limit the shared KV/GDN arena to 2 GiB.
+NUM_CACHE_PAGES=65536
+MAX_REQUESTS=1
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
 CACHE_BLOCK_TOKENS=2048
@@ -134,8 +135,8 @@ Options:
   --temperature N       Sampling temperature. Default: 0.7
   --top-k N             Sampling top-k. Default: 20
   --top-p N             Sampling top-p. Default: 0.8
-  --num-cache-pages N   Shared cache pages. Default: 393216
-  --max-requests N      Scheduler request capacity. Default: 4
+  --num-cache-pages N   Shared KV/GDN cache pages, 32 KiB each. Default: 65536 (2 GiB)
+  --max-requests N      Scheduler request capacity. Default: 1
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
   --max-tokens-per-request N
                         Scheduler per-request token capacity. Default: 64
