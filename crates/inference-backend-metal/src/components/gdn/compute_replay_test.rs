@@ -4,18 +4,23 @@ use crate::components::gdn::state_replay;
 
 #[test]
 fn test_replay_commits_selected_prefixes_across_layers() {
+    for (qk_head_dim, v_head_dim) in [(64, 8), (128, 128), (256, 8)] {
+        assert_replay_commits(Config {
+            num_qk_heads: 2,
+            num_v_heads: 4,
+            qk_head_dim,
+            v_head_dim,
+            ..fixture_config()
+        });
+    }
+}
+
+fn assert_replay_commits(config: Config) {
     const NUM_LAYERS: usize = 2;
     const NUM_SLOTS: usize = 14;
     const CANARY: f32 = -777.0;
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = Config {
-        num_qk_heads: 2,
-        num_v_heads: 4,
-        qk_head_dim: 64,
-        v_head_dim: 8,
-        ..fixture_config()
-    };
     let shape = fixture_shape(3, 12);
     let commit_config = state_replay::Config {
         num_gdn_layers: NUM_LAYERS as u32,
@@ -179,6 +184,17 @@ fn test_replay_commits_selected_prefixes_across_layers() {
         );
         for slot in 0..NUM_SLOTS {
             if [4, 7].contains(&slot) {
+                let offset = (layer * NUM_SLOTS + slot) * recurrent_stride;
+                assert_close(
+                    &read_bf16(&recurrent, offset, recurrent_stride),
+                    &read_bf16(&reference_recurrent, offset, recurrent_stride),
+                    0.001,
+                );
+                let offset = (layer * NUM_SLOTS + slot) * conv_stride;
+                assert_eq!(
+                    read_bf16(&conv, offset, conv_stride),
+                    read_bf16(&reference_conv, offset, conv_stride)
+                );
                 continue;
             }
             let offset = (layer * NUM_SLOTS + slot) * recurrent_stride;

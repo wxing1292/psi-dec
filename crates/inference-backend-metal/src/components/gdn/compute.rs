@@ -32,6 +32,9 @@ pub fn uses_chunkwise(num_tokens: usize, num_spec_tokens: usize) -> bool {
 }
 
 const SHORT_CONV_REQUIRED_THREADS: u32 = 256;
+const CHUNKWISE_TOKEN_CHUNK_SIZE: u32 = 16;
+const CHUNKWISE_NUM_V_ROWS_PER_SIMDGROUP: u32 = 8;
+const CHUNKWISE_NUM_QK_DIM_THREADS: u32 = 32;
 const FINAL_RECURRENT_STATE_NUM_QK_DIM_THREADS: u32 = 32;
 const CANDIDATE_RECURRENT_STATE_NUM_QK_DIM_THREADS: u32 = 32;
 const CANDIDATE_RECURRENT_STATE_NUM_V_ROWS_PER_SIMDGROUP: u32 = 2;
@@ -58,7 +61,25 @@ struct FinalRecurrentStateThreadBlockConstants {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChunkwiseStateThreadBlockConstants {
     num_v_rows: u32,
-    num_simdgroups: u32,
+    num_state_qk_columns: u32,
+}
+
+impl ChunkwiseStateThreadBlockConstants {
+    fn num_simdgroups(self) -> u32 {
+        self.num_v_rows.div_ceil(CHUNKWISE_NUM_V_ROWS_PER_SIMDGROUP)
+    }
+
+    fn threadblock_memory_bytes(self, qk_head_dim: u32) -> u64 {
+        // Match the static arrays in gdn_compute_chunkwise.metal. Four-row
+        // tiles still reserve eight V rows for their single SIMDgroup.
+        let num_tokens = CHUNKWISE_TOKEN_CHUNK_SIZE as u64;
+        let num_v_rows = self.num_simdgroups() as u64 * CHUNKWISE_NUM_V_ROWS_PER_SIMDGROUP as u64;
+        let qk_head_dim = qk_head_dim as u64;
+        let num_bf16_values =
+            2 * num_tokens * qk_head_dim + num_tokens * num_v_rows + num_v_rows * qk_head_dim + num_tokens * num_tokens;
+        let num_f32_values = 2 * num_tokens * num_tokens + 3 * num_tokens;
+        num_bf16_values * 2 + num_f32_values * 4
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,9 +120,9 @@ struct KernelSetConstants {
     output_norm_gate: KernelConstants<ThreadBlockConstants>,
 }
 
-/// Compile-time model and kernel geometry for one mixed execution variant.
+/// Compile-time model and kernel geometry for the mixed compute graph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct VariantConstants {
+struct ComputeConstants {
     model: ModelGeometry,
     kernels: KernelSetConstants,
 }
@@ -123,7 +144,7 @@ struct VariantConstants {
 ///
 /// `conv_qkv` is the post-SiLU recurrent-core input, not the raw convolution
 /// accumulation. `next_conv_state` contains the final `Ks = Kc - 1` inputs for
-/// the next invocation. Model geometry determines `VariantConstants` during
+/// the next invocation. Model geometry determines `ComputeConstants` during
 /// initialization. `q_scale` and `norm_eps` remain kernel arguments.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -206,8 +227,8 @@ impl Config {
     }
 }
 
-impl VariantConstants {
-    fn from_config(config: Config) -> Self {
+impl ComputeConstants {
+    fn from_config(config: Config, max_threadblock_memory_bytes: usize) -> Self {
         config.validate();
         let final_recurrent_state_num_v_rows = [8, 4]
             .into_iter()
@@ -224,10 +245,24 @@ impl VariantConstants {
             },
             required_threads: CANDIDATE_RECURRENT_STATE_NUM_QK_DIM_THREADS * CANDIDATE_RECURRENT_STATE_NUM_SIMDGROUPS,
         };
-        let chunkwise_num_v_rows = [128, 64, 32, 16, 8, 4]
+        // Keep each cooperative state update within 128 Q/K columns.
+        let num_state_qk_columns = [128, 96, 64, 32]
             .into_iter()
-            .find(|num_v_rows| config.v_head_dim.is_multiple_of(*num_v_rows))
-            .expect("GDN chunkwise V-row tile must divide Dv");
+            .find(|num_columns| config.qk_head_dim.is_multiple_of(*num_columns))
+            .unwrap();
+        let chunkwise_state_thread_block = [64, 32, 16, 8, 4]
+            .into_iter()
+            .map(|num_v_rows| {
+                ChunkwiseStateThreadBlockConstants {
+                    num_v_rows,
+                    num_state_qk_columns,
+                }
+            })
+            .find(|thread_block| {
+                config.v_head_dim.is_multiple_of(thread_block.num_v_rows)
+                    && thread_block.threadblock_memory_bytes(config.qk_head_dim) <= max_threadblock_memory_bytes as u64
+            })
+            .expect("GDN chunkwise V-row tile must divide Dv and fit device shared memory");
         let constants = Self {
             model: config.model_geometry(),
             kernels: KernelSetConstants {
@@ -249,10 +284,7 @@ impl VariantConstants {
                     },
                 },
                 chunkwise_state: KernelConstants {
-                    thread_block: ChunkwiseStateThreadBlockConstants {
-                        num_v_rows: chunkwise_num_v_rows,
-                        num_simdgroups: chunkwise_num_v_rows.div_ceil(8),
-                    },
+                    thread_block: chunkwise_state_thread_block,
                 },
                 candidate_recurrent_state: KernelConstants {
                     thread_block: candidate_recurrent_state_thread_block,
@@ -279,7 +311,6 @@ impl VariantConstants {
         assert_eq!(self.model.v_head_dim % final_recurrent_state.num_v_rows, 0);
         let chunkwise_state = self.kernels.chunkwise_state.thread_block;
         assert_eq!(self.model.v_head_dim % chunkwise_state.num_v_rows, 0);
-        assert_eq!(chunkwise_state.num_simdgroups, chunkwise_state.num_v_rows.div_ceil(8));
         let candidate_recurrent_state = self.kernels.candidate_recurrent_state.thread_block;
         assert_eq!(
             candidate_recurrent_state.required_threads,
@@ -370,7 +401,7 @@ impl ModelGeometry {
     }
 }
 
-impl VariantConstants {
+impl ComputeConstants {
     fn total_output_norm_gate_threads(self, shape: Shape) -> usize {
         checked_product(
             "GDN output norm + gate thread count",
@@ -413,8 +444,8 @@ impl Shape {
     }
 }
 
-fn source(variant_constants: VariantConstants) -> String {
-    let model = variant_constants.model;
+fn source(constants: ComputeConstants) -> String {
+    let model = constants.model;
     let source_constants = format!(
         "using namespace metal;\n\nconstant uint num_qk_heads = {num_qk_heads}u;\nconstant uint qk_head_dim = \
          {qk_head_dim}u;\nconstant uint num_v_heads = {num_v_heads}u;\nconstant uint v_head_dim = \
@@ -428,14 +459,13 @@ fn source(variant_constants: VariantConstants) -> String {
         conv_kernel_size = model.conv_kernel_size,
         qkv_dim = model.qkv_dim(),
         conv_state_len = model.conv_state_len(),
-        output_norm_gate_required_threads = variant_constants.kernels.output_norm_gate.thread_block.required_threads,
+        output_norm_gate_required_threads = constants.kernels.output_norm_gate.thread_block.required_threads,
     );
     let common_source = GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &source_constants, 1);
     format!(
-        "{common_source}\n{}\n{}\n{}",
-        recurrent::source(variant_constants),
-        chunkwise::source(variant_constants),
-        replay::source(variant_constants),
+        "{common_source}\n{}\n{}",
+        recurrent::source(constants),
+        replay::source(constants),
     )
 }
 
@@ -471,13 +501,8 @@ pub struct Buffers<'a> {
     pub norm_gated_output: &'a Buffer,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VariantKey {
-    Mixed,
-}
-
-struct Variant {
-    constants: VariantConstants,
+pub struct Compute {
+    constants: ComputeConstants,
     q_scale: f32,
     norm_eps: f32,
     short_conv: CompiledKernel,
@@ -490,15 +515,22 @@ struct Variant {
     output_norm_gate: CompiledKernel,
 }
 
-struct Registry {
-    entries: Vec<(VariantKey, Variant)>,
-}
-
-impl Registry {
-    fn new(device: &Device, config: Config) -> Self {
-        let constants = VariantConstants::from_config(config);
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
+        let constants = ComputeConstants::from_config(config, device.max_threadblock_memory_length());
         let source = source(constants);
-        let mixed = Variant {
+        let chunkwise_state = CompiledKernel::new_tensor_ops(
+            device,
+            &format!("{source}\n{}", chunkwise::source(constants)),
+            "gdn_compute_chunkwise_state_bf16",
+        );
+        assert!(chunkwise_state.static_threadblock_memory_length() <= device.max_threadblock_memory_length());
+        assert!(
+            (constants.kernels.chunkwise_state.thread_block.num_simdgroups() * CHUNKWISE_NUM_QK_DIM_THREADS) as usize
+                <= chunkwise_state.max_total_threads_per_threadblock(),
+            "GDN chunkwise threadblock exceeds the pipeline thread limit"
+        );
+        Self {
             constants,
             q_scale: config.q_scale,
             norm_eps: config.norm_eps,
@@ -507,41 +539,13 @@ impl Registry {
             replay: CompiledKernel::new(device, &source, "gdn_compute_replay_bf16"),
             candidate_conv_state: CompiledKernel::new(device, &source, "gdn_compute_candidate_conv_state_bf16"),
             final_recurrent_state: CompiledKernel::new(device, &source, "gdn_compute_final_recurrent_state_bf16"),
-            chunkwise_state: CompiledKernel::new(device, &source, "gdn_compute_chunkwise_state_bf16"),
+            chunkwise_state,
             candidate_recurrent_state: CompiledKernel::new(
                 device,
                 &source,
                 "gdn_compute_candidate_recurrent_state_bf16",
             ),
             output_norm_gate: CompiledKernel::new(device, &source, "gdn_compute_output_norm_gate_bf16"),
-        };
-        Self {
-            entries: vec![(VariantKey::Mixed, mixed)],
-        }
-    }
-}
-
-struct Selector;
-
-impl Selector {
-    fn select(registry: &Registry, shape: Shape) -> (VariantKey, &Variant) {
-        shape.validate();
-        let (key, variant) = registry
-            .entries
-            .first()
-            .expect("GDN compute registry requires an execution variant");
-        (*key, variant)
-    }
-}
-
-pub struct Compute {
-    registry: Registry,
-}
-
-impl Compute {
-    pub fn new(device: &Device, config: Config) -> Self {
-        Self {
-            registry: Registry::new(device, config),
         }
     }
 
@@ -552,9 +556,8 @@ impl Compute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> Invocation<'a> {
-        let (_, variant) = self.select(shape);
         Invocation {
-            variant,
+            compute: self,
             shape,
             buffers,
             num_active_reqs,
@@ -569,9 +572,8 @@ impl Compute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> CandidateStateUpdateInvocation<'a> {
-        let (_, variant) = self.select(shape);
         CandidateStateUpdateInvocation {
-            variant,
+            compute: self,
             shape,
             buffers,
             num_active_reqs,
@@ -595,9 +597,8 @@ impl Compute {
         num_active_chunkwise_requests: ReplayU32,
         write_candidate_states: bool,
     ) -> MixedInvocation<'a> {
-        let (_, variant) = self.select(shape);
         MixedInvocation {
-            variant,
+            compute: self,
             shape,
             buffers,
             num_active_reqs,
@@ -607,12 +608,6 @@ impl Compute {
         }
     }
 
-    fn select(&self, shape: Shape) -> (VariantKey, &Variant) {
-        Selector::select(&self.registry, shape)
-    }
-}
-
-impl Variant {
     fn record_short_conv(
         &self,
         recorder: &CommandRecorder,
@@ -744,7 +739,7 @@ impl Variant {
 }
 
 pub struct Invocation<'a> {
-    variant: &'a Variant,
+    compute: &'a Compute,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_reqs: ReplayU32,
@@ -753,10 +748,10 @@ pub struct Invocation<'a> {
 
 impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let variant = self.variant;
-        variant.constants.validate_shape(self.shape);
-        validate_buffers(variant.constants, self.shape, &self.buffers);
-        variant.record_short_conv(
+        let compute = self.compute;
+        compute.constants.validate_shape(self.shape);
+        validate_buffers(compute.constants, self.shape, &self.buffers);
+        compute.record_short_conv(
             recorder,
             self.shape,
             &self.buffers,
@@ -764,19 +759,20 @@ impl Operator for Invocation<'_> {
             self.num_active_tokens,
             true,
         );
-        variant.record_final_recurrent_state(
+        recurrent::record_final_recurrent_state(
+            compute,
             recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
             ReplayU32::Fixed(0),
         );
-        variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
+        compute.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
 pub struct CandidateStateUpdateInvocation<'a> {
-    variant: &'a Variant,
+    compute: &'a Compute,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_reqs: ReplayU32,
@@ -785,14 +781,14 @@ pub struct CandidateStateUpdateInvocation<'a> {
 
 impl Operator for CandidateStateUpdateInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let variant = self.variant;
-        variant.constants.validate_shape(self.shape);
+        let compute = self.compute;
+        compute.constants.validate_shape(self.shape);
         assert_u32_count_domain(
-            variant.constants.model.num_candidate_conv_state_values(self.shape),
+            compute.constants.model.num_candidate_conv_state_values(self.shape),
             "GDN candidate convolution state",
         );
-        validate_buffers(variant.constants, self.shape, &self.buffers);
-        variant.record_short_conv(
+        validate_buffers(compute.constants, self.shape, &self.buffers);
+        compute.record_short_conv(
             recorder,
             self.shape,
             &self.buffers,
@@ -800,26 +796,27 @@ impl Operator for CandidateStateUpdateInvocation<'_> {
             self.num_active_tokens,
             false,
         );
-        variant.record_candidate_conv_state(
+        compute.record_candidate_conv_state(
             recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
             self.num_active_tokens,
         );
-        variant.record_candidate_recurrent_state(
+        recurrent::record_candidate_recurrent_state(
+            compute,
             recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
             ReplayU32::Fixed(0),
         );
-        variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
+        compute.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
 pub struct MixedInvocation<'a> {
-    variant: &'a Variant,
+    compute: &'a Compute,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_reqs: ReplayU32,
@@ -830,15 +827,15 @@ pub struct MixedInvocation<'a> {
 
 impl Operator for MixedInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let variant = self.variant;
-        variant.constants.validate_shape(self.shape);
-        validate_buffers(variant.constants, self.shape, &self.buffers);
+        let compute = self.compute;
+        compute.constants.validate_shape(self.shape);
+        validate_buffers(compute.constants, self.shape, &self.buffers);
         if let (ReplayU32::Fixed(num_active_reqs), ReplayU32::Fixed(num_active_chunkwise_requests)) =
             (self.num_active_reqs, self.num_active_chunkwise_requests)
         {
             assert!(num_active_chunkwise_requests <= num_active_reqs);
         }
-        variant.record_short_conv(
+        compute.record_short_conv(
             recorder,
             self.shape,
             &self.buffers,
@@ -848,10 +845,10 @@ impl Operator for MixedInvocation<'_> {
         );
         if self.write_candidate_states {
             assert_u32_count_domain(
-                variant.constants.model.num_candidate_conv_state_values(self.shape),
+                compute.constants.model.num_candidate_conv_state_values(self.shape),
                 "GDN candidate convolution state",
             );
-            variant.record_candidate_conv_state(
+            compute.record_candidate_conv_state(
                 recorder,
                 self.shape,
                 &self.buffers,
@@ -864,7 +861,8 @@ impl Operator for MixedInvocation<'_> {
         recorder.record_disjoint_buffers(
             &[self.buffers.recurrent_output, self.buffers.recurrent_state_arena],
             || {
-                variant.record_chunkwise_state(
+                chunkwise::record_chunkwise_state(
+                    compute,
                     recorder,
                     self.shape,
                     &self.buffers,
@@ -872,7 +870,8 @@ impl Operator for MixedInvocation<'_> {
                     self.write_candidate_states,
                 );
                 if self.write_candidate_states {
-                    variant.record_candidate_recurrent_state(
+                    recurrent::record_candidate_recurrent_state(
+                        compute,
                         recorder,
                         self.shape,
                         &self.buffers,
@@ -880,7 +879,8 @@ impl Operator for MixedInvocation<'_> {
                         self.num_active_chunkwise_requests,
                     );
                 } else {
-                    variant.record_final_recurrent_state(
+                    recurrent::record_final_recurrent_state(
+                        compute,
                         recorder,
                         self.shape,
                         &self.buffers,
@@ -890,7 +890,7 @@ impl Operator for MixedInvocation<'_> {
                 }
             },
         );
-        variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
+        compute.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
@@ -941,7 +941,7 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
     }
 }
 
-fn validate_buffers(constants: VariantConstants, shape: Shape, buffers: &Buffers<'_>) {
+fn validate_buffers(constants: ComputeConstants, shape: Shape, buffers: &Buffers<'_>) {
     let model = constants.model;
     let bf16_bytes = size_of::<u16>() as u64;
     for (name, offset_bytes) in [

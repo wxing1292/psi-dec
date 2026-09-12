@@ -1,14 +1,10 @@
-inline ushort2 gdn_fragment_coordinate(ushort lane_id) {
-    const ushort quad_id = lane_id / 4;
-    const ushort row = (quad_id & 4) + (lane_id / 2) % 4;
-    const ushort col = (quad_id & 2) * 2 + (lane_id % 2) * 2;
-    return ushort2(col, row);
-}
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
 
-// One threadblock retains a state tile in F32 SIMDgroup fragments and
-// advances sequential chunks of at most eight tokens with the gated WY form.
-// All intermediates remain in registers or threadgroup memory. The request
-// prefix is selected at submission time; an empty prefix exits before access.
+// Sixteen-token gated WY chunks. BF16 matrix operands with F32 accumulation.
+// Live state, normalization, gates, and the triangular inverse remain F32.
+// Each SIMDgroup owns eight V rows in persistent cooperative state tiles.
 kernel void gdn_compute_chunkwise_state_bf16(
     device bfloat16_t* recurrent_output [[buffer(0)]],
     device bfloat16_t* recurrent_state_arena [[buffer(1)]],
@@ -30,7 +26,10 @@ kernel void gdn_compute_chunkwise_state_bf16(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint matrix_size = 8;
-    const uint num_qk_fragments = qk_head_dim / matrix_size;
+    // Keep each state-update destination within 128 Q/K columns. Wider heads
+    // retain multiple F32 cooperative tensors and use the same TensorOps path.
+    constexpr uint state_qk_tile_size = chunkwise_state_qk_tile_size;
+    constexpr uint num_state_tiles = qk_head_dim / state_qk_tile_size;
     const uint num_simdgroups = chunkwise_state_num_simdgroups;
     const uint num_threads = chunkwise_state_num_qk_dim_threads * num_simdgroups;
     const uint v_tile_storage_rows = num_simdgroups * matrix_size;
@@ -53,38 +52,66 @@ kernel void gdn_compute_chunkwise_state_bf16(
     const uint src_state_slot = src_recurrent_state_slots[req_index];
     const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(bfloat16_t);
     const uint v_dim_base = v_row_range_index * chunkwise_state_num_v_rows;
-    const uint simdgroup_v_dim_base = v_dim_base + simdgroup_index * matrix_size;
-    const ulong source_state_base = recurrent_state_base
-        + (ulong)src_state_slot * recurrent_state_stride
-        + ((ulong)v_head_index * v_head_dim + simdgroup_v_dim_base) * qk_head_dim;
 
-    threadgroup float normalized_k[chunkwise_token_chunk_size * qk_head_dim];
-    threadgroup float transformed_vectors[chunkwise_token_chunk_size * qk_head_dim];
+    threadgroup bfloat normalized_k[chunkwise_token_chunk_size * qk_head_dim];
+    threadgroup bfloat transformed_vectors[chunkwise_token_chunk_size * qk_head_dim];
     threadgroup float transform[chunkwise_token_chunk_size * chunkwise_token_chunk_size];
-    threadgroup float weighted_transform[chunkwise_token_chunk_size * chunkwise_token_chunk_size];
-    threadgroup float shared_v[chunkwise_token_chunk_size * chunkwise_state_num_simdgroups * matrix_size];
+    threadgroup float inverse_diagonal[chunkwise_token_chunk_size * chunkwise_token_chunk_size];
+    threadgroup bfloat shared_v[chunkwise_token_chunk_size * chunkwise_state_num_simdgroups * matrix_size];
+    threadgroup bfloat state_operands[chunkwise_state_num_simdgroups * matrix_size * qk_head_dim];
+    threadgroup bfloat weighted_transform[chunkwise_token_chunk_size * chunkwise_token_chunk_size];
     threadgroup float q_inv_norm[chunkwise_token_chunk_size];
     threadgroup float cumulative_log_decay[chunkwise_token_chunk_size];
     threadgroup float beta[chunkwise_token_chunk_size];
 
-    const ushort2 fragment_coordinate = gdn_fragment_coordinate(ushort(lane));
-    thread simdgroup_matrix<float, 8, 8> state_fragments[num_qk_fragments];
-    for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments; ++qk_fragment_index) {
-        float2 state_elements = float2(0.0f);
-        if (simdgroup_v_dim_base + fragment_coordinate.y < v_dim_base + chunkwise_state_num_v_rows) {
-            const ulong state_row_base = source_state_base + (ulong)fragment_coordinate.y * qk_head_dim;
-            state_elements[0] = float(recurrent_state_arena[
-                state_row_base + qk_fragment_index * matrix_size + fragment_coordinate.x]);
-            state_elements[1] = float(recurrent_state_arena[
-                state_row_base + qk_fragment_index * matrix_size + fragment_coordinate.x + 1]);
+    static_assert(chunkwise_token_chunk_size == 16);
+    static_assert(chunkwise_state_num_v_rows <= 64);
+    tensor<threadgroup bfloat, extents<int, qk_head_dim, 16>, tensor_inline> k_tile(
+        normalized_k, extents<int, qk_head_dim, 16>{});
+    tensor<threadgroup bfloat, extents<int, qk_head_dim, 16>, tensor_inline> vectors(
+        transformed_vectors, extents<int, qk_head_dim, 16>{});
+    tensor<threadgroup float, extents<int, 16, 16>, tensor_inline> transform_tile(
+        transform, extents<int, 16, 16>{});
+    tensor<threadgroup float, extents<int, 16, 16>, tensor_inline> inverse_diagonal_tile(
+        inverse_diagonal, extents<int, 16, 16>{});
+    tensor<threadgroup bfloat, extents<int, 8, 16>, tensor_inline> v_tile(
+        shared_v + simdgroup_index * 8, extents<int, 8, 16>{}, array<int, 2>{1, int(v_tile_storage_rows)});
+
+    tensor<threadgroup bfloat, extents<int, 16, 16>, tensor_inline> weighted_tile(
+        weighted_transform, extents<int, 16, 16>{});
+
+    constexpr auto gram_descriptor = matmul2d_descriptor(16, 16, qk_head_dim, false, true, false);
+    constexpr auto vectors_descriptor = matmul2d_descriptor(16, 16, 16, false, false, false);
+    constexpr auto state_vectors_descriptor = matmul2d_descriptor(8, 16, qk_head_dim, false, true, false);
+    constexpr auto values_descriptor = matmul2d_descriptor(8, 16, 16, true, true, false);
+    constexpr auto output_descriptor = matmul2d_descriptor(8, 16, 16, true, true, false);
+    constexpr auto update_descriptor = matmul2d_descriptor(
+        8, state_qk_tile_size, 16, true, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<gram_descriptor, execution_simdgroup> gram_op;
+    matmul2d<vectors_descriptor, execution_simdgroup> vectors_op;
+    matmul2d<state_vectors_descriptor, execution_simdgroup> state_vectors_op;
+    matmul2d<values_descriptor, execution_simdgroup> values_op;
+    matmul2d<output_descriptor, execution_simdgroup> output_op;
+    matmul2d<update_descriptor, execution_simdgroup> update_op;
+    using State = decltype(update_op.get_destination_cooperative_tensor<decltype(v_tile), decltype(k_tile), float>());
+    GDN_DECLARE_STATE_TILES
+    #pragma unroll
+    for (uint state_tile_index = 0; state_tile_index < num_state_tiles; ++state_tile_index) {
+        thread auto& state = *states[state_tile_index];
+        for (auto it = state.begin(); it != state.end(); ++it) {
+            const auto coordinate = it.get_multidimensional_index();
+            const uint row = simdgroup_index * matrix_size + uint(coordinate[1]);
+            const uint col = state_tile_index * state_qk_tile_size + uint(coordinate[0]);
+            const ulong address = recurrent_state_base + (ulong)src_state_slot * recurrent_state_stride
+                + ((ulong)v_head_index * v_head_dim + v_dim_base + row) * qk_head_dim + col;
+            *it = row < chunkwise_state_num_v_rows ? float(recurrent_state_arena[address]) : 0.0f;
         }
-        reinterpret_cast<thread float2&>(state_fragments[qk_fragment_index].thread_elements()) = state_elements;
     }
 
     for (uint chunk_start = flat_token_begin; chunk_start < flat_token_end;) {
         uint num_chunk_tokens = min(chunkwise_token_chunk_size, flat_token_end - chunk_start);
         // A materialized row ends the chunk. The next chunk retains the F32
-        // register state and does not reload the rounded BF16 checkpoint.
+        // cooperative state and does not reload the rounded BF16 checkpoint.
         if (write_candidate_states != 0) {
             for (uint token_index = 0; token_index < num_chunk_tokens; ++token_index) {
                 if (flat_recurrent_state_write_slots[chunk_start + token_index] != GDN_INVALID_STATE_SLOT_ID) {
@@ -99,7 +126,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
              value_index += num_threads) {
             const uint token_index_in_chunk = value_index / qk_head_dim;
             if (token_index_in_chunk >= num_chunk_tokens) {
-                normalized_k[value_index] = 0.0f;
+                normalized_k[value_index] = bfloat(0.0f);
             }
         }
         for (uint value_index = thread_index;
@@ -107,12 +134,12 @@ kernel void gdn_compute_chunkwise_state_bf16(
              value_index += num_threads) {
             const uint token_index_in_chunk = value_index / v_tile_storage_rows;
             const uint v_row_index = value_index - token_index_in_chunk * v_tile_storage_rows;
-            shared_v[value_index] = token_index_in_chunk < num_chunk_tokens
+            shared_v[value_index] = bfloat(token_index_in_chunk < num_chunk_tokens
                     && v_row_index < chunkwise_state_num_v_rows
                 ? float(conv_qkv[
                       (ulong)(chunk_start + token_index_in_chunk) * qkv_dim + v_base
                       + v_head_index * v_head_dim + v_dim_base + v_row_index])
-                : 0.0f;
+                : 0.0f);
         }
         for (uint token_index_in_chunk = simdgroup_index;
              token_index_in_chunk < num_chunk_tokens;
@@ -139,7 +166,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
                 const ulong k_value_index =
                     (ulong)flat_token_index * qkv_dim + k_base + qk_head_index * qk_head_dim + qk_dim_index;
                 normalized_k[token_index_in_chunk * qk_head_dim + qk_dim_index] =
-                    float(conv_qkv[k_value_index]) * k_inverse_norm;
+                    bfloat(float(conv_qkv[k_value_index]) * k_inverse_norm);
             }
             if (lane == 0) {
                 const ulong gate_index = (ulong)flat_token_index * num_v_heads + v_head_index;
@@ -164,25 +191,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simdgroup_index == 0) {
-            simdgroup_matrix<float, 8, 8> kkt;
-            reinterpret_cast<thread float2&>(kkt.thread_elements()) = float2(0.0f);
-            for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments;
-                 ++qk_fragment_index) {
-                simdgroup_matrix<float, 8, 8> k_fragment;
-                simdgroup_matrix<float, 8, 8> transposed_k_fragment;
-                simdgroup_load(
-                    k_fragment,
-                    normalized_k + qk_fragment_index * matrix_size,
-                    qk_head_dim);
-                simdgroup_load(
-                    transposed_k_fragment,
-                    normalized_k + qk_fragment_index * matrix_size,
-                    qk_head_dim,
-                    ulong2(0),
-                    true);
-                simdgroup_multiply_accumulate(kkt, k_fragment, transposed_k_fragment, kkt);
-            }
-            simdgroup_store(kkt, transform, chunkwise_token_chunk_size);
+            gram_op.run(k_tile, k_tile, transform_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -203,16 +212,55 @@ kernel void gdn_compute_chunkwise_state_bf16(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (thread_index == 0) {
-            for (uint row = 1; row < num_chunk_tokens; ++row) {
-                for (uint col = 0; col < row; ++col) {
-                    float value = transform[row * chunkwise_token_chunk_size + col];
-                    for (uint inner = col + 1; inner < row; ++inner) {
-                        value += transform[row * chunkwise_token_chunk_size + inner]
-                            * transform[inner * chunkwise_token_chunk_size + col];
-                    }
-                    transform[row * chunkwise_token_chunk_size + col] = value;
+        // Invert independent 8x8 diagonal blocks with F32 forward substitution.
+        // Merge the off-diagonal block with matrix products.
+        for (uint matrix_index = thread_index;
+             matrix_index < chunkwise_token_chunk_size * chunkwise_token_chunk_size;
+             matrix_index += num_threads) {
+            inverse_diagonal[matrix_index] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint block_index = simdgroup_index; block_index < 2; block_index += num_simdgroups) {
+            const uint block_base = block_index * 8;
+            float column[8];
+            if (lane < 8) {
+                for (uint row = 0; row < 8; ++row) {
+                    column[row] = transform[(block_base + row) * 16 + block_base + lane];
                 }
+                for (uint row = lane + 1; row < 8; ++row) {
+                    float value = column[row];
+                    for (uint inner = lane + 1; inner < row; ++inner) {
+                        value += transform[(block_base + row) * 16 + block_base + inner] * column[inner];
+                    }
+                    column[row] = value;
+                }
+                for (uint row = 0; row < 8; ++row) {
+                    inverse_diagonal[(block_base + row) * 16 + block_base + lane] = column[row];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint matrix_index = thread_index;
+             matrix_index < chunkwise_token_chunk_size * chunkwise_token_chunk_size;
+             matrix_index += num_threads) {
+            if (matrix_index / 16 < 8 || matrix_index % 16 >= 8) {
+                transform[matrix_index] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simdgroup_index == 0) {
+            constexpr auto inverse_descriptor = matmul2d_descriptor(16, 16, 16, false, false, false);
+            matmul2d<inverse_descriptor, execution_simdgroup> inverse_op;
+            auto product = inverse_op.get_destination_cooperative_tensor<decltype(inverse_diagonal_tile), decltype(transform_tile), float>();
+            inverse_op.run(inverse_diagonal_tile, transform_tile, product);
+            auto left = inverse_op.get_left_input_cooperative_tensor<float, float, float>(product);
+            auto merged = inverse_op.get_destination_cooperative_tensor<decltype(left), decltype(inverse_diagonal_tile), float>();
+            inverse_op.run(left, inverse_diagonal_tile, merged);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (auto it = merged.begin(); it != merged.end(); ++it) {
+                const auto coordinate = it.get_multidimensional_index();
+                const uint matrix_index = uint(coordinate[1]) * 16 + uint(coordinate[0]);
+                transform[matrix_index] = inverse_diagonal[matrix_index] + *it;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -222,89 +270,65 @@ kernel void gdn_compute_chunkwise_state_bf16(
              matrix_index += num_threads) {
             const uint row = matrix_index / chunkwise_token_chunk_size;
             const uint col = matrix_index - row * chunkwise_token_chunk_size;
-            weighted_transform[matrix_index] = row < num_chunk_tokens && col <= row
+            weighted_transform[matrix_index] = bfloat(row < num_chunk_tokens && col <= row
                 ? transform[matrix_index] * beta[col]
-                : 0.0f;
+                : 0.0f);
         }
         for (uint value_index = thread_index;
              value_index < chunkwise_token_chunk_size * qk_head_dim;
              value_index += num_threads) {
             const uint row = value_index / qk_head_dim;
-            transformed_vectors[value_index] = row < num_chunk_tokens
-                ? metal::exp(cumulative_log_decay[row]) * normalized_k[value_index]
-                : 0.0f;
+            transformed_vectors[value_index] = bfloat(row < num_chunk_tokens
+                ? metal::exp(cumulative_log_decay[row]) * float(normalized_k[value_index])
+                : 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint col = simdgroup_index * 16; col < qk_head_dim; col += num_simdgroups * 16) {
+            auto vector_columns = vectors.slice<16, 16>(col, 0);
+            auto w = vectors_op.get_destination_cooperative_tensor<decltype(weighted_tile), decltype(vector_columns), float>();
+            vectors_op.run(weighted_tile, vector_columns, w);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (auto it = w.begin(); it != w.end(); ++it) {
+                const auto coordinate = it.get_multidimensional_index();
+                transformed_vectors[uint(coordinate[1]) * qk_head_dim + col + uint(coordinate[0])] = bfloat(*it);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint qk_fragment_index = simdgroup_index;
-             qk_fragment_index < num_qk_fragments;
-             qk_fragment_index += num_simdgroups) {
-            simdgroup_matrix<float, 8, 8> weighted_transform_fragment;
-            simdgroup_matrix<float, 8, 8> decayed_k_fragment;
-            simdgroup_matrix<float, 8, 8> w_fragment;
-            simdgroup_load(
-                weighted_transform_fragment,
-                weighted_transform,
-                chunkwise_token_chunk_size);
-            simdgroup_load(
-                decayed_k_fragment,
-                transformed_vectors + qk_fragment_index * matrix_size,
-                qk_head_dim);
-            reinterpret_cast<thread float2&>(w_fragment.thread_elements()) = float2(0.0f);
-            simdgroup_multiply_accumulate(
-                w_fragment,
-                weighted_transform_fragment,
-                decayed_k_fragment,
-                w_fragment);
-            simdgroup_store(
-                w_fragment,
-                transformed_vectors + qk_fragment_index * matrix_size,
-                qk_head_dim);
+        auto values = values_op.get_destination_cooperative_tensor<decltype(v_tile), decltype(weighted_tile), float>();
+        values_op.run(v_tile, weighted_tile, values);
+        // The V input and transposed U output share storage within this
+        // SIMDgroup's disjoint V-row range. Finish all reads before stores.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (auto it = values.begin(); it != values.end(); ++it) {
+            const auto coordinate = it.get_multidimensional_index();
+            shared_v[uint(coordinate[0]) * v_tile_storage_rows + simdgroup_index * 8 + uint(coordinate[1])] = bfloat(*it);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        simdgroup_matrix<float, 8, 8> state_w;
-        reinterpret_cast<thread float2&>(state_w.thread_elements()) = float2(0.0f);
-        for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments;
-             ++qk_fragment_index) {
-            simdgroup_matrix<float, 8, 8> transposed_w_fragment;
-            simdgroup_load(
-                transposed_w_fragment,
-                transformed_vectors + qk_fragment_index * matrix_size,
-                qk_head_dim,
-                ulong2(0),
-                true);
-            simdgroup_multiply_accumulate(
-                state_w,
-                state_fragments[qk_fragment_index],
-                transposed_w_fragment,
-                state_w);
+        // The live state stays F32. Only its matrix operand is rounded.
+        // Each SIMDgroup owns a disjoint eight-row region of the operand tile.
+        #pragma unroll
+        for (uint state_tile_index = 0; state_tile_index < num_state_tiles; ++state_tile_index) {
+            thread auto& state = *states[state_tile_index];
+            for (auto it = state.begin(); it != state.end(); ++it) {
+                const auto coordinate = it.get_multidimensional_index();
+                const uint row = simdgroup_index * matrix_size + uint(coordinate[1]);
+                const uint col = state_tile_index * state_qk_tile_size + uint(coordinate[0]);
+                state_operands[row * qk_head_dim + col] = bfloat(*it);
+            }
         }
-        simdgroup_matrix<float, 8, 8> transposed_v_fragment;
-        simdgroup_matrix<float, 8, 8> transposed_weighted_transform_fragment;
-        simdgroup_matrix<float, 8, 8> transposed_u;
-        simdgroup_load(
-            transposed_v_fragment,
-            shared_v + simdgroup_index * matrix_size,
-            v_tile_storage_rows,
-            ulong2(0),
-            true);
-        simdgroup_load(
-            transposed_weighted_transform_fragment,
-            weighted_transform,
-            chunkwise_token_chunk_size,
-            ulong2(0),
-            true);
-        reinterpret_cast<thread float2&>(transposed_u.thread_elements()) = float2(0.0f);
-        simdgroup_multiply_accumulate(
-            transposed_u,
-            transposed_v_fragment,
-            transposed_weighted_transform_fragment,
-            transposed_u);
-        simdgroup_matrix<float, 8, 8> delta_fragment;
-        reinterpret_cast<thread float2&>(delta_fragment.thread_elements()) =
-            reinterpret_cast<thread float2&>(transposed_u.thread_elements())
-            - reinterpret_cast<thread float2&>(state_w.thread_elements());
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        tensor<threadgroup bfloat, extents<int, qk_head_dim, 8>, tensor_inline> state_input(
+            state_operands + simdgroup_index * matrix_size * qk_head_dim,
+            extents<int, qk_head_dim, 8>{});
+        auto state_w = state_vectors_op.get_destination_cooperative_tensor<decltype(state_input), decltype(vectors), float>();
+        state_vectors_op.run(state_input, vectors, state_w);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (auto it = state_w.begin(); it != state_w.end(); ++it) {
+            const auto coordinate = it.get_multidimensional_index();
+            const uint token = uint(coordinate[0]);
+            const uint row = simdgroup_index * 8 + uint(coordinate[1]);
+            shared_v[token * v_tile_storage_rows + row] = bfloat(float(shared_v[token * v_tile_storage_rows + row]) - *it);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint value_index = thread_index;
@@ -316,33 +340,15 @@ kernel void gdn_compute_chunkwise_state_bf16(
                 const uint flat_token_index = chunk_start + row;
                 const ulong q_value_index =
                     (ulong)flat_token_index * qkv_dim + q_base + qk_head_index * qk_head_dim + qk_dim_index;
-                transformed_vectors[value_index] = float(conv_qkv[q_value_index]) * q_inv_norm[row];
+                transformed_vectors[value_index] = bfloat(float(conv_qkv[q_value_index]) * q_inv_norm[row]);
             } else {
-                transformed_vectors[value_index] = 0.0f;
+                transformed_vectors[value_index] = bfloat(0.0f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simdgroup_index == 0) {
-            simdgroup_matrix<float, 8, 8> qk;
-            reinterpret_cast<thread float2&>(qk.thread_elements()) = float2(0.0f);
-            for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments;
-                 ++qk_fragment_index) {
-                simdgroup_matrix<float, 8, 8> q_fragment;
-                simdgroup_matrix<float, 8, 8> transposed_k_fragment;
-                simdgroup_load(
-                    q_fragment,
-                    transformed_vectors + qk_fragment_index * matrix_size,
-                    qk_head_dim);
-                simdgroup_load(
-                    transposed_k_fragment,
-                    normalized_k + qk_fragment_index * matrix_size,
-                    qk_head_dim,
-                    ulong2(0),
-                    true);
-                simdgroup_multiply_accumulate(qk, q_fragment, transposed_k_fragment, qk);
-            }
-            simdgroup_store(qk, transform, chunkwise_token_chunk_size);
+            gram_op.run(vectors, k_tile, transform_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -351,109 +357,67 @@ kernel void gdn_compute_chunkwise_state_bf16(
              matrix_index += num_threads) {
             const uint row = matrix_index / chunkwise_token_chunk_size;
             const uint col = matrix_index - row * chunkwise_token_chunk_size;
-            transform[matrix_index] = row < num_chunk_tokens && col <= row
+            weighted_transform[matrix_index] = bfloat(row < num_chunk_tokens && col <= row
                 ? metal::exp(cumulative_log_decay[row] - cumulative_log_decay[col])
                     * transform[matrix_index]
-                : 0.0f;
+                : 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_matrix<float, 8, 8> state_q;
-        reinterpret_cast<thread float2&>(state_q.thread_elements()) = float2(0.0f);
-        for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments;
-             ++qk_fragment_index) {
-            simdgroup_matrix<float, 8, 8> transposed_q_fragment;
-            simdgroup_load(
-                transposed_q_fragment,
-                transformed_vectors + qk_fragment_index * matrix_size,
-                qk_head_dim,
-                ulong2(0),
-                true);
-            simdgroup_multiply_accumulate(
-                state_q,
-                state_fragments[qk_fragment_index],
-                transposed_q_fragment,
-                state_q);
+        // Use one destination layout for both terms. Keep the state projection
+        // in a cooperative tensor until the local output is ready.
+        auto state_q = output_op.get_destination_cooperative_tensor<decltype(v_tile), decltype(weighted_tile), float>();
+        state_vectors_op.run(state_input, vectors, state_q);
+        for (auto it = state_q.begin(); it != state_q.end(); ++it) {
+            const auto coordinate = it.get_multidimensional_index();
+            const uint token = uint(coordinate[0]);
+            *it = token < num_chunk_tokens
+                ? *it * metal::exp(cumulative_log_decay[token]) : 0.0f;
         }
-        thread float2 state_q_elements =
-            reinterpret_cast<thread float2&>(state_q.thread_elements());
-        state_q_elements[0] *= fragment_coordinate.x < num_chunk_tokens
-            ? metal::exp(cumulative_log_decay[fragment_coordinate.x])
-            : 0.0f;
-        state_q_elements[1] *= fragment_coordinate.x + 1 < num_chunk_tokens
-            ? metal::exp(cumulative_log_decay[fragment_coordinate.x + 1])
-            : 0.0f;
-        reinterpret_cast<thread float2&>(state_q.thread_elements()) = state_q_elements;
-
-        simdgroup_matrix<float, 8, 8> transposed_transform_fragment;
-        simdgroup_matrix<float, 8, 8> local_output;
-        simdgroup_load(
-            transposed_transform_fragment,
-            transform,
-            chunkwise_token_chunk_size,
-            ulong2(0),
-            true);
-        reinterpret_cast<thread float2&>(local_output.thread_elements()) = float2(0.0f);
-        simdgroup_multiply_accumulate(
-            local_output,
-            delta_fragment,
-            transposed_transform_fragment,
-            local_output);
-        const float2 output_elements = state_q_elements
-            + reinterpret_cast<thread float2&>(local_output.thread_elements());
-        for (uint element_index = 0; element_index < 2; ++element_index) {
-            const uint token_index_in_chunk = fragment_coordinate.x + element_index;
-            if (token_index_in_chunk < num_chunk_tokens
-                && simdgroup_v_dim_base + fragment_coordinate.y < v_dim_base + chunkwise_state_num_v_rows) {
-                const uint v_dim_index = simdgroup_v_dim_base + fragment_coordinate.y;
-                recurrent_output[
-                    ((ulong)(chunk_start + token_index_in_chunk) * num_v_heads + v_head_index) * v_head_dim
-                    + v_dim_index] = bfloat16_t(output_elements[element_index]);
+        auto local_output = output_op.get_destination_cooperative_tensor<decltype(v_tile), decltype(weighted_tile), float>();
+        output_op.run(v_tile, weighted_tile, local_output);
+        auto state_q_it = state_q.begin();
+        for (auto it = local_output.begin(); it != local_output.end(); ++it, ++state_q_it) {
+            const auto coordinate = it.get_multidimensional_index();
+            const uint token = uint(coordinate[0]);
+            const uint row = simdgroup_index * 8 + uint(coordinate[1]);
+            if (token < num_chunk_tokens && row < chunkwise_state_num_v_rows) {
+                recurrent_output[((ulong)(chunk_start + token) * num_v_heads + v_head_index) * v_head_dim
+                    + v_dim_base + row] = bfloat16_t(*it + *state_q_it);
             }
         }
-
+        // QK readers must finish before K is changed for the state update.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const float final_decay = metal::exp(cumulative_log_decay[num_chunk_tokens - 1]);
-        for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments;
-             ++qk_fragment_index) {
-            simdgroup_matrix<float, 8, 8> weighted_k_fragment;
-            simdgroup_load(
-                weighted_k_fragment,
-                normalized_k + qk_fragment_index * matrix_size,
-                qk_head_dim);
-            thread float2 weighted_k_elements =
-                reinterpret_cast<thread float2&>(weighted_k_fragment.thread_elements());
-            const float k_scale = fragment_coordinate.y < num_chunk_tokens
-                ? metal::exp(
-                      cumulative_log_decay[num_chunk_tokens - 1]
-                      - cumulative_log_decay[fragment_coordinate.y])
-                : 0.0f;
-            weighted_k_elements *= k_scale;
-            reinterpret_cast<thread float2&>(weighted_k_fragment.thread_elements()) = weighted_k_elements;
-            reinterpret_cast<thread float2&>(state_fragments[qk_fragment_index].thread_elements()) *=
-                final_decay;
-            simdgroup_multiply_accumulate(
-                state_fragments[qk_fragment_index],
-                delta_fragment,
-                weighted_k_fragment,
-                state_fragments[qk_fragment_index]);
+        for (uint index = thread_index; index < 16 * qk_head_dim; index += num_threads) {
+            const uint token = index / qk_head_dim;
+            normalized_k[index] = bfloat(float(normalized_k[index]) * (token < num_chunk_tokens
+                ? metal::exp(cumulative_log_decay[num_chunk_tokens - 1] - cumulative_log_decay[token])
+                : 0.0f));
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint state_slot = write_candidate_states != 0 || chunk_start + num_chunk_tokens == flat_token_end
             ? flat_recurrent_state_write_slots[chunk_start + num_chunk_tokens - 1]
             : GDN_INVALID_STATE_SLOT_ID;
-        if (state_slot != GDN_INVALID_STATE_SLOT_ID
-            && simdgroup_v_dim_base + fragment_coordinate.y < v_dim_base + chunkwise_state_num_v_rows) {
-            const ulong state_row_base = recurrent_state_base
-                + (ulong)state_slot * recurrent_state_stride
-                + ((ulong)v_head_index * v_head_dim + simdgroup_v_dim_base + fragment_coordinate.y) * qk_head_dim;
-            for (uint qk_fragment_index = 0; qk_fragment_index < num_qk_fragments; ++qk_fragment_index) {
-                const float2 state_elements = reinterpret_cast<thread float2&>(
-                    state_fragments[qk_fragment_index].thread_elements());
-                recurrent_state_arena[
-                    state_row_base + qk_fragment_index * matrix_size + fragment_coordinate.x] =
-                    bfloat16_t(state_elements[0]);
-                recurrent_state_arena[
-                    state_row_base + qk_fragment_index * matrix_size + fragment_coordinate.x + 1] =
-                    bfloat16_t(state_elements[1]);
+        #pragma unroll
+        for (uint state_tile_index = 0; state_tile_index < num_state_tiles; ++state_tile_index) {
+            thread auto& state = *states[state_tile_index];
+            for (auto it = state.begin(); it != state.end(); ++it) {
+                *it *= final_decay;
+            }
+            auto keys = k_tile.slice<state_qk_tile_size, 16>(state_tile_index * state_qk_tile_size, 0);
+            update_op.run(v_tile, keys, state);
+            if (state_slot != GDN_INVALID_STATE_SLOT_ID) {
+                for (auto it = state.begin(); it != state.end(); ++it) {
+                    const auto coordinate = it.get_multidimensional_index();
+                    const uint row = simdgroup_index * matrix_size + uint(coordinate[1]);
+                    const uint col = state_tile_index * state_qk_tile_size + uint(coordinate[0]);
+                    if (row < chunkwise_state_num_v_rows) {
+                        const ulong address = recurrent_state_base + (ulong)state_slot * recurrent_state_stride
+                            + ((ulong)v_head_index * v_head_dim + v_dim_base + row) * qk_head_dim + col;
+                        recurrent_state_arena[address] = bfloat16_t(*it);
+                    }
+                }
             }
         }
         chunk_start += num_chunk_tokens;

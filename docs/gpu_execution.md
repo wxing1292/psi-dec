@@ -159,8 +159,8 @@ Variant
 ```
 
 Do not create separate selector layers for algorithm choice and shape-specific kernel choice. One registry entry must
-identify the complete selectable combination. For example, a future GDN registry can contain recurrent and chunkwise
-variants. Each entry can identify the constants and kernels for one supported shape family.
+identify the complete selectable combination. GQA SingleQ and TiledQ entries each identify the Map and Reduce kernels
+and their matching constants.
 
 `Variant` can own ready `CompiledKernel` values. It can also contain stable descriptions that another owner uses to
 compile or look up those kernels. The component contract determines this ownership.
@@ -342,7 +342,7 @@ This table identifies the current selection owner. Component documents contain t
 | --- | --- | --- |
 | GQA SDPA | Complete SplitKV Map/Reduce execution variant. | `gqa::sdpa::Selector` returns a rich component-local `Selection`. |
 | BiDiBlockGQA history SDPA | Complete SplitKV Map/Reduce execution variant plus fixed proposal capacity. | `bidi_block_gqa::sdpa::Selector` returns a component-local `Selection` with the variant and `BiDiBlockGQACapacity`. |
-| GDN | Fixed mixed graph with prefill chunkwise and decode recurrent kernels. The request split is a submission parameter. | `gdn::compute::Selector` returns `(VariantKey, &Variant)`. |
+| GDN | Fixed mixed graph with chunkwise and replay kernels. The request split is a submission parameter. | `gdn::compute::Compute` owns kernels and initialization constants directly. |
 | Quantized affine | QMV or QMM kernel for the runtime row count. | `affine_quantized::Selector` returns the selected kernel entry. |
 | BF16 matmul | GEMV or Steel GEMM kernel for the runtime row count. | `matmul_bf16::Selector` returns the selected Variant. |
 | Dense MLP | No independent outer variant. | Each affine owner selects QMV or QMM. |
@@ -363,8 +363,8 @@ Keep these intentional differences:
   owns the outer routing and command-graph choice.
 - Top-K sampling partitions a vocabulary row. Rejection sampling processes one ordered request. They do not share a
   ThreadBlockTask.
-- GQA selection materializes coupled SplitKV work. GDN currently needs only a small Variant selection. Do not add GQA
-  partial-state or SplitKV concepts to GDN.
+- GQA selection materializes coupled SplitKV work. GDN records a fixed graph and selects active work at submission.
+  Do not add GQA partial-state or SplitKV concepts to GDN.
 
 See these component documents:
 

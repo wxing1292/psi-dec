@@ -225,10 +225,10 @@ component path as the design.
 
 ## Model and Backend Investigations
 
-- Validate GQA SingleQ and TiledQ TensorOps on M5 hardware before making acceleration claims.
+- Validate GQA SingleQ and TiledQ and GDN chunkwise TensorOps on M5 hardware before making acceleration claims.
   Local forced-kernel correctness checks run on M3 Max and do not establish M5 throughput or energy efficiency.
-  Measure strict F32 matrix operations, tile sizes, prefill selection thresholds, and full-model prefill/decode.
-  Keep cached-prefix and per-row visibility parity as gates.
+  Compare F32 and BF16 matrix operands, tile sizes, prefill selection thresholds, and full-model prefill/decode.
+  Keep cached-prefix, per-row visibility, snapshot, and commit parity as gates.
   The current GQA TiledQ PV width is 128; a direct 256-column mixed F32/BF16 PV operation produced zero upper columns
   with the local M3 runtime compiler. Re-test wider tiles on the target hardware before changing this width.
 
@@ -237,6 +237,10 @@ component path as the design.
   That generalization lost the short-window prototype's advantage on M3 Max.
   Compare compiler resource allocation and loop-carried cooperative state before changing the default.
   Preserve zero-length copies, partial dimensions, active job counts, and accepted-prefix CPU-reference checks.
+
+- Validate the GDN BF16 operand policy on long real-model trajectories and against the upstream mixed-precision paths.
+  The correlated-key stress case exceeds the experimental output and state error bounds in
+  [`executor_gdn.md`](executor_gdn.md). Keep F32 live state and accumulation while investigating this difference.
 
 - Measure the GDN short-input routing threshold and per-forward replay commit with controlled old/new runs.
   Current commit materializes only the accepted final state and cache boundaries. Keep that capacity bound.

@@ -1,11 +1,11 @@
-use super::Buffers;
-use super::Compute;
-use super::Shape;
-use super::Variant;
-use super::VariantConstants;
-use super::set_chunkwise_count;
-use super::set_replay_u32;
-use super::validate_buffers;
+use crate::components::gdn::compute::Buffers;
+use crate::components::gdn::compute::Compute;
+use crate::components::gdn::compute::ComputeConstants;
+use crate::components::gdn::compute::Shape;
+use crate::components::gdn::compute::chunkwise;
+use crate::components::gdn::compute::set_chunkwise_count;
+use crate::components::gdn::compute::set_replay_u32;
+use crate::components::gdn::compute::validate_buffers;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Operator;
@@ -29,7 +29,7 @@ pub struct ReplayBuffers<'a> {
     pub num_total_tokens: u32,
 }
 
-pub fn source(constants: VariantConstants) -> String {
+pub fn source(constants: ComputeConstants) -> String {
     let thread_block = constants.kernels.candidate_recurrent_state.thread_block;
     format!(
         "constant uint replay_num_qk_dim_threads = {qk_threads}u;\nconstant uint replay_num_v_rows_per_simdgroup = \
@@ -52,9 +52,8 @@ impl Compute {
         num_active_tokens: ReplayU32,
         num_active_chunkwise_requests: ReplayU32,
     ) -> ReplayInvocation<'a> {
-        let (_, variant) = self.select(shape);
         ReplayInvocation {
-            variant,
+            compute: self,
             shape,
             buffers,
             replay,
@@ -66,7 +65,7 @@ impl Compute {
 }
 
 pub struct ReplayInvocation<'a> {
-    variant: &'a Variant,
+    compute: &'a Compute,
     shape: Shape,
     buffers: Buffers<'a>,
     replay: ReplayBuffers<'a>,
@@ -77,11 +76,11 @@ pub struct ReplayInvocation<'a> {
 
 impl Operator for ReplayInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let variant = self.variant;
-        variant.constants.validate_shape(self.shape);
-        validate_buffers(variant.constants, self.shape, &self.buffers);
+        let compute = self.compute;
+        compute.constants.validate_shape(self.shape);
+        validate_buffers(compute.constants, self.shape, &self.buffers);
         assert!(self.replay.num_total_tokens > 0);
-        let model = variant.constants.model;
+        let model = compute.constants.model;
         for (buffer, row_bytes) in [
             (self.replay.alpha, model.num_v_heads as u64 * size_of::<f32>() as u64),
             (
@@ -106,8 +105,8 @@ impl Operator for ReplayInvocation<'_> {
         {
             assert!(num_active_chunkwise_requests <= num_active_reqs);
         }
-        recorder.set_kernel(&variant.short_conv_replay);
-        variant.record_short_conv_bindings(
+        recorder.set_kernel(&compute.short_conv_replay);
+        compute.record_short_conv_bindings(
             recorder,
             self.shape,
             &self.buffers,
@@ -123,8 +122,8 @@ impl Operator for ReplayInvocation<'_> {
             self.num_active_chunkwise_requests,
             self.shape.num_total_reqs,
         );
-        variant.dispatch_short_conv(recorder, self.shape);
-        variant.record_candidate_conv_state(
+        compute.dispatch_short_conv(recorder, self.shape);
+        compute.record_candidate_conv_state(
             recorder,
             self.shape,
             &self.buffers,
@@ -135,7 +134,8 @@ impl Operator for ReplayInvocation<'_> {
         recorder.record_disjoint_buffers(
             &[self.buffers.recurrent_output, self.buffers.recurrent_state_arena],
             || {
-                variant.record_chunkwise_state(
+                chunkwise::record_chunkwise_state(
+                    compute,
                     recorder,
                     self.shape,
                     &self.buffers,
@@ -145,7 +145,7 @@ impl Operator for ReplayInvocation<'_> {
                 self.record_replay(recorder);
             },
         );
-        variant.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
+        compute.record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
@@ -165,7 +165,7 @@ fn validate_log_range(buffer_bytes: u64, row_bytes: u64, token_offset: u64, num_
 
 impl ReplayInvocation<'_> {
     fn record_replay(&self, recorder: &CommandRecorder<'_>) {
-        recorder.set_kernel(&self.variant.replay);
+        recorder.set_kernel(&self.compute.replay);
         recorder.set_buffer_write(0, self.buffers.recurrent_output, 0);
         recorder.set_buffer_read(1, self.buffers.recurrent_state_arena, 0);
         recorder.set_buffer_read(2, self.buffers.conv_qkv, 0);
@@ -176,7 +176,7 @@ impl ReplayInvocation<'_> {
         recorder.set_buffer_read(7, self.buffers.src_recurrent_state_slots, 0);
         recorder.set_buffer_write(8, self.replay.u, 0);
         recorder.set_buffer_read(9, self.buffers.cu_tokens, 0);
-        recorder.set_f32(10, self.variant.q_scale);
+        recorder.set_f32(10, self.compute.q_scale);
         set_replay_u32(
             recorder,
             11,
@@ -194,11 +194,11 @@ impl ReplayInvocation<'_> {
         recorder.set_buffer_write(14, self.replay.k, 0);
         recorder.set_buffer_write(15, self.replay.alpha, 0);
         recorder.set_u64(16, self.replay.token_offset);
-        let thread_block = self.variant.constants.kernels.candidate_recurrent_state.thread_block;
+        let thread_block = self.compute.constants.kernels.candidate_recurrent_state.thread_block;
         recorder.dispatch_threadblocks(
             (
-                (self.variant.constants.model.v_head_dim / thread_block.num_v_rows()) as usize,
-                self.shape.num_total_reqs as usize * self.variant.constants.model.num_v_heads as usize,
+                (self.compute.constants.model.v_head_dim / thread_block.num_v_rows()) as usize,
+                self.shape.num_total_reqs as usize * self.compute.constants.model.num_v_heads as usize,
                 1,
             ),
             (

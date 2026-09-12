@@ -9,13 +9,12 @@ use inference_executor_core::attn::gdn::reference::gdn_short_conv_reference;
 
 use super::Buffers;
 use super::Compute;
+use super::ComputeConstants;
 use super::Config;
 use super::MixedInvocation;
-use super::Registry;
-use super::Selector;
 use super::Shape;
-use super::VariantConstants;
-use super::VariantKey;
+use super::chunkwise;
+use super::recurrent;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -40,28 +39,21 @@ fn test_execution_segments() {
 }
 
 #[test]
-fn test_selector_returns_registered_mixed_variant() {
-    let device = Device::system_default();
-    let registry = Registry::new(&device, fixture_config());
-
-    let (key, variant) = Selector::select(
-        &registry,
-        Shape {
-            num_total_reqs: 2,
-            num_total_tokens: 5,
-        },
-    );
-
-    assert_eq!(key, VariantKey::Mixed);
-    assert_eq!(variant.constants, VariantConstants::from_config(fixture_config()));
-}
-
-#[test]
 #[should_panic(expected = "GDN candidate recurrent-state constants require Dv divisible by the SIMDgroup V-row count")]
 fn test_candidate_register_v_rejects_v_dim_tail() {
     let mut config = fixture_config();
     config.v_head_dim = 5;
     config.validate();
+}
+
+#[test]
+#[should_panic(expected = "GDN chunkwise V-row tile must divide Dv and fit device shared memory")]
+fn test_new_insufficient_shared_memory() {
+    let config = Config {
+        qk_head_dim: 512,
+        ..fixture_config()
+    };
+    ComputeConstants::from_config(config, 32 * 1024);
 }
 
 #[test]
@@ -779,6 +771,35 @@ fn test_mixed_replay_matches_reference_across_prefill_decode_counts() {
     );
 }
 
+#[test]
+fn test_chunkwise_replay_across_head_dimensions() {
+    // Cover padded V rows and multiple V blocks, including wider Q/K heads.
+    for (qk_head_dim, v_head_dim) in [(32, 4), (128, 128), (192, 32), (256, 8), (256, 128)] {
+        assert_mixed_replay(
+            Config {
+                qk_head_dim,
+                v_head_dim,
+                ..fixture_config()
+            },
+            4,
+            48,
+            &[
+                (0, &[1]),
+                (1, &[1]),
+                (1, &[2]),
+                (1, &[8]),
+                (1, &[16]),
+                (1, &[17]),
+                (3, &[19, 17, 8, 4]),
+                (1, &[33, 2, 3]),
+                (2, &[5, 11, 4, 2]),
+                (0, &[1, 4, 2, 3]),
+                (1, &[1]),
+            ],
+        );
+    }
+}
+
 // Record the same kernels with an explicit dependency before decode. This
 // isolates scheduling from the CPU oracle's different floating-point order.
 struct SerialMixedInvocation<'a>(MixedInvocation<'a>);
@@ -786,8 +807,8 @@ struct SerialMixedInvocation<'a>(MixedInvocation<'a>);
 impl Operator for SerialMixedInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let invocation = self.0;
-        let variant = invocation.variant;
-        variant.record_short_conv(
+        let compute = invocation.compute;
+        compute.record_short_conv(
             recorder,
             invocation.shape,
             &invocation.buffers,
@@ -796,7 +817,7 @@ impl Operator for SerialMixedInvocation<'_> {
             !invocation.write_candidate_states,
         );
         if invocation.write_candidate_states {
-            variant.record_candidate_conv_state(
+            compute.record_candidate_conv_state(
                 recorder,
                 invocation.shape,
                 &invocation.buffers,
@@ -804,7 +825,8 @@ impl Operator for SerialMixedInvocation<'_> {
                 invocation.num_active_tokens,
             );
         }
-        variant.record_chunkwise_state(
+        chunkwise::record_chunkwise_state(
+            compute,
             recorder,
             invocation.shape,
             &invocation.buffers,
@@ -812,7 +834,7 @@ impl Operator for SerialMixedInvocation<'_> {
             invocation.write_candidate_states,
         );
         recorder.record_with_barrier_before(SerialDecodeInvocation(&invocation));
-        variant.record_output_norm_gate(
+        compute.record_output_norm_gate(
             recorder,
             invocation.shape,
             &invocation.buffers,
@@ -827,7 +849,8 @@ impl Operator for SerialDecodeInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let invocation = self.0;
         if invocation.write_candidate_states {
-            invocation.variant.record_candidate_recurrent_state(
+            recurrent::record_candidate_recurrent_state(
+                invocation.compute,
                 recorder,
                 invocation.shape,
                 &invocation.buffers,
@@ -835,7 +858,8 @@ impl Operator for SerialDecodeInvocation<'_> {
                 invocation.num_active_chunkwise_requests,
             );
         } else {
-            invocation.variant.record_final_recurrent_state(
+            recurrent::record_final_recurrent_state(
+                invocation.compute,
                 recorder,
                 invocation.shape,
                 &invocation.buffers,
@@ -847,12 +871,15 @@ impl Operator for SerialDecodeInvocation<'_> {
 }
 
 fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens: usize, rounds: &[(u32, &[u32])]) {
+    assert_mixed_replay(fixture_config(), num_total_reqs, num_total_tokens, rounds);
+}
+
+fn assert_mixed_replay(config: Config, num_total_reqs: usize, num_total_tokens: usize, rounds: &[(u32, &[u32])]) {
     let num_state_slots = num_total_reqs + num_total_tokens;
     const CANARY: f32 = -777.0;
 
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = fixture_config();
     let shape = fixture_shape(num_total_reqs as u32, num_total_tokens as u32);
     let kernels = Compute::new(&device, config);
     let qkv_values = bf16_round_trip(&fixture_values(config.num_qkv_values(shape), 0.03125, 3));
@@ -986,7 +1013,12 @@ fn assert_mixed_replay_matches_reference(num_total_reqs: usize, num_total_tokens
                 let begin = bounds[0] as usize;
                 let end = bounds[1] as usize;
                 for prefix_end in begin + 1..=end {
-                    let core = fixture_core(fixture_shape(1, (prefix_end - begin) as u32));
+                    let core = GDNCore {
+                        hidden_dim: config.v_head_dim as usize,
+                        qk_head_dim: config.qk_head_dim as usize,
+                        v_head_dim: config.v_head_dim as usize,
+                        ..fixture_core(fixture_shape(1, (prefix_end - begin) as u32))
+                    };
                     let prefix_cu = [0, (prefix_end - begin) as u32];
                     let conv_reference = gdn_short_conv_reference(
                         &core,

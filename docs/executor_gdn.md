@@ -17,7 +17,7 @@ Historical measurements appear after the current implementation sections.
 | Full and selected snapshot I/O | `crates/inference-executor-metal/src/attn/gdn/state_table/file_io.rs` |
 | Shared model state lifecycle | `crates/inference-executor-metal/src/model/qwen/v3_x/state/gdn.rs` |
 | Per-layer weights and log bindings | `crates/inference-executor-metal/src/model/qwen/v3_x/layer/gdn.rs` |
-| Forward geometry, registry, and buffer contract | `crates/inference-backend-metal/src/components/gdn/compute.rs` |
+| Forward geometry, kernel ownership, and buffer contract | `crates/inference-backend-metal/src/components/gdn/compute.rs` |
 | Chunkwise, reference recurrent, and replay recording | `crates/inference-backend-metal/src/components/gdn/compute/{chunkwise,recurrent,replay}.rs` |
 | All-layer replay commit | `crates/inference-backend-metal/src/components/gdn/state_replay.rs` |
 | State-page kernels | `crates/inference-backend-metal/src/components/gdn/state_pages.rs` |
@@ -25,7 +25,7 @@ Historical measurements appear after the current implementation sections.
 Metal sources live in `crates/inference-backend-metal/src/components/metal/`:
 
 - `gdn_compute.metal`: short convolution, convolution snapshots, and output norm/gate.
-- `gdn_compute_chunkwise.metal`: fused sequential chunkwise state computation.
+- `gdn_compute_chunkwise.metal`: fused sequential TensorOps computation with sixteen-token tiles.
 - `gdn_compute_recurrent.metal`: final/candidate recurrent reference paths.
 - `gdn_compute_replay.metal`: recurrent outputs and the F32 replay log.
 - `gdn_state_replay.metal`: accepted-prefix recurrent and convolution commit.
@@ -79,7 +79,7 @@ The record-time log capacity is independent of the full-forward token capacity.
 Initialization, resource release, and resource reload cover all six state/log buffers together.
 The log lives until this forward's commit finishes. It is not a circular buffer or a cache checkpoint.
 
-## Execution variants, kernel constants, and tasks
+## Execution paths, kernel constants, and tasks
 
 Qwen stably orders complete requests before it packs tokens, sampler configuration, GQA metadata, or GDN metadata:
 
@@ -122,9 +122,45 @@ The recorder declares that disjoint access. Output norm/gate waits for both core
 Short convolution also copies raw QKV for replay requests in the same dispatch.
 Its compile-time `SaveReplay` specialization keeps the old standalone recurrent APIs independent of the log.
 
-Chunkwise uses an eight-token tile. It ends a tile early at a requested cache-boundary snapshot row.
-The kernel retains F32 state across tiles. It writes BF16 only at requested boundaries and at the request end.
-A snapshot does not replace the live F32 registers with rounded BF16 values.
+Chunkwise uses Metal 4 TensorOps on all supported devices, including devices without GPU Neural Accelerators.
+`Compute` directly owns the kernels for the fixed graph. It has no runtime registry or selector.
+`Compute::new` validates model geometry and selects the V-row and Q/K state-update tiles once.
+The shader source renders these constants. Recording validates invocation shapes and buffer ranges.
+Each tile contains sixteen tokens and at most 64 V rows per thread block.
+The selected V-row count must divide `Dv` and fit the device shared-memory budget.
+Wider Q/K heads use smaller V-row tiles with the same TensorOps implementation.
+The kernel keeps F32 state in cooperative tensors. Each state-update tensor contains eight V rows and at most 128 Q/K columns.
+Wider Q/K heads retain multiple state-update tensors per SIMDgroup.
+The backend emits named tensors because MSL does not allow arrays of cooperative tensors.
+State projections consume a BF16 operand copy in
+threadgroup memory. The state update accumulates into the original F32 tensor.
+The compiler controls register allocation.
+The kernel ends a tile early at a requested cache-boundary snapshot row.
+It writes BF16 state only at requested boundaries and at the request end. A snapshot does not round the live F32 state.
+
+The kernel expresses the Gram matrix, WY transforms, state projections, output, and state update as
+`mpp::tensor_ops::matmul2d` operations. Matrix operands use BF16. Accumulation, normalization, gates, and the triangular
+inverse use F32 with `relaxed_precision = false`. Two independent eight-row solves and F32 matrix products form the
+inverse. SIMDgroups distribute the W columns. The output combines F32 state and local projections in cooperative tensors.
+Static threadgroup arrays need `(64 + 2 * R) * Dqk + 32 * R + 2752` bytes before compiler padding.
+Here, `R` is the V-row count rounded up to eight rows for SIMDgroup storage.
+With a 32 KiB budget and `Dv=128`, `Dqk=128` uses 64 V rows and needs 29,376 bytes.
+`Dqk=256` uses 16 V rows and needs 27,840 bytes.
+Initialization rejects a configuration when no tile fits.
+Pipeline construction also checks the reported storage and thread-count limits.
+This kernel uses the existing bindings, dispatch metadata, and parent ICB. It adds no submission or CPU wait.
+Tile selection does not change the mixed graph or the ReplaySSM suffix.
+
+The 128-column state-update tile also avoids an observed M3 Max TensorOps failure.
+A standalone BF16 `8 x 256` multiply-accumulate probe computes incorrect values in columns 128 through 255.
+The tiled implementation passes the CPU-reference checks for `Dqk=256`, including multiple V blocks and requested state snapshots.
+These checks do not establish a performance gain on M5.
+
+BF16 matrix operands change numerical results relative to the F32 SIMDgroup implementation.
+A synthetic 2,048-token test with correlated K, weak decay, and beta near one reports 0.893% output relative L2 error.
+Its maximum output error is 3.315% of the reference peak. This exceeds the experiment's 3% normalized maximum bound.
+The final-state relative L2 error is 1.533%, above the experiment's 1.5% bound.
+This result does not establish model-level quality parity with vLLM or SGLang.
 
 Replay uses sequential register recurrence for all suffix requests, with or without speculative tokens.
 Each SIMDgroup owns two V rows. Two SIMDgroups form one thread block. Dqk is distributed across 32 lanes.
@@ -316,6 +352,9 @@ Focused correctness coverage includes:
 
 - CPU parity for recurrence, convolution, output gating, and both quantized projections.
 - Mixed chunkwise/replay outputs with independent active request, token, and prefix counts.
+- Default kernel selection for padded V rows, multiple V blocks, and wider Q/K heads.
+  Tests use the production recorder and cover sixteen-token chunks, ragged tails, boundary snapshots,
+  serial/concurrent parity, and selected-prefix commits across layers.
 - Per-layer logs with grouped K heads, disjoint state slots, and inactive capacity.
 - Reconstructed states for selected prefixes, including zero and complete acceptance.
 - Chunkwise final/boundary maps and deferred replay allocation.
