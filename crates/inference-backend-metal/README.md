@@ -62,6 +62,17 @@ Weights, workspace, and runtime input use the same Metal allocation types despit
 `MetalRuntime` owns one compute `Stream` and one `BufferIO`.
 See [Execution Resources](#execution-resources) for retention and residency, and [End-To-End Lifecycle](#end-to-end-lifecycle) for resource creation and submission.
 
+### TensorOps kernels
+
+`CompiledKernel::new_tensor_ops` compiles TensorOps source with MSL 4.0. The pipeline cache includes the language version.
+Both compiler paths disable fast math and retain indirect-command-buffer support.
+TensorOps commands use the existing recorder and Stream. They do not use the separate Apple Neural Engine framework.
+
+Apple's [inline ML sample](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4)
+provides tiled matmul building blocks. The [WWDC26 attention session](https://developer.apple.com/videos/play/wwdc2026/330/)
+describes cooperative tensors, row reductions, and attention composition.
+The project supplies its own paged-cache, mixed-request, and GDN state-boundary integration.
+
 ### GPU timestamps
 
 `MetalRuntime` enables relaxed GPU timestamps by default.

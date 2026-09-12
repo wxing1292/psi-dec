@@ -11,6 +11,7 @@ use objc2_metal::MTLCompileOptions;
 use objc2_metal::MTLComputePipelineDescriptor;
 use objc2_metal::MTLComputePipelineState;
 use objc2_metal::MTLDevice;
+use objc2_metal::MTLLanguageVersion;
 use objc2_metal::MTLLibrary;
 use objc2_metal::MTLPipelineOption;
 
@@ -26,6 +27,7 @@ struct KernelCacheKey {
     device: usize,
     source_hash: u64,
     function_name: String,
+    language_version: MTLLanguageVersion,
 }
 
 thread_local! {
@@ -35,17 +37,28 @@ thread_local! {
 
 impl CompiledKernel {
     pub fn new(device: &Device, source: &str, function_name: &str) -> Self {
+        Self::compile(device, source, function_name, MTLCompileOptions::new())
+    }
+
+    pub fn new_tensor_ops(device: &Device, source: &str, function_name: &str) -> Self {
+        let options = MTLCompileOptions::new();
+        options.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        Self::compile(device, source, function_name, options)
+    }
+
+    fn compile(device: &Device, source: &str, function_name: &str, options: Retained<MTLCompileOptions>) -> Self {
         let key = KernelCacheKey {
             device: device.as_raw() as *const _ as *const () as usize,
             source_hash: stable_hash(source),
             function_name: function_name.to_string(),
+            language_version: options.languageVersion(),
         };
         let pipeline = KERNEL_CACHE.with(|cache| {
             if let Some(pipeline) = cache.borrow().get(&key) {
                 return pipeline.clone();
             }
 
-            let library = compile_library(device, source);
+            let library = compile_library(device, source, &options);
             let function = library
                 .newFunctionWithName(&NSString::from_str(function_name))
                 .expect("Metal function lookup failed");
@@ -93,13 +106,16 @@ fn stable_hash(value: &str) -> u64 {
     hasher.finish()
 }
 
-fn compile_library(device: &Device, source: &str) -> Retained<ProtocolObject<dyn MTLLibrary>> {
-    let options = MTLCompileOptions::new();
+fn compile_library(
+    device: &Device,
+    source: &str,
+    options: &MTLCompileOptions,
+) -> Retained<ProtocolObject<dyn MTLLibrary>> {
     // Match MLX JIT compilation so MLX-derived qdot/math kernels keep parity.
     #[allow(deprecated)]
     options.setFastMathEnabled(false);
     device
         .as_raw()
-        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(options))
         .expect("Metal library compile failed")
 }
