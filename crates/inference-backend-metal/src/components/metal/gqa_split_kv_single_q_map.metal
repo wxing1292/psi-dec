@@ -1,254 +1,187 @@
-// HND SplitKV SingleQ SDPA map. One MapThreadBlockTask maps 1:1 to one
-// threadblock. Its fields are sourced as follows:
-//
-// Map task template {     // materialized; three u32 fields
-//   q_token_range_index,  // sdpa_map_task_templates[map_task_template_index, 0]
-//   kv_token_begin,       // sdpa_map_task_templates[map_task_template_index, 1]
-//   kv_token_end,         // sdpa_map_task_templates[map_task_template_index, 2]
-// }
-// MapThreadBlockTask {
-//   q_token_range_index,  // from the Map task template
-//   kv_token_begin,       // from the Map task template
-//   kv_token_end,         // from the Map task template
-//   kv_head_index,        // grid-derived
-//   q_head_range_index,   // grid-derived
-// }
-//
-// The task walks consecutive KV iterations and writes one SDPAPartialOutput
-// per active Q head. A sentinel Map task template returns without writing any
-// partial output or statistics.
-//
-// q              : [num_tokens, num_q_heads, kv_head_dim]
-// kv_pages       : [num_pages, K/V, num_kv_heads, num_tokens, kv_head_dim]
-// req_slots      : [num_tokens]
-// page_ids       : [num_req_slots, num_gqa_layers, num_blocks, num_page_ids_per_block]
-// sdpa_map_task_templates: [num_total_kv_splits, q_token_range_index/kv_token_begin/kv_token_end]
-//
-// partial_exp_sums       : [num_total_kv_splits, num_q_heads]
-// partial_max_logits     : [num_total_kv_splits, num_q_heads]
-// partial_output         : [num_total_kv_splits, num_q_heads, kv_head_dim]
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
 
-uint global_thread_index = thread_position_in_grid.x;
-uint thread_index_in_threadblock = global_thread_index % (uint)REQUIRED_THREADS;
-uint threadblock_linear_index = global_thread_index / (uint)REQUIRED_THREADS;
-
-constexpr uint num_q_heads = uint(NUM_Q_HEADS);
-if (threadblock_linear_index >=
-    (uint)(TOTAL_KV_SPLITS * NUM_KV_HEADS * NUM_Q_HEAD_RANGES_PER_KV_HEAD)) {
-    return;
-}
-
-uint map_task_template_index = threadblock_linear_index % (uint)TOTAL_KV_SPLITS;
-if (map_task_template_index >= num_active_kv_splits) {
-    return;
-}
-uint head_group_index = threadblock_linear_index / (uint)TOTAL_KV_SPLITS;
-uint q_head_range_index = head_group_index % (uint)NUM_Q_HEAD_RANGES_PER_KV_HEAD;
-uint kv_head_index = head_group_index / (uint)NUM_Q_HEAD_RANGES_PER_KV_HEAD;
-uint q_token_range_index = sdpa_map_task_templates[map_task_template_index * 3];
-// Invalid Map task templates are replay padding or slots intentionally
-// populated by another attention task before the shared partial-output reduce.
-if (q_token_range_index >= num_active_tokens) {
-    return;
-}
-
-uint kv_token_begin = sdpa_map_task_templates[map_task_template_index * 3 + 1];
-uint kv_token_end = sdpa_map_task_templates[map_task_template_index * 3 + 2];
-uint q_head_range_begin = q_head_range_index * uint(MAX_Q_HEADS);
-uint num_active_q_heads = metal::min(
-    uint(MAX_Q_HEADS), uint(Q_HEADS_PER_KV_HEAD) - q_head_range_begin);
-uint q_head_base = kv_head_index * uint(Q_HEADS_PER_KV_HEAD) + q_head_range_begin;
-
-threadgroup float logits[MAX_Q_HEADS * KV_TOKENS_PER_ITERATION];
-threadgroup float reduce_scratch[REQUIRED_THREADS];
-
-const ulong q_head_range_offset =
-    ((ulong)q_token_range_index * (ulong)num_q_heads + (ulong)q_head_base) * (ulong)KV_HEAD_DIM;
-const device T* q_head_range_ptr = q + q_head_range_offset;
-uint req_slot = req_slots[q_token_range_index];
-
-float running_max[MAX_Q_HEADS];
-float running_exp_sum[MAX_Q_HEADS];
-for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-    running_max[local_q_head] = -INFINITY;
-    running_exp_sum[local_q_head] = 0.0f;
-}
-
-#define NUM_DIMS_PER_THREAD ((KV_HEAD_DIM + REQUIRED_THREADS - 1) / REQUIRED_THREADS)
-float running_output[MAX_Q_HEADS][NUM_DIMS_PER_THREAD];
-for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-    for (uint dim_slot = 0; dim_slot < uint(NUM_DIMS_PER_THREAD); ++dim_slot) {
-        running_output[local_q_head][dim_slot] = 0.0f;
-    }
-}
-
-for (uint kv_iteration_begin = kv_token_begin; kv_iteration_begin < kv_token_end;
-     kv_iteration_begin += uint(KV_TOKENS_PER_ITERATION)) {
-    uint kv_iteration_end = metal::min(kv_iteration_begin + uint(KV_TOKENS_PER_ITERATION), kv_token_end);
-    uint num_kv_tokens_in_iteration = kv_iteration_end - kv_iteration_begin;
-    float local_max[MAX_Q_HEADS];
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        local_max[local_q_head] = -INFINITY;
-    }
-
-    for (uint kv_token_index = kv_iteration_begin + thread_index_in_threadblock; kv_token_index < kv_iteration_end;
-         kv_token_index += uint(REQUIRED_THREADS)) {
-        uint block_index = kv_token_index / uint(NUM_TOKENS * NUM_PAGE_IDS_PER_BLOCK);
-        uint page_id_index = (kv_token_index / uint(NUM_TOKENS)) % uint(NUM_PAGE_IDS_PER_BLOCK);
-        uint page_token_index = kv_token_index % uint(NUM_TOKENS);
-        ulong page_id_table_index =
-            ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)gqa_layer_index)
-              * (ulong)NUM_BLOCKS
-              + (ulong)block_index)
-             * (ulong)NUM_PAGE_IDS_PER_BLOCK)
-            + (ulong)page_id_index;
-        ulong page_id = (ulong)page_ids[page_id_table_index];
-        uint token_offset = kv_token_index - kv_iteration_begin;
-        const device KV_T* k_ptr =
-            kv_pages + (page_id * ((ulong)PAGE_BYTES / sizeof(KV_T))
-                        + (ulong)(((0 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS
-                                   + page_token_index)
-                                  * KV_HEAD_DIM));
-
-        float scores[MAX_Q_HEADS];
-        for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-            scores[local_q_head] = 0.0f;
+// Each SIMDgroup stages one 16-token x 64-dimension K or V tile. K and V
+// reuse this storage; the final cross-SIMDgroup reduction reuses it as F32.
+inline void load_kv_tile(
+    device const uchar* pages, device const uint* page_ids,
+    uint req_slot, uint layer_index, uint kv_head_index,
+    uint token_begin, uint token_end, uint dim_begin, uint value_plane,
+    threadgroup bfloat16_t* tile, uint lane)
+{
+    for (uint index = lane * 8; index < 16 * 64; index += 32 * 8) {
+        const ulong token = (ulong)token_begin + index / 64;
+        const uint dim = dim_begin + index % 64;
+        if (token < token_end && dim < KV_HEAD_DIM) {
+            const uint block = token / (NUM_TOKENS * NUM_PAGE_IDS_PER_BLOCK);
+            const uint page_index = token / NUM_TOKENS % NUM_PAGE_IDS_PER_BLOCK;
+            const ulong address = ((((ulong)req_slot * NUM_GQA_LAYERS + layer_index) * NUM_BLOCKS + block)
+                                   * NUM_PAGE_IDS_PER_BLOCK) + page_index;
+            const ulong page = page_ids[address];
+            const device uchar* source = pages + page * PAGE_BYTES
+                + ((ulong)(value_plane * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS + token % NUM_TOKENS) * KV_HEAD_DIM + dim;
+            if constexpr (KV_HEAD_DIM % 8 == 0) {
+                *reinterpret_cast<threadgroup uint4*>(tile + index) =
+                    fp8_e4m3x8_to_bf16x8(*reinterpret_cast<device const uint2*>(source));
+            } else {
+                for (uint part = 0; part < 8; ++part) {
+                    tile[index + part] = dim + part < KV_HEAD_DIM
+                        ? as_type<bfloat16_t>(fp8_e4m3_to_bf16_bits(source[part])) : bfloat16_t(0.0f);
+                }
+            }
+        } else {
+            *reinterpret_cast<threadgroup uint4*>(tile + index) = uint4(0);
         }
-        for (uint d = 0; d < uint(KV_HEAD_DIM); ++d) {
-            const float k = fp8_e4m3_to_bf16(k_ptr[d]);
-            for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-                const device T* q_ptr = q_head_range_ptr + local_q_head * KV_HEAD_DIM;
-                scores[local_q_head] += static_cast<float>(q_ptr[d]) * k;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void gqa_split_kv_single_q_map(
+    device const T* q [[buffer(0)]],
+    device const uchar* kv_pages [[buffer(1)]],
+    device const uint* req_slots [[buffer(2)]],
+    device const uint* page_ids [[buffer(3)]],
+    device const uint* sdpa_map_task_templates [[buffer(4)]],
+    device float* partial_exp_sums [[buffer(5)]],
+    device float* partial_max_logits [[buffer(6)]],
+    device T* partial_output [[buffer(7)]],
+    constant uint& gqa_layer_index [[buffer(8)]],
+    constant uint& num_active_tokens [[buffer(9)]],
+    constant uint& num_active_kv_splits [[buffer(10)]],
+    uint3 block [[threadgroup_position_in_grid]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint num_simdgroups = REQUIRED_THREADS / 32;
+    constexpr uint num_output_tiles = (KV_HEAD_DIM + 63) / 64;
+    const uint task = block.x;
+    if (task >= num_active_kv_splits) return;
+    const uint q_token = sdpa_map_task_templates[task * 3];
+    if (q_token >= num_active_tokens) return;
+    const uint head_group = block.y;
+    const uint head_range = head_group % NUM_Q_HEAD_RANGES_PER_KV_HEAD;
+    const uint kv_head = head_group / NUM_Q_HEAD_RANGES_PER_KV_HEAD;
+    const uint head_begin = kv_head * Q_HEADS_PER_KV_HEAD + head_range * MAX_Q_HEADS;
+    const uint num_heads = min(uint(MAX_Q_HEADS), uint(Q_HEADS_PER_KV_HEAD) - head_range * MAX_Q_HEADS);
+    const uint kv_begin = sdpa_map_task_templates[task * 3 + 1];
+    const uint kv_end = sdpa_map_task_templates[task * 3 + 2];
+    const uint req_slot = req_slots[q_token];
+
+    threadgroup float workspace[num_simdgroups * 8 * 64];
+    threadgroup float probabilities[num_simdgroups * 8 * 16];
+    threadgroup float stats[num_simdgroups * 8 * 3];
+    threadgroup float global_stats[8 * 2];
+    threadgroup bfloat16_t* kv = reinterpret_cast<threadgroup bfloat16_t*>(workspace + simdgroup_index * 8 * 64);
+    threadgroup float* row_sum = stats + simdgroup_index * 8 * 3;
+    threadgroup float* row_max = row_sum + 8;
+    threadgroup float* row_scale = row_max + 8;
+    if (lane < 8) { row_sum[lane] = 0.0f; row_max[lane] = -INFINITY; }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    using Query = tensor<device T, extents<int, dynamic_extent, dynamic_extent>, tensor_inline>;
+    using KV = tensor<threadgroup bfloat16_t, extents<int, 64, 16>, tensor_inline>;
+    using Probability = tensor<threadgroup float, extents<int, 16, 8>, tensor_inline>;
+    constexpr auto qk_desc = matmul2d_descriptor(8, 16, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto pv_desc = matmul2d_descriptor(8, 64, 16, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+    KV kv_tile(kv, extents<int, 64, 16>{});
+    Probability p_tile(probabilities + simdgroup_index * 8 * 16, extents<int, 16, 8>{});
+    using Output = decltype(pv_op.get_destination_cooperative_tensor<Probability, KV, float>());
+    GQA_DECLARE_OUTPUT_TILES
+    for (uint tile = 0; tile < num_output_tiles; ++tile) {
+        for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) *it = 0.0f;
+    }
+    auto running_max = qk_op.get_row_reduction_destination_cooperative_tensor<Query, KV, float>();
+    for (uint i = 0; i < running_max.get_capacity(); ++i) running_max[i] = -INFINITY;
+    auto running_sum = running_max;
+    auto running_scale = running_max;
+    for (uint i = 0; i < running_sum.get_capacity(); ++i) running_sum[i] = 0.0f;
+    for (ulong begin = (ulong)kv_begin + simdgroup_index * 16; begin < kv_end; begin += num_simdgroups * 16) {
+        auto scores = qk_op.get_destination_cooperative_tensor<Query, KV, float>();
+        for (auto it = scores.begin(); it != scores.end(); ++it) *it = 0.0f;
+        for (uint tile = 0; tile < num_output_tiles; ++tile) {
+            const uint dim_begin = tile * 64;
+            load_kv_tile(kv_pages, page_ids, req_slot, gqa_layer_index, kv_head, uint(begin), kv_end, dim_begin, 0, kv, lane);
+            Query query(const_cast<device T*>(q + ((ulong)q_token * NUM_Q_HEADS + head_begin) * KV_HEAD_DIM + dim_begin),
+                        extents<int, dynamic_extent, dynamic_extent>(int(min(64u, uint(KV_HEAD_DIM) - dim_begin)), int(num_heads)),
+                        array<int, 2>{1, KV_HEAD_DIM});
+            qk_op.run(query, kv_tile, scores);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (auto it = scores.begin(); it != scores.end(); ++it) {
+            const auto coord = it.get_multidimensional_index();
+            *it = uint(coord[1]) < num_heads && begin + uint(coord[0]) < kv_end ? *it * ATTENTION_SCALE : -INFINITY;
+        }
+        auto iteration_max = running_max;
+        reduce_rows(scores, iteration_max, reduction_operation::max, -INFINITY);
+        for (uint i = 0; i < running_max.get_capacity(); ++i) {
+            const float next = max(running_max[i], iteration_max[i]);
+            running_scale[i] = running_max[i] == -INFINITY ? 0.0f : metal::exp(running_max[i] - next);
+            running_max[i] = next;
+        }
+        for (auto it = scores.begin(); it != scores.end(); ++it)
+            *it = *it == -INFINITY ? 0.0f : metal::exp(*it - *running_max.map_iterator(it));
+        auto iteration_sum = running_sum;
+        reduce_rows(scores, iteration_sum, reduction_operation::sum, 0.0f);
+        for (uint i = 0; i < running_sum.get_capacity(); ++i)
+            running_sum[i] = running_sum[i] * running_scale[i] + iteration_sum[i];
+        for (auto it = scores.begin(); it != scores.end(); ++it) {
+            const auto coord = it.get_multidimensional_index();
+            if (coord[0] == 0) {
+                row_sum[coord[1]] = *running_sum.map_iterator(it);
+                row_max[coord[1]] = *running_max.map_iterator(it);
+                row_scale[coord[1]] = *running_scale.map_iterator(it);
             }
         }
-        for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-            float score = scores[local_q_head] * ATTENTION_SCALE;
-            logits[local_q_head * KV_TOKENS_PER_ITERATION + token_offset] = score;
-            local_max[local_q_head] = metal::max(local_max[local_q_head], score);
+        scores.store(p_tile);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint tile = 0; tile < num_output_tiles; ++tile) {
+            load_kv_tile(kv_pages, page_ids, req_slot, gqa_layer_index, kv_head, uint(begin), kv_end, tile * 64, 1, kv, lane);
+            for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) *it *= row_scale[it.get_multidimensional_index()[1]];
+            pv_op.run(p_tile, kv_tile, *outputs[tile]);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
-    }
-
-    float iteration_max[MAX_Q_HEADS];
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        reduce_scratch[thread_index_in_threadblock] = local_max[local_q_head];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = uint(REQUIRED_THREADS / 2); stride > 0; stride >>= 1) {
-            if (thread_index_in_threadblock < stride) {
-                reduce_scratch[thread_index_in_threadblock] = metal::max(reduce_scratch[thread_index_in_threadblock], reduce_scratch[thread_index_in_threadblock + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        iteration_max[local_q_head] = reduce_scratch[0];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float local_exp_sum[MAX_Q_HEADS];
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        local_exp_sum[local_q_head] = 0.0f;
-    }
-    for (uint token_offset = thread_index_in_threadblock; token_offset < num_kv_tokens_in_iteration;
-         token_offset += uint(REQUIRED_THREADS)) {
-        for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-            uint logits_index = local_q_head * uint(KV_TOKENS_PER_ITERATION) + token_offset;
-            float weight = metal::exp(logits[logits_index] - iteration_max[local_q_head]);
-            logits[logits_index] = weight;
-            local_exp_sum[local_q_head] += weight;
-        }
-    }
-
-    float iteration_exp_sum[MAX_Q_HEADS];
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        reduce_scratch[thread_index_in_threadblock] = local_exp_sum[local_q_head];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = uint(REQUIRED_THREADS / 2); stride > 0; stride >>= 1) {
-            if (thread_index_in_threadblock < stride) {
-                reduce_scratch[thread_index_in_threadblock] += reduce_scratch[thread_index_in_threadblock + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        iteration_exp_sum[local_q_head] = reduce_scratch[0];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float old_scale[MAX_Q_HEADS];
-    float iteration_scale[MAX_Q_HEADS];
-    float next_max[MAX_Q_HEADS];
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        next_max[local_q_head] = metal::max(running_max[local_q_head], iteration_max[local_q_head]);
-        old_scale[local_q_head] = isfinite(running_max[local_q_head])
-            ? metal::exp(running_max[local_q_head] - next_max[local_q_head])
-            : 0.0f;
-        iteration_scale[local_q_head] = metal::exp(iteration_max[local_q_head] - next_max[local_q_head]);
-    }
-
-    for (uint dim_slot = 0; dim_slot < uint(NUM_DIMS_PER_THREAD); ++dim_slot) {
-        uint d = thread_index_in_threadblock + dim_slot * uint(REQUIRED_THREADS);
-        if (d >= uint(KV_HEAD_DIM)) {
-            continue;
-        }
-        float iteration_output[MAX_Q_HEADS];
-        for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-            iteration_output[local_q_head] = 0.0f;
-        }
-        for (uint token_offset = 0; token_offset < num_kv_tokens_in_iteration; ++token_offset) {
-            uint kv_token_index = kv_iteration_begin + token_offset;
-            uint block_index = kv_token_index / uint(NUM_TOKENS * NUM_PAGE_IDS_PER_BLOCK);
-            uint page_id_index = (kv_token_index / uint(NUM_TOKENS)) % uint(NUM_PAGE_IDS_PER_BLOCK);
-            uint page_token_index = kv_token_index % uint(NUM_TOKENS);
-            ulong page_id_table_index =
-                ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)gqa_layer_index)
-                  * (ulong)NUM_BLOCKS
-                  + (ulong)block_index)
-                 * (ulong)NUM_PAGE_IDS_PER_BLOCK)
-                + (ulong)page_id_index;
-            ulong page_id = (ulong)page_ids[page_id_table_index];
-            const device KV_T* v_ptr =
-                kv_pages + (page_id * ((ulong)PAGE_BYTES / sizeof(KV_T))
-                            + (ulong)(((1 * NUM_KV_HEADS + kv_head_index) * NUM_TOKENS
-                                       + page_token_index)
-                                      * KV_HEAD_DIM));
-            float v = fp8_e4m3_to_bf16(v_ptr[d]);
-            for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-                iteration_output[local_q_head] +=
-                    logits[local_q_head * KV_TOKENS_PER_ITERATION + token_offset] * v;
-            }
-        }
-        for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-            running_output[local_q_head][dim_slot] =
-                running_output[local_q_head][dim_slot] * old_scale[local_q_head]
-                + iteration_output[local_q_head] * iteration_scale[local_q_head];
-        }
-    }
-
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        running_exp_sum[local_q_head] =
-            running_exp_sum[local_q_head] * old_scale[local_q_head]
-            + iteration_exp_sum[local_q_head] * iteration_scale[local_q_head];
-        running_max[local_q_head] = next_max[local_q_head];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
-if (thread_index_in_threadblock == 0) {
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        uint q_head_index = q_head_base + local_q_head;
-        ulong partial_output_index = (ulong)map_task_template_index * (ulong)num_q_heads + (ulong)q_head_index;
-        partial_exp_sums[partial_output_index] = running_exp_sum[local_q_head];
-        partial_max_logits[partial_output_index] = running_max[local_q_head];
+    if (simdgroup_index == 0 && lane < num_heads) {
+        float maximum = -INFINITY;
+        for (uint sg = 0; sg < num_simdgroups; ++sg) maximum = max(maximum, stats[sg * 24 + 8 + lane]);
+        float sum = 0.0f;
+        for (uint sg = 0; sg < num_simdgroups; ++sg) {
+            const float local_sum = stats[sg * 24 + lane];
+            if (local_sum > 0.0f) sum += local_sum * metal::exp(stats[sg * 24 + 8 + lane] - maximum);
+        }
+        global_stats[lane] = sum;
+        global_stats[8 + lane] = maximum;
+        const ulong partial = (ulong)task * NUM_Q_HEADS + head_begin + lane;
+        partial_exp_sums[partial] = sum;
+        partial_max_logits[partial] = maximum;
     }
-}
-for (uint dim_slot = 0; dim_slot < uint(NUM_DIMS_PER_THREAD); ++dim_slot) {
-    uint d = thread_index_in_threadblock + dim_slot * uint(REQUIRED_THREADS);
-    if (d >= uint(KV_HEAD_DIM)) {
-        continue;
-    }
-    for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
-        uint q_head_index = q_head_base + local_q_head;
-        ulong partial_output_index = (ulong)map_task_template_index * (ulong)num_q_heads + (ulong)q_head_index;
-        float inv_exp_sum = running_exp_sum[local_q_head] > 0.0f
-            ? 1.0f / running_exp_sum[local_q_head]
-            : 0.0f;
-        partial_output[partial_output_index * KV_HEAD_DIM + d] =
-            static_cast<T>(running_output[local_q_head][dim_slot] * inv_exp_sum);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint tile = 0; tile < num_output_tiles; ++tile) {
+        for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) {
+            const auto coord = it.get_multidimensional_index();
+            workspace[simdgroup_index * 8 * 64 + uint(coord[1]) * 64 + uint(coord[0])] = *it;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simdgroup_index == 0) {
+            for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) {
+                const auto coord = it.get_multidimensional_index();
+                const uint row = uint(coord[1]);
+                const uint col = uint(coord[0]);
+                if (row < num_heads && tile * 64 + col < KV_HEAD_DIM) {
+                    float value = 0.0f;
+                    for (uint sg = 0; sg < num_simdgroups; ++sg) {
+                        const float scale = stats[sg * 24 + row] > 0.0f ? metal::exp(stats[sg * 24 + 8 + row] - global_stats[8 + row]) : 0.0f;
+                        value += workspace[sg * 8 * 64 + row * 64 + col] * scale;
+                    }
+                    const ulong partial = (ulong)task * NUM_Q_HEADS + head_begin + row;
+                    partial_output[partial * KV_HEAD_DIM + tile * 64 + col] = T(global_stats[row] > 0.0f ? value / global_stats[row] : 0.0f);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }

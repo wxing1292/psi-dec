@@ -18,6 +18,31 @@ const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.
 const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.paged.active_kv_splits");
 
 #[test]
+fn test_pipelines_reused_across_replay_capacities() {
+    let device = Device::system_default();
+    let config = fixture_config();
+    let execution = fixture_execution(config);
+    let shape = Shape {
+        num_total_tokens: 8,
+        num_total_sdpa_map_task_templates: 8,
+    };
+    let kernels = Compute::new(&device, config, execution, shape);
+    for (num_total_tokens, num_total_sdpa_map_task_templates) in [(4, 4), (8, 16), (16, 16)] {
+        let other = Compute::new(
+            &device,
+            config,
+            execution,
+            Shape {
+                num_total_tokens,
+                num_total_sdpa_map_task_templates,
+            },
+        );
+        assert!(std::ptr::eq(kernels.map.as_raw(), other.map.as_raw()));
+        assert!(std::ptr::eq(kernels.reduce.as_raw(), other.reduce.as_raw()));
+    }
+}
+
+#[test]
 #[should_panic(expected = "GQA SDPA query/output exceeds the shader u32 count domain")]
 fn test_sdpa_shape_rejects_shader_count_overflow() {
     let config = Config {
@@ -210,46 +235,55 @@ fn test_ragged_requests_match_reference() {
 
 #[test]
 fn test_multiple_page_ids_per_block() {
-    let mut config = fixture_config();
-    let mut shape = fixture_shape();
-    shape.num_total_tokens = 1;
-    shape.num_total_sdpa_map_task_templates = 1;
-    config.page_table_layout.num_page_ids_per_block = 2;
-    let kv_stride = config.num_kv_heads as usize * config.head_dim as usize;
-    let q = fixture_values(config.num_output_values(shape), 0.125, 3);
-    let k = fixture_values(8 * kv_stride, 0.0625, 5);
-    let v = fixture_values(8 * kv_stride, 0.25, 7);
-    let kv_pages = kv_page_values(
-        config,
-        &[
-            (&k[..4 * kv_stride], &v[..4 * kv_stride]),
-            (&k[4 * kv_stride..], &v[4 * kv_stride..]),
-        ],
-    );
-    let actual = run_gqa_split_kv_single_q(
-        config,
-        shape,
-        TestInput {
-            q: &q,
-            kv_pages: &kv_pages,
-            req_slots: &[0],
-            page_ids: &[0, 1],
-            flat_token_indices: &[7],
-        },
-    );
-    let quantized_k = fp8_e4m3_round_trip(&k);
-    let quantized_v = fp8_e4m3_round_trip(&v);
-    let expected = projected_gqa_reference(
-        &fixture_core(config),
-        GQAReferenceInput {
-            cu_tokens: &[0, 1],
-            token_indices: &[7],
-            q: &q,
-            context_k_by_req: &[&quantized_k],
-            context_v_by_req: &[&quantized_v],
-        },
-    );
-    assert_close(&actual, &expected, 2.0e-2);
+    for head_dim in [2, 128, 256] {
+        for dtype in [Dtype::Bfloat16, Dtype::Float32] {
+            let mut config = fixture_config();
+            config.head_dim = head_dim;
+            config.dtype = dtype;
+            let tokens_per_page = if head_dim == 2 { 4 } else { 32 };
+            config.page_bytes = 2 * config.num_kv_heads * tokens_per_page * head_dim;
+            let tokens = tokens_per_page as usize * 2;
+            let mut shape = fixture_shape();
+            shape.num_total_tokens = 1;
+            shape.num_total_sdpa_map_task_templates = 1;
+            config.page_table_layout.num_page_ids_per_block = 2;
+            let kv_stride = config.num_kv_heads as usize * config.head_dim as usize;
+            let q = fixture_values(config.num_output_values(shape), 0.125, 3);
+            let k = fixture_values(tokens * kv_stride, 0.0625, 5);
+            let v = fixture_values(tokens * kv_stride, 0.25, 7);
+            let kv_pages = kv_page_values(
+                config,
+                &[
+                    (&k[..tokens / 2 * kv_stride], &v[..tokens / 2 * kv_stride]),
+                    (&k[tokens / 2 * kv_stride..], &v[tokens / 2 * kv_stride..]),
+                ],
+            );
+            let actual = run_gqa_split_kv_single_q(
+                config,
+                shape,
+                TestInput {
+                    q: &q,
+                    kv_pages: &kv_pages,
+                    req_slots: &[0],
+                    page_ids: &[0, 1],
+                    flat_token_indices: &[tokens as u32 - 1],
+                },
+            );
+            let quantized_k = fp8_e4m3_round_trip(&k);
+            let quantized_v = fp8_e4m3_round_trip(&v);
+            let expected = projected_gqa_reference(
+                &fixture_core(config),
+                GQAReferenceInput {
+                    cu_tokens: &[0, 1],
+                    token_indices: &[tokens as u32 - 1],
+                    q: &q,
+                    context_k_by_req: &[&quantized_k],
+                    context_v_by_req: &[&quantized_v],
+                },
+            );
+            assert_close(&actual, &expected, 2.0e-2);
+        }
+    }
 }
 
 fn fixture_config() -> Config {
@@ -273,7 +307,12 @@ fn fixture_config() -> Config {
 }
 
 fn fixture_execution(config: Config) -> sdpa::ExecutionVariant {
-    sdpa::ExecutionVariant::single_q(config.sdpa_config(), 4, 64, 2)
+    sdpa::ExecutionVariant::single_q(
+        config.sdpa_config(),
+        4,
+        config.head_dim.clamp(32, 128).next_power_of_two(),
+        2,
+    )
 }
 
 fn fixture_shape() -> Shape {
@@ -308,7 +347,11 @@ fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>)
     let stream = Stream::new(&device);
     let execution = fixture_execution(config);
     let kernels = Compute::new(&device, config, execution, shape);
-    let q = bf16_buffer(&device, input.q);
+    let q = match config.dtype {
+        Dtype::Bfloat16 => bf16_buffer(&device, input.q),
+        Dtype::Float32 => Buffer::from_slice(&device, input.q),
+        _ => unreachable!(),
+    };
     let kv_pages = Buffer::from_slice(&device, input.kv_pages);
     let req_slots = Buffer::from_slice(&device, input.req_slots);
     let page_ids = Buffer::from_slice(&device, input.page_ids);
@@ -339,7 +382,11 @@ fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>)
                 .with_u32(NUM_ACTIVE_KV_SPLITS, shape.num_total_sdpa_map_task_templates),
         )
         .wait();
-    read_bf16(&output, config.num_output_values(shape))
+    match config.dtype {
+        Dtype::Bfloat16 => read_bf16(&output, config.num_output_values(shape)),
+        Dtype::Float32 => output.read_typed::<f32>(0, config.num_output_values(shape)),
+        _ => unreachable!(),
+    }
 }
 
 fn sdpa_map_task_template_buffers(

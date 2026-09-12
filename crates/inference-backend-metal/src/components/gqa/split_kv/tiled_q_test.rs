@@ -18,7 +18,236 @@ const NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("te
 const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.num_active_kv_splits");
 
 #[test]
+fn test_pipelines_reused_across_replay_capacities() {
+    let device = Device::system_default();
+    let (config, shape) = tiled_workload(128, 8);
+    let execution = tiled_execution(config);
+    let kernels = Compute::new(&device, config, execution, shape);
+    for (num_total_tokens, num_total_q_token_tiles, num_total_sdpa_map_task_templates) in
+        [(4, 1, 2), (8, 2, 4), (16, 2, 8)]
+    {
+        let other = Compute::new(
+            &device,
+            config,
+            execution,
+            Shape {
+                num_total_tokens,
+                num_total_q_token_tiles,
+                num_total_sdpa_map_task_templates,
+            },
+        );
+        assert!(std::ptr::eq(kernels.map.as_raw(), other.map.as_raw()));
+        assert!(std::ptr::eq(kernels.reduce.as_raw(), other.reduce.as_raw()));
+    }
+}
+
+#[test]
 fn test_replay_bucketing() {
+    assert_replay_bucketing();
+}
+
+#[test]
+fn test_replay_paged_ranges() {
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    for (head_dim, tokens_per_page) in [(128, 8), (128, 16), (256, 8), (256, 16), (256, 32)] {
+        for kv_tokens_per_iteration in [8, 16] {
+            let config = Config {
+                num_q_heads: 6,
+                num_kv_heads: 2,
+                head_dim,
+                scale: (head_dim as f32).sqrt().recip(),
+                page_bytes: 4 * tokens_per_page * head_dim,
+                dtype: Dtype::Bfloat16,
+                page_table_layout: PageTableLayout {
+                    num_req_slots: 2,
+                    num_gqa_layers: 2,
+                    num_blocks: 3,
+                    num_page_ids_per_block: 2,
+                },
+            };
+            let shape = Shape {
+                num_total_tokens: 20,
+                num_total_q_token_tiles: 4,
+                num_total_sdpa_map_task_templates: 8,
+            };
+            let execution = sdpa::ExecutionVariant::tiled_q(config.sdpa_config(), 16, kv_tokens_per_iteration, 2);
+            let kernels = Compute::new(&device, config, execution, shape);
+            let q_values = generated_bf16_values(config.q_bytes(shape) as usize / 2, 17);
+            let kv_width = (config.num_kv_heads * head_dim) as usize;
+            let keys = [36, 7].map(|tokens| fp8_e4m3_round_trip(&generated_bf16_values(tokens * kv_width, 31)));
+            let values = [36, 7].map(|tokens| fp8_e4m3_round_trip(&generated_bf16_values(tokens * kv_width, 47)));
+            let mut page_table = vec![u32::MAX; 24];
+            let mut pages = vec![0_u8; 12 * config.page_bytes as usize];
+            let mut next_page = 11;
+            for (req, req_slot) in [1_usize, 0].into_iter().enumerate() {
+                let page_values = tokens_per_page as usize * kv_width;
+                for (page_index, (k, v)) in keys[req]
+                    .chunks(page_values)
+                    .zip(values[req].chunks(page_values))
+                    .enumerate()
+                {
+                    let mut page_k = vec![0.0; page_values];
+                    let mut page_v = vec![0.0; page_values];
+                    page_k[..k.len()].copy_from_slice(k);
+                    page_v[..v.len()].copy_from_slice(v);
+                    let page = kv_page_values(config, &page_k, &page_v);
+                    let begin = next_page * config.page_bytes as usize;
+                    pages[begin..begin + page.len()].copy_from_slice(&page);
+                    page_table[req_slot * 12 + 6 + page_index] = next_page as u32;
+                    next_page -= 1;
+                }
+            }
+            let q = bf16_buffer(&device, &q_values);
+            let kv_pages = Buffer::from_slice(&device, &pages);
+            let page_ids = Buffer::from_slice(&device, &page_table);
+            let mut slots = vec![1_u32; 20];
+            slots[17] = 0;
+            let req_slots = Buffer::from_slice(&device, &slots);
+            let visible_ranges = Buffer::new_zeroed_elements(&device, 40, Dtype::Uint32);
+            let ranges = Buffer::from_slice(&device, &[0_u32, 16, 16, 17, 17, 18, u32::MAX, u32::MAX]);
+            let templates = Buffer::from_slice(
+                &device,
+                &[
+                    0_u32,
+                    0,
+                    16,
+                    0,
+                    16,
+                    35,
+                    1,
+                    0,
+                    16,
+                    1,
+                    16,
+                    36,
+                    2,
+                    0,
+                    7,
+                    2,
+                    7,
+                    7,
+                    u32::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                ],
+            );
+            let cu_partials = Buffer::from_slice(&device, &[0_u32, 2, 4, 6, u32::MAX]);
+            let partial_output = Buffer::new_zeroed(&device, config.partial_output_bytes(execution, shape));
+            let partial_sums = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
+            let partial_max = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
+            let output = bf16_buffer(&device, &vec![42.0; q_values.len()]);
+            let mut builder = stream.create_replay_program();
+            builder.record(kernels.invoke_map(
+                MapBuffers {
+                    q: &q,
+                    kv_pages: &kv_pages,
+                    req_slots: &req_slots,
+                    page_ids: &page_ids,
+                    visible_kv_token_ranges: &visible_ranges,
+                    q_token_ranges: &ranges,
+                    sdpa_map_task_templates: &templates,
+                    partial_output: &partial_output,
+                    partial_exp_sums: &partial_sums,
+                    partial_max_logits: &partial_max,
+                },
+                ReplayU32::Fixed(1),
+                ReplayU32::Fixed(18),
+                ReplayU32::Fixed(3),
+                ReplayU32::Fixed(6),
+            ));
+            builder.record_with_barrier_before(kernels.invoke_reduce(
+                ReduceBuffers {
+                    partial_output: &partial_output,
+                    partial_exp_sums: &partial_sums,
+                    partial_max_logits: &partial_max,
+                    q_token_ranges: &ranges,
+                    cu_sdpa_partial_outputs: &cu_partials,
+                    output: &output,
+                },
+                ReplayU32::Fixed(3),
+            ));
+            let replay = builder.build();
+            let q_width = (config.num_q_heads * head_dim) as usize;
+            for windowed in [false, true] {
+                let mut visibility = Vec::new();
+                let mut expected = Vec::new();
+                for token in 0..18 {
+                    let req = usize::from(token == 17);
+                    let end = if req == 0 { 20 + token } else { 7 };
+                    let begin = if windowed {
+                        if req == 0 { end - 3 } else { end }
+                    } else {
+                        0
+                    };
+                    visibility.extend([begin as u32, end as u32]);
+                    if begin == end {
+                        expected.extend(vec![0.0; q_width]);
+                    } else {
+                        expected.extend(projected_gqa_reference(
+                            &fixture_core(config),
+                            GQAReferenceInput {
+                                cu_tokens: &[0, 1],
+                                token_indices: &[(end - begin - 1) as u32],
+                                q: &q_values[token * q_width..(token + 1) * q_width],
+                                context_k_by_req: &[&keys[req][begin * kv_width..end * kv_width]],
+                                context_v_by_req: &[&values[req][begin * kv_width..end * kv_width]],
+                            },
+                        ));
+                    }
+                }
+                visible_ranges.write_typed(0, &visibility);
+                stream.submit_replay(&replay).wait();
+                assert_close(&read_bf16_values(&output, 18 * q_width), &expected, 2.0e-2);
+                assert!(
+                    output
+                        .read_typed::<u16>(18 * q_width, 2 * q_width)
+                        .iter()
+                        .all(|&value| value == bf16::from_f32(42.0).to_bits())
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "GQA SplitKV TiledQ supports only")]
+fn test_shape_rejects_unsupported_profile() {
+    let (config, shape) = tiled_workload(192, 8);
+    shape.validate(config);
+}
+
+#[test]
+#[should_panic(expected = "GQA SplitKV TiledQ Q-token-range metadata exceeds the shader u32 element-index domain")]
+fn test_shape_rejects_shader_index_overflow() {
+    let shape = Shape {
+        num_total_tokens: u32::MAX,
+        num_total_q_token_tiles: u32::MAX,
+        num_total_sdpa_map_task_templates: u32::MAX,
+    };
+    let (config, _) = tiled_workload(256, 16);
+    shape.validate(config);
+}
+
+#[test]
+#[should_panic(
+    expected = "GQA SplitKV TiledQ visible K/V-token-range metadata exceeds the shader u32 element-index domain"
+)]
+fn test_shape_rejects_visible_range_index_overflow() {
+    let shape = Shape {
+        num_total_tokens: u32::MAX,
+        num_total_q_token_tiles: 1,
+        num_total_sdpa_map_task_templates: 1,
+    };
+    let (config, _) = tiled_workload(256, 16);
+    shape.validate(config);
+}
+
+// Force both implementations independently of the production hardware policy.
+fn assert_replay_bucketing() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let (config, base_shape) = tiled_workload(128, 8);
@@ -131,39 +360,6 @@ fn test_replay_bucketing() {
         let actual = read_bf16_values(&output, num_active_tokens * q_values_per_token);
         assert_close(&actual, &expected, 2.0e-2);
     }
-}
-
-#[test]
-#[should_panic(expected = "GQA SplitKV TiledQ supports only")]
-fn test_shape_rejects_unsupported_profile() {
-    let (config, shape) = tiled_workload(192, 8);
-    shape.validate(config);
-}
-
-#[test]
-#[should_panic(expected = "GQA SplitKV TiledQ Q-token-range metadata exceeds the shader u32 element-index domain")]
-fn test_shape_rejects_shader_index_overflow() {
-    let shape = Shape {
-        num_total_tokens: u32::MAX,
-        num_total_q_token_tiles: u32::MAX,
-        num_total_sdpa_map_task_templates: u32::MAX,
-    };
-    let (config, _) = tiled_workload(256, 16);
-    shape.validate(config);
-}
-
-#[test]
-#[should_panic(
-    expected = "GQA SplitKV TiledQ visible K/V-token-range metadata exceeds the shader u32 element-index domain"
-)]
-fn test_shape_rejects_visible_range_index_overflow() {
-    let shape = Shape {
-        num_total_tokens: u32::MAX,
-        num_total_q_token_tiles: 1,
-        num_total_sdpa_map_task_templates: 1,
-    };
-    let (config, _) = tiled_workload(256, 16);
-    shape.validate(config);
 }
 
 fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (Config, Shape) {

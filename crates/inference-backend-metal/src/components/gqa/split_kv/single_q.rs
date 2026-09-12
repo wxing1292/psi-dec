@@ -15,6 +15,7 @@ use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
+const FP8_SOURCE: &str = include_str!("../../metal/gqa_fp8.metal");
 const MAP_SOURCE: &str = include_str!("../../metal/gqa_split_kv_single_q_map.metal");
 const REDUCE_SOURCE: &str = include_str!("../../metal/gqa_split_kv_single_q_reduce.metal");
 
@@ -39,8 +40,7 @@ impl KernelConstants {
 
     fn map_threadblock_memory_bytes(self) -> usize {
         let map = self.map.thread_block;
-        (map.max_q_heads as usize * map.kv_tokens_per_iteration as usize + map.required_threads as usize)
-            * size_of::<f32>()
+        (map.required_threads as usize / 32 * (8 * 64 + 8 * 16 + 8 * 3) + 8 * 2) * size_of::<f32>()
     }
 
     fn num_q_head_ranges_per_kv_head(self) -> u32 {
@@ -76,10 +76,10 @@ impl KernelConstants {
 /// MapThreadBlockTask:
 ///   { q_token_range_index, kv_token_begin, kv_token_end } from the template
 ///   + { kv_head_index, q_head_range_index } from the grid
-/// grid: (total Map task templates * Hkv * Q-head ranges, 1, 1), flattened
+/// grid: (total Map task templates, Hkv * Q-head ranges, 1)
 /// threadblock: (configured width, 1, 1)
-/// parallel: Map tasks, KV heads, Q-head ranges
-/// ordered/reduce: consecutive KV iterations merged with online softmax
+/// parallel: Map tasks, KV heads, Q-head ranges, SIMDgroup KV ranges
+/// ordered/reduce: online softmax per SIMDgroup, then threadblock reduction
 /// produces: SDPAPartialOutput + statistics -> final reduce -> SDPAOutput
 /// ```
 ///
@@ -322,14 +322,18 @@ impl Compute {
             Dtype::Bfloat16 => "gqa_split_kv_single_q_reduce_bf16",
             dtype => panic!("unsupported GQA SplitKV SingleQ reduce dtype {dtype:?}"),
         };
+        let map = CompiledKernel::new_tensor_ops(
+            device,
+            &gqa_split_kv_single_q_map_source(constants),
+            "gqa_split_kv_single_q_map",
+        );
+        assert!(map.static_threadblock_memory_length() <= device.max_threadblock_memory_length());
+        assert!(constants.map.thread_block.required_threads as usize <= map.max_total_threads_per_threadblock());
+        assert_eq!(map.thread_execution_width(), 32);
         Self {
             constants,
             shape,
-            map: CompiledKernel::new(
-                device,
-                &gqa_split_kv_single_q_map_source(constants, shape),
-                "gqa_split_kv_single_q_map",
-            ),
+            map,
             reduce: CompiledKernel::new(
                 device,
                 &gqa_split_kv_single_q_reduce_source(constants),
@@ -367,36 +371,29 @@ impl Compute {
     }
 }
 
-fn gqa_split_kv_single_q_map_source(constants: KernelConstants, shape: Shape) -> String {
+fn gqa_split_kv_single_q_map_source(constants: KernelConstants) -> String {
     let config = constants.config;
     let map = constants.map.thread_block;
     let dtype = metal_dtype_name(config.dtype);
-    let body = MAP_SOURCE
-        .replace("uint global_thread_index = thread_position_in_grid.x;\n", "")
-        .replace(
-            "int num_blocks = page_table_layout[2];",
-            &format!("int num_blocks = {};", config.page_table_layout.num_blocks),
-        );
-    assert!(!body.contains("thread_position_in_grid"));
-    assert!(!body.contains("q_shape"));
-    assert!(!body.contains("page_table_layout"));
+    let num_output_tiles = config.head_dim.div_ceil(64);
+    let declarations = (0..num_output_tiles)
+        .map(|tile| format!("Output output_{tile};"))
+        .collect::<String>();
+    let pointers = (0..num_output_tiles)
+        .map(|tile| format!("&output_{tile}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = MAP_SOURCE.replace(
+        "GQA_DECLARE_OUTPUT_TILES",
+        &format!("{declarations}thread Output* outputs[] = {{{pointers}}};"),
+    );
     format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
 typedef bfloat bfloat16_t;
-inline bfloat16_t fp8_e4m3_to_bf16(uchar bits) {{
-    const uint sign = uint(bits & uchar(0x80)) << 24;
-    const uint exponent = (uint(bits) >> 3) & 0x0fu;
-    const uint mantissa = uint(bits) & 0x07u;
-    const float normal = as_type<float>(sign | ((exponent + 120u) << 23) | (mantissa << 20));
-    const float subnormal_magnitude = float(mantissa) * (1.0f / 512.0f);
-    const float subnormal = sign == 0u ? subnormal_magnitude : -subnormal_magnitude;
-    const float finite = select(normal, subnormal, exponent == 0u);
-    return bfloat16_t(select(finite, as_type<float>(sign | 0x7fc00000u), exponent == 15u && mantissa == 7u));
-}}
-#define T {dtype}
-#define KV_T uchar
+{FP8_SOURCE}
+using T = {dtype};
 #define NUM_Q_HEADS {num_q_heads}
 #define NUM_KV_HEADS {num_kv_heads}
 #define KV_HEAD_DIM {head_dim}
@@ -406,29 +403,12 @@ inline bfloat16_t fp8_e4m3_to_bf16(uchar bits) {{
 #define NUM_Q_HEAD_RANGES_PER_KV_HEAD {num_q_head_ranges_per_kv_head}
 #define NUM_TOKENS {num_tokens}
 #define PAGE_BYTES {page_bytes}
-#define KV_TOKENS_PER_ITERATION {kv_tokens_per_iteration}
-#define TOTAL_KV_SPLITS {num_total_kv_splits}
 #define REQUIRED_THREADS {required_threads}
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
 
-kernel void gqa_split_kv_single_q_map(
-    device const T* q [[buffer(0)]],
-    device const KV_T* kv_pages [[buffer(1)]],
-    device const uint* req_slots [[buffer(2)]],
-    device const uint* page_ids [[buffer(3)]],
-    device const uint* sdpa_map_task_templates [[buffer(4)]],
-    device float* partial_exp_sums [[buffer(5)]],
-    device float* partial_max_logits [[buffer(6)]],
-    device T* partial_output [[buffer(7)]],
-    constant uint& gqa_layer_index [[buffer(8)]],
-    constant uint& num_active_tokens [[buffer(9)]],
-    constant uint& num_active_kv_splits [[buffer(10)]],
-    uint global_thread_index [[thread_position_in_grid]]
-) {{
 {body}
-}}
 "#,
         dtype = dtype,
         head_dim = config.head_dim,
@@ -440,13 +420,10 @@ kernel void gqa_split_kv_single_q_map(
         num_tokens = config.num_tokens_per_page(),
         num_q_heads = config.num_q_heads,
         page_bytes = config.page_bytes,
-        kv_tokens_per_iteration = map.kv_tokens_per_iteration,
-        num_total_kv_splits = shape.num_total_sdpa_map_task_templates,
         required_threads = map.required_threads,
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
-        body = body,
     )
 }
 
@@ -506,9 +483,13 @@ impl Operator for MapInvocation<'_> {
             shape.num_total_sdpa_map_task_templates,
             "GQA SplitKV SingleQ active KV split count",
         );
-        recorder.dispatch_1d(
-            self.constants.map_threads(shape),
-            self.constants.map.thread_block.required_threads as usize,
+        recorder.dispatch_threadblocks(
+            (
+                shape.num_total_sdpa_map_task_templates as usize,
+                (self.constants.config.num_kv_heads * self.constants.num_q_head_ranges_per_kv_head()) as usize,
+                1,
+            ),
+            (self.constants.map.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -516,7 +497,6 @@ impl Operator for MapInvocation<'_> {
 impl MapInvocation<'_> {
     fn validate(&self) {
         let config = self.constants.config;
-        self.shape.validate(config);
         assert!(self.buffers.q.len_bytes_u64() >= config.q_bytes(self.shape));
         assert!(self.buffers.kv_pages.len_bytes_u64() >= config.page_bytes as u64);
         assert!(self.buffers.req_slots.len_bytes_u64() >= config.req_slots_bytes(self.shape));
@@ -576,7 +556,6 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 impl ReduceInvocation<'_> {
     fn validate(&self) {
         let config = self.constants.config;
-        self.shape.validate(config);
         assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(self.shape));
         assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(self.shape));
         assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(self.shape));

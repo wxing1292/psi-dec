@@ -437,14 +437,13 @@ impl Fixture {
     }
 
     fn print_resources(&self) {
-        let single_q_smem = (self.split_kv_single_q_max_q_heads as usize
-            * self.params.split_kv_single_q_kv_tokens_per_iteration as usize
-            + self.params.split_kv_single_q_required_threads as usize)
-            * size_of::<f32>();
+        let num_simdgroups = self.params.split_kv_single_q_required_threads as usize / 32;
+        let single_q_smem = (num_simdgroups * (8 * 64 + 8 * 16 + 8 * 3) + 8 * 2) * size_of::<f32>();
         let tiled_config = self.tiled_config();
         let tiled_execution = self.split_kv_tiled_q_metadata.variant();
-        let single_q_output_accumulators = self.split_kv_single_q_max_q_heads as usize
-            * (self.core.head_dim as u32).div_ceil(self.params.split_kv_single_q_required_threads) as usize;
+        let tiled_q_smem = tiled_config.map_threadblock_memory_bytes(tiled_execution)
+            + tiled_execution.map.thread_block.required_threads as usize / 32 * (8 * 16 + 8 * 3) * size_of::<f32>();
+        let single_q_output_accumulators = 8 * 64 / 32 * self.core.head_dim.div_ceil(64);
         println!(
             "resources device={} head_dim={} q_heads={} kv_heads={} q_heads_per_kv_head={} \
              split_kv_single_q_max_q_heads={} split_kv_single_q_required_threads={} \
@@ -452,7 +451,7 @@ impl Fixture {
              split_kv_single_q_output_accumulators_per_thread={} production_tiled_q_max_q_heads={} \
              split_kv_tiled_q_max_q_heads={} split_kv_tiled_q_required_threads={} split_kv_tiled_q_max_q_tokens={} \
              split_kv_tiled_q_kv_tokens_per_iteration={} split_kv_tiled_q_threadgroup_bytes={} \
-             split_kv_tiled_q_head_fragments_per_thread={}",
+             split_kv_tiled_q_output_accumulators_per_thread={}",
             self.device.name(),
             self.core.head_dim,
             self.core.num_q_heads,
@@ -468,8 +467,8 @@ impl Fixture {
             tiled_execution.map.thread_block.required_threads,
             self.params.split_kv_tiled_q_max_q_tokens,
             self.params.split_kv_tiled_q_kv_tokens_per_iteration,
-            tiled_config.map_threadblock_memory_bytes(tiled_execution),
-            self.core.head_dim / 8,
+            tiled_q_smem,
+            8 * self.core.head_dim / 32,
         );
     }
 

@@ -122,7 +122,7 @@ impl ExecutionVariant {
             return map.max_q_heads <= 8
                 && map.kv_tokens_per_iteration <= 1024
                 && map.required_threads.is_power_of_two()
-                && map.required_threads <= 256
+                && (32..=256).contains(&map.required_threads)
                 && reduce.max_q_tokens == expected_reduce_max_q_tokens
                 && reduce.max_q_heads == expected_reduce_max_q_heads
                 && reduce.required_threads == 256;
@@ -233,9 +233,12 @@ fn supports_tiled_q(config: Config) -> bool {
 }
 
 fn single_q_variant(config: Config) -> ExecutionVariant {
-    let required_threads = config.head_dim.clamp(32, 256).next_power_of_two();
+    let kv_tokens_per_iteration = config.head_dim.clamp(32, 256).next_power_of_two();
+    // TensorOps partitions KV tiles across SIMDgroups. Four groups retain enough
+    // parallelism without the shared-memory cost of the former eight-group map.
+    let required_threads = kv_tokens_per_iteration.min(128);
     let max_q_heads = config.q_heads_per_kv_head().min(8);
-    ExecutionVariant::single_q(config, required_threads, required_threads, max_q_heads)
+    ExecutionVariant::single_q(config, kv_tokens_per_iteration, required_threads, max_q_heads)
 }
 
 fn tiled_q_variant(config: Config, max_q_heads: u32) -> ExecutionVariant {

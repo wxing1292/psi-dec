@@ -15,7 +15,9 @@ use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
+const FP8_SOURCE: &str = include_str!("../../metal/gqa_fp8.metal");
 const SOURCE: &str = include_str!("../../metal/gqa_split_kv_tiled_q.metal");
+const TENSOR_OPS_SOURCE: &str = include_str!("../../metal/gqa_split_kv_tiled_q_tensor_ops.metal");
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct KernelConstants {
@@ -85,7 +87,7 @@ impl KernelConstants {
             "GQA SplitKV TiledQ threadgroup memory byte length",
             &[
                 2,
-                self.map.thread_block.kv_tokens_per_iteration as usize,
+                self.map.thread_block.kv_tokens_per_iteration.max(16) as usize,
                 padded_head_dim,
                 self.config.dtype.item_size(),
             ],
@@ -291,18 +293,31 @@ impl Compute {
     pub fn new(device: &Device, config: Config, execution: sdpa::ExecutionVariant, shape: Shape) -> Self {
         let constants = KernelConstants::new(config, execution);
         shape.validate(config);
+        i32::try_from(config.num_q_heads as u64 * config.head_dim as u64)
+            .expect("GQA TensorOps query stride must fit i32");
         assert!(
             constants.map_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
             "GQA SplitKV TiledQ shape needs {} bytes of threadblock memory but device only supports {}",
             constants.map_threadblock_memory_bytes(),
             device.max_threadblock_memory_length()
         );
-        let source = source(constants, shape);
+        let source = source(constants);
+        let map = CompiledKernel::new_tensor_ops(device, &source, "gqa_split_kv_tiled_q_map");
+        assert!(
+            constants.map_threadblock_memory_bytes() + map.static_threadblock_memory_length()
+                <= device.max_threadblock_memory_length(),
+            "GQA SplitKV TiledQ threadblock memory exceeds device capacity"
+        );
+        assert!(
+            constants.map.thread_block.required_threads as usize <= map.max_total_threads_per_threadblock(),
+            "GQA SplitKV TiledQ threadblock exceeds the Map pipeline thread limit"
+        );
+        assert_eq!(map.thread_execution_width(), 32);
         Self {
             constants,
             shape,
-            map: CompiledKernel::new(device, &source, "gqa_split_kv_tiled_q_map"),
-            reduce: CompiledKernel::new(device, &source, "gqa_split_kv_tiled_q_reduce"),
+            map,
+            reduce: CompiledKernel::new_tensor_ops(device, &source, "gqa_split_kv_tiled_q_reduce"),
         }
     }
 
@@ -357,7 +372,6 @@ impl Operator for MapInvocation<'_> {
         let shape = self.shape;
         let constants = self.constants;
         let config = constants.config;
-        shape.validate(config);
         assert!(self.buffers.q.len_bytes_u64() >= config.q_bytes(shape));
         assert!(self.buffers.kv_pages.len_bytes() >= config.page_bytes as usize);
         assert!(self.buffers.req_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
@@ -442,7 +456,6 @@ impl Operator for ReduceInvocation<'_> {
         let shape = self.shape;
         let constants = self.constants;
         let config = constants.config;
-        shape.validate(config);
         assert!(self.buffers.partial_output.len_bytes_u64() >= constants.partial_output_bytes(shape));
         assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= constants.partial_output_stats_bytes(shape));
         assert!(self.buffers.partial_max_logits.len_bytes_u64() >= constants.partial_output_stats_bytes(shape));
@@ -474,13 +487,12 @@ impl Operator for ReduceInvocation<'_> {
     }
 }
 
-fn source(constants: KernelConstants, shape: Shape) -> String {
+fn source(constants: KernelConstants) -> String {
     let config = constants.config;
     let map = constants.map.thread_block;
     let reduce = constants.reduce.thread_block;
     format!(
         r#"
-#define NUM_TOKENS {num_tokens}
 #define NUM_Q_HEADS {num_q_heads}
 #define NUM_KV_HEADS {num_kv_heads}
 #define MAX_Q_HEADS {max_q_heads}
@@ -496,9 +508,12 @@ fn source(constants: KernelConstants, shape: Shape) -> String {
 #define KV_TOKENS_PER_ITERATION {kv_tokens_per_iteration}
 #define MAP_REQUIRED_THREADS {map_required_threads}
 #define REDUCE_REQUIRED_THREADS {reduce_required_threads}
-{body}
+#include <metal_stdlib>
+using namespace metal;
+{FP8_SOURCE}
+{SOURCE}
+{TENSOR_OPS_SOURCE}
 "#,
-        num_tokens = shape.num_total_tokens,
         num_q_heads = config.num_q_heads,
         num_kv_heads = config.num_kv_heads,
         max_q_heads = map.max_q_heads,
@@ -514,7 +529,6 @@ fn source(constants: KernelConstants, shape: Shape) -> String {
         kv_tokens_per_iteration = map.kv_tokens_per_iteration,
         map_required_threads = map.required_threads,
         reduce_required_threads = reduce.required_threads,
-        body = SOURCE,
     )
 }
 

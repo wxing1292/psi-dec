@@ -43,7 +43,7 @@ const GQA_ROPE_THETA: f32 = 10_000_000.0;
 const GQA_NORM_EPS: f32 = 1.0e-6;
 const DEFAULT_MAX_TOKENS: usize = 128;
 const SPLIT_KV_SINGLE_Q_KV_TOKENS_PER_ITERATION: u32 = 256;
-const SPLIT_KV_SINGLE_Q_REQUIRED_THREADS: u32 = 256;
+const SPLIT_KV_SINGLE_Q_REQUIRED_THREADS: u32 = 128;
 const SPLIT_KV_SINGLE_Q_MAX_Q_HEADS: u32 = 8;
 const SPLIT_KV_TILED_Q_MAX_Q_TOKENS: u32 = 8;
 const SPLIT_KV_TILED_Q_KV_TOKENS_PER_ITERATION: u32 = 16;
@@ -392,9 +392,8 @@ fn print_help_and_exit() -> ! {
 }
 
 fn split_kv_single_q_threadblock_memory_bytes(params: GQABenchParams) -> usize {
-    (params.split_kv_single_q_max_q_heads as usize * params.split_kv_single_q_kv_tokens_per_iteration as usize
-        + params.split_kv_single_q_required_threads as usize)
-        * size_of::<f32>()
+    let num_simdgroups = params.split_kv_single_q_required_threads as usize / 32;
+    (num_simdgroups * (8 * 64 + 8 * 16 + 8 * 3) + 8 * 2) * size_of::<f32>()
 }
 
 fn print_gqa_kernel_limits(device: &Device, params: GQABenchParams) {

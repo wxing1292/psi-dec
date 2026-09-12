@@ -206,6 +206,11 @@ to the low-level SplitKV `Compute` constructor. It does not reconstruct a varian
 model and storage `Config`. Each SplitKV module uses a private `KernelConstants` value to bind that `Config` to the
 selected Map and Reduce constants.
 
+The backend makes a further immutable source choice inside `TiledQ`: Apple10 devices use TensorOps when
+`kv_tokens_per_iteration == 16`. The alternative uses the existing SIMDgroup Map.
+Both sources consume the same task metadata and produce the same natural-log partial-state ABI.
+This device-local choice does not add a scheduler branch, a replay argument, or a component replay cache.
+
 ### Dynamic selection
 
 `gqa::sdpa::RequestShape` contains `num_history_tokens` and `num_q_tokens` for one request. For a causal Q-token offset:

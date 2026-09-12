@@ -93,9 +93,11 @@ crates/inference-backend-metal/src/components/
     gqa_qkv_split.metal        ungated QKV split source
     rms_norm_rope.metal         Metal head-row RMSNorm/RoPE source
     gqa_kv_page_write.metal     Metal KV page-write source
+    gqa_fp8.metal                      shared packed FP8-to-BF16 decode
     gqa_split_kv_single_q_map.metal     Metal SplitKV SingleQ map source
     gqa_split_kv_single_q_reduce.metal  Metal SplitKV SingleQ reduce source
     gqa_split_kv_tiled_q.metal          Metal SplitKV TiledQ map/reduce source
+    gqa_split_kv_tiled_q_tensor_ops.metal  Metal 4 TensorOps TiledQ map
     gqa_bidi_block_sdpa.metal         Metal bidirectional local-block SDPA partial-output source
     gqa_activation_gate.metal    Metal attention-output gate source
 ```
@@ -405,6 +407,9 @@ The selected `backend_sdpa::ExecutionVariant` is the only source for `max_q_toke
 Recording passes it to `single_q::Compute::new(...)` or `tiled_q::Compute::new(...)` without copying its fields into
 `Config`.
 
+Both SplitKV compute owners validate immutable configuration and shape at construction.
+Map and Reduce recording validate the newly supplied buffer ranges and replay arguments.
+
 Each low-level SplitKV module binds `Config` and the selected variant in one private `KernelConstants` value. Source
 generation, scratch validation, and Map and Reduce dispatch use that value. The Map and Reduce thread requirements
 remain distinct fields even when a current variant gives them the same value.
@@ -487,9 +492,9 @@ cache-format kernel.
 
 The cache conversion uses fixed unit scale and IEEE-style round-to-nearest, ties-to-even. It saturates finite overflow
 and infinity to `±448`. It preserves the sign of zero. It encodes NaN with an E4M3FN NaN code. The cache does not own a
-scale buffer, scale metadata, or a scale lifecycle. `SingleQ` decodes each cache byte directly to F32. `TiledQ` decodes
-eight adjacent cache bytes directly to packed BF16 bit patterns for threadgroup K/V storage. It then performs F32
-matrix arithmetic.
+scale buffer, scale metadata, or a scale lifecycle. `SingleQ` and `TiledQ` decode
+eight adjacent cache bytes directly to packed BF16 bit patterns for threadgroup K/V storage. Matrix operations use
+the configured query dtype, BF16 K/V, and F32 accumulation.
 
 This format is the only production GQA cache contract. The implementation does not keep a BF16 compatibility cache,
 an alternate writer, a runtime fallback, or a feature flag.
@@ -698,8 +703,8 @@ parallelism: KV split x KV head x Q-head range
 input: normalized Q plus paged K/V selected through the request page table
 output: partial attention states for one KV range, followed by one numerically stable reduce
 
-SingleQ    one Q token per Q-token range; scalar dot/reduction work
-TiledQ    several Q tokens/Q heads per range; SIMD-group matrix work
+SingleQ    one Q token per range; TensorOps rows are Q heads
+TiledQ    several Q tokens per range; TensorOps rows are Q tokens
 ```
 
 Both variants use GQA head sharing. If `G = Hq / Hkv`, KV head `k` supplies K/V to Q heads
@@ -766,107 +771,72 @@ For 35B, `TiledQ` uses `max_q_heads=4` below four useful tokens per Q-token rang
 
 #### `SingleQ`
 
-`SingleQ` always uses `max_q_tokens=1`. Qwen3-14B uses `kv_tokens_per_iteration=128`, `required_threads=128`, and
-`max_q_heads=5`.
+`SingleQ` always uses `max_q_tokens=1`. Its Map uses Metal 4 TensorOps on every supported GPU.
+One block owns one Q token, one KV head, up to `max_q_heads` Q heads, and one KV split.
+The dispatch grid uses X for map task templates and Y for KV heads and Q-head ranges.
+The task capacity belongs to the dispatch shape. It does not specialize the shader.
+A new split capacity can reuse the compiled pipeline while it records a new replay.
+The existing task-template and partial-output layouts are unchanged.
+`kv_tokens_per_iteration` remains a planning input. The kernel processes its assigned range in 16-token tiles.
 
-The Qwen3.5 profiles use `kv_tokens_per_iteration=256`, `required_threads=256`, and their model-derived
-`max_q_heads` value:
+Each SIMDgroup takes a disjoint sequence of 16-token tiles from the split. It retains its own F32 online-softmax state.
+The matrix rows are Q heads, padded to eight. The matrix operations are:
 
 ```text
-one block owns
-  one Q token
-  one KV head
-  up to max_q_heads Q heads sharing that KV head
-  one KV split's [kv_begin, kv_end) segment
-
-Q[q_token, max_q_heads, D]             paged K/V
-          |                                |
-          +-- each thread scores K token --+
-                           |
-             threadgroup logits[max_q_heads, kv_tokens_per_iteration]
-             + block max/sum reduction
-                           |
-             each thread owns output dim d
-             and streams V[token, d]
-                           |
-                online-softmax merge
-                           |
-        partial output[D] + max + sum per Q head
+QK: [8 Q heads, 64 dimensions] x [64 dimensions, 16 KV tokens]
+      -> [8 Q heads, 16 KV tokens] scores, accumulated across D/64 dimension tiles
+PV: [8 Q heads, 16 KV tokens] x [16 KV tokens, 64 dimensions]
+      -> [8 Q heads, 64 dimensions] output accumulator
 ```
 
-For Qwen3-14B, `D=128` and 128 threads let one thread own one output dimension. The full five-head group stays in one
-Map threadblock.
+The final dimension tile can be incomplete. Query views and K/V staging pad it. Output stores use the actual head width.
+An incomplete head range pads Q rows. Masked rows do not write partial outputs or statistics.
+FP8 K/V tiles decode to BF16. Queries retain the configured F32 or BF16 dtype.
+Probabilities, softmax statistics, and accumulators stay in F32.
 
-Its `logits[5, 128]` and `reduce_scratch[128]` use 3 KiB of threadgroup memory. A `max_q_heads` value of four requires
-separate `4+1` head ranges.
+Each SIMDgroup stages K and V into the same 2 KiB region at different times.
+After attention completes, that region holds one F32 output tile for the cross-SIMDgroup reduction.
+The block merges local maxima, exponential sums, and output numerators before writing one partial state per Q head.
+This merge adds no GPU command or CPU synchronization.
 
-A thread count of 64 doubles the output accumulators that each thread holds.
-
-The Qwen3.5 `D=256` profiles use one active thread per output dimension. The 27B profile uses 7 KiB
-(`max_q_heads=6`). The 35B profile uses 9 KiB (`max_q_heads=8`).
-
-The kernels stream K/V from global memory instead of staging them as threadgroup tiles. Running statistics and owned
-output dimensions are MSL thread-local values.
+A block needs `(num_simdgroups * (8*64 + 8*16 + 8*3) + 8*2) * sizeof(float)` bytes of threadgroup memory.
+The D=128 and D=256 production variants use 128 threads and 10,688 bytes.
+The supported 256-thread variant uses 21,312 bytes. This bound does not grow with head width.
+The number of cooperative output tiles does grow with head width; a D=256 head retains four 8x64 output tiles per SIMDgroup.
+The source uses named cooperative tensors and an array of thread pointers, as the GDN chunkwise owner does.
+MSL cannot create an array of cooperative tensors whose storage size depends on the device.
 
 #### `TiledQ`
 
-The common tiled variant and its internal tensor regions are:
+`TiledQ` uses Metal 4 TensorOps on every supported GPU. There is no hardware flag or alternate SIMDgroup Map kernel.
+The request-shape selector still chooses SingleQ or TiledQ for the batch. It does not classify work from a prefill/decode label alone.
+Initialization validates the selected pipeline's storage, SIMD width, and thread-count limits.
+Token, Q-token-range, and map-task capacities belong to the dispatch shape and replay bindings.
+They do not specialize the Map or Reduce shader. New replay capacities reuse the compiled pipelines.
+
+One SIMDgroup owns one Q head and eight Q rows. QK uses an 8x16 score tile.
+PV uses 8x128 output tiles; D=256 retains two independent PV accumulators.
+The default KV iteration has 16 tokens. The supported eight-token iteration pads its TensorOps operand tile to 16.
+The kernel masks those padding columns before softmax and advances by the logical iteration length.
 
 ```text
-max_q_tokens:              8
-max_q_heads:               model- and workload-derived
-kv_tokens_per_iteration:   16
-grid:                      (Hkv * ceil((Hq/Hkv) / max_q_heads), TaskTemplates, 1)
-required_threads:          (max_q_tokens / 8) * max_q_heads * 32
-Q tensor region:           [up to max_q_tokens, max_q_heads, D]
-K/V tensor region:         [kv_tokens_per_iteration, D] for one KV head
-
-Qwen3-14B max_q_heads=5  -> 160 threads = 5 SIMD-groups
-max_q_heads=4           -> 128 threads = 4 SIMD-groups
-max_q_heads=8           -> 256 threads = 8 SIMD-groups
+paged FP8 K/V
+    -> shared BF16 K[16, D+8] and V[16, D+8]
+    -> QK TensorOps, per-query visible-range mask, online softmax
+    -> F32 probabilities x BF16 V
+    -> F32 cooperative output accumulators
+    -> partial BF16 output + F32 statistics
 ```
 
-One 32-lane SIMD-group owns one Q head and one eight-token fragment. Its lanes collectively hold the Q rows in MSL
-thread-local `q_fragments`.
+K/V staging uses 8.5 KiB at D=128 and 16.5 KiB at D=256.
+Per-SIMDgroup probabilities and row statistics require an additional `(8*16 + 8*3) * sizeof(float)` bytes.
+Both workspaces are reused across KV iterations. The kernel does not double-buffer them.
+The shared FP8 decoder loads eight cache bytes and produces eight packed BF16 values.
 
-Qwen3-14B has 16 dimension fragments per thread. The `D=256` profiles have 32. An incomplete request tail loads only
-active rows.
-
-```text
-thread-local Q fragments stay resident for the KV split
-                              |
-paged K/V -- each participating lane reads 8 FP8 bytes
-                              |
-                              v
-software E4M3FN decode -- each lane writes 16 packed BF16 bytes
-                              |
-                              v
-threadgroup K[16, D+8] + V[16, D+8] BF16
-                              |
-            Q x K^T, explicit visible-range mask
-                 online-softmax update
-                 probability x V
-                              |
-                thread-local max/sum/output
-                              |
-                  reuse K/V storage for
-                    the next KV iteration
-                              |
-                              v
-partial output[up to max_q_tokens, max_q_heads, D] + statistics
-```
-
-For each K or V row, one participating lane reads a contiguous eight-byte FP8 segment and writes one contiguous
-16-byte BF16 segment. `D=256` uses all 32 lanes. `D=128` uses 16 lanes. This mapping matches the previous 16-byte BF16
-load path because both paths assign eight cache values to each participating lane. A 16-value FP8 packet uses only
-half as many lanes for `D=256` and performs worse on M3 Max.
-
-The two threadgroup tiles occupy 8.5 KiB for Qwen3-14B (`2 * 16 * 136 * sizeof(bf16)`).
-
-The tiles occupy 16.5 KiB for `D=256` (`2 * 16 * 264 * sizeof(bf16)`). Q, scores, running statistics, and output
-fragments are MSL thread-local.
-
-The current kernel has one K workspace and one V workspace. It does not double-buffer consecutive K/V tiles.
+Cooperative-tensor iterators expose logical coordinates. QK and PV exchange row statistics through shared memory.
+The implementation does not assume a device-specific lane layout. `relaxed_precision` remains false.
+Cached prefixes, per-row visibility, causal masking, partial-state layout, and Reduce keep their existing contracts.
+The Map remains one command in the parent ICB and adds no submission or CPU wait.
 
 Both variants reduce partial attention states by rescaling them to one global maximum. `SingleQ` reduces flat
 `[token, Q head, D]` elements.
@@ -1034,7 +1004,8 @@ stable.
 
 Qwen3-14B `SingleQ` uses `kv_tokens_per_iteration=128`, `required_threads=128`, and `max_q_heads=5`.
 
-Qwen3.5 retains `kv_tokens_per_iteration=256`, `required_threads=256`, and `max_q_heads <= 8`.
+Qwen3.5 uses `kv_tokens_per_iteration=256`, `required_threads=128`, and `max_q_heads <= 8`.
+The planning grain stays at 256 KV tokens. The independent thread count limits the block to four SIMDgroups.
 
 The layout groups Q heads by KV head. Each `MapThreadBlockTask` handles one KV head and one Q-head range.
 
@@ -1066,15 +1037,20 @@ remaining coverage.
 
 `gqa/split_kv/single_q_test.rs` compares SplitKV SingleQ with the CPU projected-GQA reference. Its main replay test uses
 one isolated cache and the complete active-count sequence for capacity `8`. Focused cases cover a ragged batch and a
-logical cache block that spans multiple physical page IDs. The cases validate compact KV-split indexing,
+logical cache block that spans multiple physical page IDs, BF16 and F32 activations, and head dimensions up to 256.
+The cases validate compact KV-split indexing,
 online-softmax iteration merging, request slots, page-table lookup, and causal visibility.
 
+The TiledQ tests exercise the default TensorOps Map with both eight-token and sixteen-token KV iterations.
+They use the production recorder and preserve one partial-state ABI.
+They cover all five supported `(D, tokens_per_page)` profiles, non-contiguous pages, a cached prefix, multiple KV
+heads, Q-head tails, multiple Q fragments, sliding visibility, fully masked rows, and padded replay capacity.
+These correctness tests do not measure M5 performance.
+
 `gqa/split_kv/tiled_q_test.rs` compares the BF16-output SplitKV TiledQ map and reduce variant, with an FP8 E4M3FN KV
-cache, against the same CPU reference. One isolated test cache records a total capacity of `8`. The test replays
-`1, 8, 3, 7, 2, 6, 4, 5`. It refreshes the explicit visible ranges for each submission and compares the active output
-with the CPU projected-GQA reference.
-`gqa/split_kv/single_q_test.rs` uses the same active-count sequence and CPU-reference contract. Both tests ignore
-inactive scratch and output tails.
+cache, against the same CPU reference. The replay test uses one isolated cache with a total token capacity
+of `4` and the active-count sequence `1, 4, 3, 2`. The Q-token-tile and map-task capacities stay fixed.
+The paged-range case also verifies that inactive output rows retain their sentinel values.
 
 `gqa/bidi_block_sdpa_test.rs` records one total Q-token-range capacity of `8` and replays
 `1, 8, 3, 7, 2, 6, 4, 5` active ranges. It compares each active partial state and output with a CPU softmax reference.
@@ -1172,7 +1148,7 @@ Use `--split-kv-single-q-kv-tokens-per-iteration`, `--split-kv-single-q-required
 `--split-kv-single-q-max-q-heads` to configure SingleQ. Use `--split-kv-tiled-q-max-q-tokens`,
 `--split-kv-tiled-q-kv-tokens-per-iteration`, and `--split-kv-tiled-q-max-q-heads` to configure TiledQ.
 
-The validation also prints the derived threadgroup/register shape.
+The validation also prints threadgroup memory and logical accumulator counts. These counts do not measure compiler register allocation.
 
 For `qwen35_gqa`, `--gqa-model 27b|35b` selects the real-weight layer profile. Pass the matching model directory with
 `--model-dir`.
