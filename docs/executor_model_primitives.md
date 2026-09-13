@@ -80,6 +80,14 @@ variants. `Selector::select(...)` returns `(affine_quantized::KernelKind, &affin
 validated matrix configuration and row count. The same selection owns kernel tile geometry and topology boundaries.
 `Unembed` supplies model geometry, weights, buffers, and row counts. It must not select a second kernel.
 
+For BF16 vocabulary projections with at least 65,536 outputs, QMM starts at five rows when `hidden_dim <= 2048`.
+It starts at six rows for larger hidden dimensions.
+Once QMM is selected, it uses BM8 through eight rows, BM16 through 16 rows, and BM32 above 16 rows.
+Vocabulary width does not bypass BM8. The replay bucket policy preserves these topology boundaries.
+The backend selects the reduction tile at initialization. Wide projections use BK32 for BM8 and BM16.
+BM32 keeps `BK=min(group_size, 64)` for BF16 operands.
+The smaller reduction tile limits operand staging for wide outputs without adding runtime selection.
+
 Embedding and unembedding share weight lifecycle and replay-capacity conventions. They do not share one GPU selector.
 Embedding is a row lookup. Unembedding is a matrix multiplication.
 

@@ -21,7 +21,7 @@ fn test_adaptive_large_vocabulary_qmm_crossover() {
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5),
-        KernelKind::QmmBm16Bn32
+        KernelKind::QmmBm8Bn32
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5),
@@ -29,7 +29,7 @@ fn test_adaptive_large_vocabulary_qmm_crossover() {
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6),
-        KernelKind::QmmBm16Bn32
+        KernelKind::QmmBm8Bn32
     );
 }
 
@@ -61,8 +61,10 @@ fn test_adaptive_dense_projection_crossover() {
 #[test]
 fn test_adaptive_topology_boundaries_follow_selector() {
     let cases = [
-        (adaptive_config(151_936, 2048, Dtype::Bfloat16), &[5, 17][..]),
-        (adaptive_config(151_936, 5120, Dtype::Bfloat16), &[6, 17][..]),
+        (adaptive_config(151_936, 2048, Dtype::Bfloat16), &[5, 9, 17][..]),
+        (adaptive_config(151_936, 5120, Dtype::Bfloat16), &[6, 9, 17][..]),
+        (adaptive_config(248_320, 2048, Dtype::Bfloat16), &[5, 9, 17][..]),
+        (adaptive_config(248_320, 5120, Dtype::Bfloat16), &[6, 9, 17][..]),
         (adaptive_config(34_816, 5120, Dtype::Bfloat16), &[6, 9, 17][..]),
         (adaptive_config(4096, 4096, Dtype::Bfloat16), &[12, 17][..]),
         (adaptive_config(1024, 2048, Dtype::Bfloat16), &[18][..]),
@@ -578,20 +580,24 @@ fn test_qmm_reference() {
 
 #[test]
 fn test_qmm_bm8_bn32_q4_bf16_reference() {
-    assert_qmm_bm8_bm16_bn32_q4_bf16_reference(8);
+    for n in [32, 65_537] {
+        assert_qmm_bm8_bm16_bn32_q4_bf16_reference(8, n);
+    }
 }
 
 #[test]
 fn test_qmm_bm16_bn32_q4_bf16_reference() {
-    assert_qmm_bm8_bm16_bn32_q4_bf16_reference(16);
+    for n in [32, 65_537] {
+        assert_qmm_bm8_bm16_bn32_q4_bf16_reference(16, n);
+    }
 }
 
-fn assert_qmm_bm8_bm16_bn32_q4_bf16_reference(bm: usize) {
+fn assert_qmm_bm8_bm16_bn32_q4_bf16_reference(bm: usize, n: i32) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 7;
     let config = Config {
-        n: 32,
+        n,
         k: 64,
         group_size: 64,
         bits: 4,

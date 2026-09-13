@@ -238,6 +238,10 @@ component path as the design.
   Compare compiler resource allocation and loop-carried cooperative state before changing the default.
   Preserve zero-length copies, partial dimensions, active job counts, and accepted-prefix CPU-reference checks.
 
+- Compare the remaining BM16 vocabulary projection gap against `ceed86d` on M3 Max.
+  The backend now selects BK32 for wide BM8/BM16 projections.
+  Inspect generated matrix instructions and load layouts before changing the two-SIMDgroup partition or padding.
+
 - Validate the GDN BF16 operand policy on long real-model trajectories and against the upstream mixed-precision paths.
   The correlated-key stress case exceeds the experimental output and state error bounds in
   [`executor_gdn.md`](executor_gdn.md). Keep F32 live state and accumulation while investigating this difference.

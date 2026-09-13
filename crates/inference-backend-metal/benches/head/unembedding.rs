@@ -13,11 +13,12 @@ use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::affine_quantized;
 
 const VOCAB_SIZE: i32 = 151_936;
-const TOKENS: [i32; 8] = [1, 5, 6, 7, 14, 16, 21, 28];
+const TOKENS: [i32; 9] = [1, 5, 6, 7, 8, 14, 16, 21, 28];
 const PROFILES: [Profile; 3] = [Profile::Qwen27, Profile::Qwen35, Profile::DSparkMarkov];
-const MATMUL_PATHS: [MatmulPath; 4] = [
+const MATMUL_PATHS: [MatmulPath; 5] = [
     MatmulPath::Auto,
     MatmulPath::QmvBn8Bk32,
+    MatmulPath::QmmBm8Bn32,
     MatmulPath::QmmBm16Bn32,
     MatmulPath::QmmBm32Bn32,
 ];
@@ -46,6 +47,7 @@ fn bench_unembedding(c: &mut Criterion) {
 enum MatmulPath {
     Auto,
     QmvBn8Bk32,
+    QmmBm8Bn32,
     QmmBm16Bn32,
     QmmBm32Bn32,
 }
@@ -55,6 +57,7 @@ impl MatmulPath {
         match self {
             Self::Auto => "auto",
             Self::QmvBn8Bk32 => "qmv-bn8-bk32",
+            Self::QmmBm8Bn32 => "qmm-bm8-bn32",
             Self::QmmBm16Bn32 => "qmm-bm16-bn32",
             Self::QmmBm32Bn32 => "qmm-bm32-bn32",
         }
@@ -137,6 +140,23 @@ impl UnembeddingFixture {
             },
             MatmulPath::QmvBn8Bk32 => {
                 let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmvBn8Bk32);
+                builder.record(kernel.invoke(
+                    tokens as u32,
+                    ReplayU32::Fixed(tokens as u32),
+                    &logits,
+                    0,
+                    &hidden,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
+            },
+            MatmulPath::QmmBm8Bn32 => {
+                let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmmBm8Bn32);
                 builder.record(kernel.invoke(
                     tokens as u32,
                     ReplayU32::Fixed(tokens as u32),

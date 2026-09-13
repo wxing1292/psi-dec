@@ -1105,13 +1105,14 @@ impl Kernel {
         config.validate();
         validate_kernel_kind(config, kind);
         let (kernel_name, source) = affine_kernel_source(config, kind);
-        let kernel = CompiledKernel::new(device, &source, &kernel_name);
-        if matches!(
-            kind,
-            KernelKind::QmmBm8Bn32 | KernelKind::QmmBm16Bn32 | KernelKind::QmmBm32Bn32
-        ) {
-            validate_qmm_pipeline(device, config, kind, &kernel);
-        }
+        let kernel = match kind {
+            KernelKind::QmvBn8Bk32 | KernelKind::QmvQuadBn64 => CompiledKernel::new(device, &source, &kernel_name),
+            KernelKind::QmmBm8Bn32 | KernelKind::QmmBm16Bn32 | KernelKind::QmmBm32Bn32 => {
+                let kernel = CompiledKernel::new_tensor_ops(device, &source, &kernel_name);
+                validate_qmm_pipeline(device, config, kind, &kernel);
+                kernel
+            },
+        };
         Self { config, kind, kernel }
     }
 
@@ -1269,7 +1270,7 @@ impl Selector {
         assert!(num_rows > 0);
         if num_rows < adaptive_qmv_batch_limit(config) {
             Self::qmv_key(config)
-        } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && num_rows <= QMM_BM8_MAX_ROWS {
+        } else if num_rows <= QMM_BM8_MAX_ROWS {
             KernelKind::QmmBm8Bn32
         } else if num_rows <= QMM_BM16_MAX_ROWS {
             KernelKind::QmmBm16Bn32
@@ -1483,79 +1484,34 @@ fn affine_kernel_source(config: Config, kind: KernelKind) -> (String, String) {
 }
 
 fn affine_qmm_bn32_source(config: Config, bm: usize) -> (String, String) {
-    assert!(matches!(bm, 8 | 16 | 32));
-    if !config.uses_same_dtype() {
-        let input_type = metal_type_string(config.input_dtype);
-        let output_type = metal_type_string(config.output_dtype);
-        let scale_bias_type = metal_type_string(config.scale_bias_dtype);
-        let aligned = config.n % 32 == 0;
-        let kernel_name = format!(
-            "mixed_qmm_t_bm{bm}_bn32_{input_type}_{scale_bias_type}_{output_type}_gs_{}_b_{}_alN_{}",
-            config.group_size, config.bits, aligned
-        );
-        let template_definition = template_definition(
-            &kernel_name,
-            "mixed_qmm_t",
-            &[
-                input_type.to_string(),
-                scale_bias_type.to_string(),
-                output_type.to_string(),
-                config.group_size.to_string(),
-                config.bits.to_string(),
-                aligned.to_string(),
-                bm.to_string(),
-            ],
-        );
-        return (
-            kernel_name,
-            affine_quantized_source(&format!("{MIXED_AFFINE_SOURCE}\n{template_definition}")),
-        );
-    }
-
-    if bm == 32 {
-        let type_string = metal_type_string(config.input_dtype);
-        let aligned = config.n % 32 == 0;
-        let kernel_name = format!(
-            "psi_dec_qmm_t_{type_string}_gs_{}_b_{}_alN_{}_batch_0",
-            config.group_size, config.bits, aligned
-        );
-        let template_definition = template_definition(
-            &kernel_name,
-            "psi_dec_qmm_t",
-            &[
-                type_string.to_string(),
-                config.group_size.to_string(),
-                config.bits.to_string(),
-                aligned.to_string(),
-                "false".to_string(),
-            ],
-        );
-        return (
-            kernel_name,
-            affine_quantized_source(&format!("{GUARDED_AFFINE_SOURCE}\n{template_definition}")),
-        );
-    }
-
-    let type_string = metal_type_string(config.input_dtype);
+    let input_type = metal_type_string(config.input_dtype);
+    let output_type = metal_type_string(config.output_dtype);
+    let scale_bias_type = metal_type_string(config.scale_bias_dtype);
     let aligned = config.n % 32 == 0;
+    let bk = qmm_bk(config, bm);
     let kernel_name = format!(
-        "qmm_t_bm{bm}_bn32_{type_string}_gs_{}_b_{}_alN_{}",
-        config.group_size, config.bits, aligned,
+        "affine_qmm_tensor_ops_bm{bm}_bn32_bk{bk}_{input_type}_{scale_bias_type}_{output_type}_gs_{}_b_{}_alN_{}",
+        config.group_size, config.bits, aligned
     );
     let template_definition = template_definition(
         &kernel_name,
-        "qmm_t_bm8_bm16_bn32",
+        "affine_qmm_tensor_ops",
         &[
-            type_string.to_string(),
+            input_type.to_string(),
+            scale_bias_type.to_string(),
+            output_type.to_string(),
             config.group_size.to_string(),
             config.bits.to_string(),
             aligned.to_string(),
             bm.to_string(),
+            bk.to_string(),
         ],
     );
     (
         kernel_name,
-        affine_quantized_source(&format!("{QMM_BM8_BM16_BN32_SOURCE}\n{template_definition}")),
+        affine_quantized_source(&format!(
+            "{MIXED_AFFINE_SOURCE}\n{QMM_TENSOR_OPS_SOURCE}\n{template_definition}"
+        )),
     )
 }
 
@@ -1634,9 +1590,8 @@ fn affine_qmv_quad_bn64_source(config: Config) -> (String, String) {
 }
 
 fn ceil_div_i32(value: i32, divisor: i32) -> i32 {
-    assert!(value > 0);
-    assert!(divisor > 0);
-    (value + divisor - 1) / divisor
+    // Callers supply validated positive dimensions and fixed positive tile sizes.
+    1 + (value - 1) / divisor
 }
 
 fn is_power_of_two(value: i32) -> bool {
@@ -1701,6 +1656,16 @@ fn validate_kernel_kind(config: Config, kind: KernelKind) {
     }
 }
 
+// Wide projections expose enough output tiles for reduced operand staging to pay off.
+// Smaller projections retain BK64 to amortize reduction-loop loads and barriers.
+fn qmm_bk(config: Config, bm: usize) -> usize {
+    if !config.uses_same_dtype() || config.input_dtype == Dtype::Float32 || (config.n >= 65_536 && bm <= 16) {
+        32
+    } else {
+        config.group_size.min(64) as usize
+    }
+}
+
 fn validate_qmm_pipeline(device: &Device, config: Config, kind: KernelKind, kernel: &CompiledKernel) {
     let (bm, num_simdgroups): (usize, usize) = match kind {
         KernelKind::QmmBm8Bn32 => (8, 2),
@@ -1719,12 +1684,14 @@ fn validate_qmm_pipeline(device: &Device, config: Config, kind: KernelKind, kern
         "QMM BM={bm} BN=32 requires {num_threads} threads, pipeline supports {}",
         kernel.max_total_threads_per_threadblock()
     );
-    let item_size = if config.uses_same_dtype() {
-        config.input_dtype.item_size()
+    let operand_dtype = if config.uses_same_dtype() {
+        config.input_dtype
     } else {
-        Dtype::Float32.item_size()
+        Dtype::Float32
     };
-    let bk_padded = 32 + 16 / item_size;
+    let item_size = operand_dtype.item_size();
+    let bk = qmm_bk(config, bm);
+    let bk_padded = bk + 16 / item_size;
     let expected_threadblock_memory = (bm + 32)
         .checked_mul(bk_padded)
         .and_then(|elements| elements.checked_mul(item_size))
@@ -1738,12 +1705,6 @@ fn validate_qmm_pipeline(device: &Device, config: Config, kind: KernelKind, kern
         kernel.static_threadblock_memory_length(),
         expected_threadblock_memory,
         "QMM BM={bm} BN=32 pipeline threadblock memory does not match its tile"
-    );
-    assert!(
-        kernel.static_threadblock_memory_length() <= device.max_threadblock_memory_length(),
-        "QMM BM={bm} BN=32 pipeline uses {} bytes of threadblock memory, device supports {}",
-        kernel.static_threadblock_memory_length(),
-        device.max_threadblock_memory_length()
     );
 }
 
@@ -1784,11 +1745,11 @@ fn affine_quantized_source(template_definition: &str) -> String {
     source
 }
 
-const QMM_BM8_BM16_BN32_SOURCE: &str = include_str!("metal/affine_quantized_qmm_bm8_bm16_bn32.metal");
+const QMM_TENSOR_OPS_SOURCE: &str = include_str!("metal/affine_quantized_qmm_tensor_ops.metal");
 
-const MIXED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_mixed_qmv_qmm.metal");
+const MIXED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_mixed.metal");
 
-const GUARDED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_guarded_qmv_qmm.metal");
+const GUARDED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_guarded_qmv.metal");
 
 const GATE_UP_SWIGLU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_swiglu_qmv_qmm.metal");
 

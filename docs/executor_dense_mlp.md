@@ -263,12 +263,17 @@ choices so that a replay bucket cannot cross either topology boundary.
 
 `dense_mlp::Compute` owns one adaptive `affine_quantized::Matmul` for gate/up and one for down.
 Each `affine_quantized::Matmul` owns the QMV/QMM candidates and selects its kernel.
+QMM uses Metal TensorOps with F32 cooperative accumulators. The BM8, BM16, and BM32 tiles share
+one implementation in `operators/metal/affine_quantized_qmm_tensor_ops.metal`.
+Each thread block loads an input tile and dequantizes one weight tile into threadgroup memory.
+The SIMDgroups reuse these tiles across output rows. Same-dtype operands keep their existing storage-dtype
+rounding; mixed-dtype operands use F32. QMV remains the small-row path.
 The model and executor provide the complete dense-MLP dimensions and active row count.
 They do not select a kernel or tile.
 
 Large dense MLPs use this policy when `hidden_dim > 4096` or `intermediate_dim > 4096`:
 
-| Active rows | Backend path |
+| Recorded row capacity | Backend path |
 | ---: | --- |
 | 1–5 | QMV |
 | 6–8 | QMM BM8/BN32 |
@@ -276,16 +281,19 @@ Large dense MLPs use this policy when `hidden_dim > 4096` or `intermediate_dim >
 | 17 or more | QMM BM32/BN32 |
 
 Smaller dense MLPs keep QMV for a longer range.
-The QMV limit is 18 rows when both dimensions are at most 2048.
-The QMV limit is 12 rows for the remaining smaller shapes.
+The first QMM row count is 18 when both dimensions are at most 2048.
+The first QMM row count is 12 for the remaining smaller shapes.
 The backend uses BM16/BN32 through 16 rows after that limit.
 It uses BM32/BN32 for larger row counts.
 
 Gate/up and down apply the same backend selector independently.
 They can share a family when their dimensions select the same candidate.
-The 8-row BF16 BM8/BN32 kernel uses 64 threads and 3200 bytes of static threadblock memory.
-The memory contains the `8 × 40` input tile and the `32 × 40` weight tile.
-The `40` stride is `BK=32` plus eight BF16 padding values.
+For group size 64, the 8-row BF16 BM8/BN32 kernel uses 64 threads and 5760 bytes of static threadblock memory.
+The memory contains the `8 × 72` input tile and the `32 × 72` weight tile.
+The stride is `BK` plus 16 bytes of padding. BF16 and F16 operands normally use `BK=min(group_size, 64)`.
+For BM8 and BM16 with at least 65,536 weight rows, the backend selects BK32 at initialization.
+F32 operands always use BK32. The same selection sets the shader constant and validates pipeline scratch.
+The 27B dense MLP retains BK64 for group size 64. Accumulators remain F32 in each case.
 Kernel initialization checks the SIMD width, pipeline thread limit, calculated threadblock memory, reported static
 threadblock memory, and device threadblock-memory limit.
 
