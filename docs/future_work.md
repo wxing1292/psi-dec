@@ -225,7 +225,7 @@ component path as the design.
 
 ## Model and Backend Investigations
 
-- Validate GQA SingleQ and TiledQ and GDN chunkwise TensorOps on M5 hardware before making acceleration claims.
+- Validate GQA SingleQ and TiledQ, GDN chunkwise, affine QMM, and grouped expert TensorOps on M5 hardware before making acceleration claims.
   Local forced-kernel correctness checks run on M3 Max and do not establish M5 throughput or energy efficiency.
   Compare F32 and BF16 matrix operands, tile sizes, prefill selection thresholds, and full-model prefill/decode.
   Keep cached-prefix, per-row visibility, snapshot, and commit parity as gates.
@@ -238,9 +238,12 @@ component path as the design.
   Compare compiler resource allocation and loop-carried cooperative state before changing the default.
   Preserve zero-length copies, partial dimensions, active job counts, and accepted-prefix CPU-reference checks.
 
-- Compare the remaining BM16 vocabulary projection gap against `ceed86d` on M3 Max.
+- Tune affine TensorOps and dense fusion across small and large row counts on M3 and M5.
+  Compare the remaining BM16 vocabulary projection gap against `ceed86d` on M3 Max.
   The backend now selects BK32 for wide BM8/BM16 projections.
   Inspect generated matrix instructions and load layouts before changing the two-SIMDgroup partition or padding.
+  Compare grouped expert batches whose segments remain below the QMM crossover with batches that use QMM.
+  Reduce the overhead of inactive QMM candidates without changing compact routing or replay submission.
 
 - Validate the GDN BF16 operand policy on long real-model trajectories and against the upstream mixed-precision paths.
   The correlated-key stress case exceeds the experimental output and state error bounds in

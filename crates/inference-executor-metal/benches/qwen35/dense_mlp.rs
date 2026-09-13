@@ -107,16 +107,15 @@ impl Args {
 #[derive(Clone, Copy, Debug)]
 enum DenseMLPBenchCase {
     FullAuto,
-    FullQmmBm8Bn32,
-    FullQmmBm16Bn32,
+    FullQmmBm8,
+    FullQmmBm16,
     FullQmvBn8Bk32,
-    FullQmmBm32Bn32,
-    GateUpAuto,
-    GateUpQmmBm8Bn32,
-    GateUpQmmBm16Bn32,
-    GateUpQmvBn8Bk32,
-    GateUpQmmBm32Bn32,
-    SwiGLU,
+    FullQmmBm32,
+    GateUpSwiGLUAuto,
+    GateUpSwiGLUQmmBm8Bn16,
+    GateUpSwiGLUQmmBm16Bn16,
+    GateUpSwiGLUQmvBn8Bk32,
+    GateUpSwiGLUQmmBm32Bn16,
     DownAuto,
     DownQmmBm8Bn32,
     DownQmmBm16Bn32,
@@ -128,16 +127,15 @@ impl DenseMLPBenchCase {
     fn parse(value: &str) -> Self {
         match value {
             "full_auto" => Self::FullAuto,
-            "full_qmm_bm8_bn32" => Self::FullQmmBm8Bn32,
-            "full_qmm_bm16_bn32" => Self::FullQmmBm16Bn32,
+            "full_qmm_bm8" => Self::FullQmmBm8,
+            "full_qmm_bm16" => Self::FullQmmBm16,
             "full_qmv_bn8_bk32" => Self::FullQmvBn8Bk32,
-            "full_qmm_bm32_bn32" => Self::FullQmmBm32Bn32,
-            "gate_up_auto" => Self::GateUpAuto,
-            "gate_up_qmm_bm8_bn32" => Self::GateUpQmmBm8Bn32,
-            "gate_up_qmm_bm16_bn32" => Self::GateUpQmmBm16Bn32,
-            "gate_up_qmv_bn8_bk32" => Self::GateUpQmvBn8Bk32,
-            "gate_up_qmm_bm32_bn32" => Self::GateUpQmmBm32Bn32,
-            "swiglu" => Self::SwiGLU,
+            "full_qmm_bm32" => Self::FullQmmBm32,
+            "gate_up_swiglu_auto" => Self::GateUpSwiGLUAuto,
+            "gate_up_swiglu_qmm_bm8_bn16" => Self::GateUpSwiGLUQmmBm8Bn16,
+            "gate_up_swiglu_qmm_bm16_bn16" => Self::GateUpSwiGLUQmmBm16Bn16,
+            "gate_up_swiglu_qmv_bn8_bk32" => Self::GateUpSwiGLUQmvBn8Bk32,
+            "gate_up_swiglu_qmm_bm32_bn16" => Self::GateUpSwiGLUQmmBm32Bn16,
             "down_auto" => Self::DownAuto,
             "down_qmm_bm8_bn32" => Self::DownQmmBm8Bn32,
             "down_qmm_bm16_bn32" => Self::DownQmmBm16Bn32,
@@ -150,16 +148,15 @@ impl DenseMLPBenchCase {
     fn key(self) -> &'static str {
         match self {
             Self::FullAuto => "full_auto",
-            Self::FullQmmBm8Bn32 => "full_qmm_bm8_bn32",
-            Self::FullQmmBm16Bn32 => "full_qmm_bm16_bn32",
+            Self::FullQmmBm8 => "full_qmm_bm8",
+            Self::FullQmmBm16 => "full_qmm_bm16",
             Self::FullQmvBn8Bk32 => "full_qmv_bn8_bk32",
-            Self::FullQmmBm32Bn32 => "full_qmm_bm32_bn32",
-            Self::GateUpAuto => "gate_up_auto",
-            Self::GateUpQmmBm8Bn32 => "gate_up_qmm_bm8_bn32",
-            Self::GateUpQmmBm16Bn32 => "gate_up_qmm_bm16_bn32",
-            Self::GateUpQmvBn8Bk32 => "gate_up_qmv_bn8_bk32",
-            Self::GateUpQmmBm32Bn32 => "gate_up_qmm_bm32_bn32",
-            Self::SwiGLU => "swiglu",
+            Self::FullQmmBm32 => "full_qmm_bm32",
+            Self::GateUpSwiGLUAuto => "gate_up_swiglu_auto",
+            Self::GateUpSwiGLUQmmBm8Bn16 => "gate_up_swiglu_qmm_bm8_bn16",
+            Self::GateUpSwiGLUQmmBm16Bn16 => "gate_up_swiglu_qmm_bm16_bn16",
+            Self::GateUpSwiGLUQmvBn8Bk32 => "gate_up_swiglu_qmv_bn8_bk32",
+            Self::GateUpSwiGLUQmmBm32Bn16 => "gate_up_swiglu_qmm_bm32_bn16",
             Self::DownAuto => "down_auto",
             Self::DownQmmBm8Bn32 => "down_qmm_bm8_bn32",
             Self::DownQmmBm16Bn32 => "down_qmm_bm16_bn32",
@@ -176,12 +173,11 @@ struct RealDenseMLPFixture<'a> {
     compute: dense_mlp::Compute,
     hidden_state: Buffer,
     output: Buffer,
-    gate_up: Buffer,
     swiglu: Buffer,
-    gate_up_qmv_bn8_bk32: affine_quantized::Kernel,
-    gate_up_qmm_bm8_bn32: affine_quantized::Kernel,
-    gate_up_qmm_bm16_bn32: affine_quantized::Kernel,
-    gate_up_qmm_bm32_bn32: affine_quantized::Kernel,
+    gate_up_swiglu_qmv_bn8_bk32: affine_quantized::Kernel,
+    gate_up_swiglu_qmm_bm8_bn16: affine_quantized::Kernel,
+    gate_up_swiglu_qmm_bm16_bn16: affine_quantized::Kernel,
+    gate_up_swiglu_qmm_bm32_bn16: affine_quantized::Kernel,
     down_qmv_bn8_bk32: affine_quantized::Kernel,
     down_qmm_bm8_bn32: affine_quantized::Kernel,
     down_qmm_bm16_bn32: affine_quantized::Kernel,
@@ -227,30 +223,26 @@ impl<'a> RealDenseMLPFixture<'a> {
             compute: dense_mlp::Compute::new(device, config),
             hidden_state,
             output: Buffer::new_zeroed(device, down_config.output_bytes(m)),
-            gate_up: Buffer::from_slice(
-                device,
-                &hidden_fixture(num_tokens as usize, (INTERMEDIATE_DIM * 2) as usize),
-            ),
             swiglu: Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, INTERMEDIATE_DIM as usize)),
-            gate_up_qmv_bn8_bk32: affine_quantized::Kernel::new(
+            gate_up_swiglu_qmv_bn8_bk32: affine_quantized::Kernel::new_gate_up_swiglu(
                 device,
                 gate_up_config,
                 affine_quantized::KernelKind::QmvBn8Bk32,
             ),
-            gate_up_qmm_bm8_bn32: affine_quantized::Kernel::new(
+            gate_up_swiglu_qmm_bm8_bn16: affine_quantized::Kernel::new_gate_up_swiglu(
                 device,
                 gate_up_config,
-                affine_quantized::KernelKind::QmmBm8Bn32,
+                affine_quantized::KernelKind::QmmBm8Bn16,
             ),
-            gate_up_qmm_bm16_bn32: affine_quantized::Kernel::new(
+            gate_up_swiglu_qmm_bm16_bn16: affine_quantized::Kernel::new_gate_up_swiglu(
                 device,
                 gate_up_config,
-                affine_quantized::KernelKind::QmmBm16Bn32,
+                affine_quantized::KernelKind::QmmBm16Bn16,
             ),
-            gate_up_qmm_bm32_bn32: affine_quantized::Kernel::new(
+            gate_up_swiglu_qmm_bm32_bn16: affine_quantized::Kernel::new_gate_up_swiglu(
                 device,
                 gate_up_config,
-                affine_quantized::KernelKind::QmmBm32Bn32,
+                affine_quantized::KernelKind::QmmBm32Bn16,
             ),
             down_qmv_bn8_bk32: affine_quantized::Kernel::new(
                 device,
@@ -279,37 +271,26 @@ impl<'a> RealDenseMLPFixture<'a> {
     fn replay(&self, case: DenseMLPBenchCase) -> ReplayProgram {
         match case {
             DenseMLPBenchCase::FullAuto => self.forward_replay(),
-            DenseMLPBenchCase::FullQmmBm8Bn32 => self.forced_full_replay(DenseAffinePolicy::QmmBm8Bn32),
-            DenseMLPBenchCase::FullQmmBm16Bn32 => self.forced_full_replay(DenseAffinePolicy::QmmBm16Bn32),
+            DenseMLPBenchCase::FullQmmBm8 => self.forced_full_replay(DenseAffinePolicy::QmmBm8Bn32),
+            DenseMLPBenchCase::FullQmmBm16 => self.forced_full_replay(DenseAffinePolicy::QmmBm16Bn32),
             DenseMLPBenchCase::FullQmvBn8Bk32 => self.forced_full_replay(DenseAffinePolicy::QmvBn8Bk32),
-            DenseMLPBenchCase::FullQmmBm32Bn32 => self.forced_full_replay(DenseAffinePolicy::QmmBm32Bn32),
-            DenseMLPBenchCase::GateUpAuto => {
+            DenseMLPBenchCase::FullQmmBm32 => self.forced_full_replay(DenseAffinePolicy::QmmBm32Bn32),
+            DenseMLPBenchCase::GateUpSwiGLUAuto => {
                 build_single_invocation_replay(
                     &self.stream,
-                    self.compute.invoke_gate_up(
+                    self.compute.invoke_gate_up_swiglu(
                         self.shape,
                         ReplayU32::Fixed(self.shape.num_total_tokens),
                         &self.hidden_state,
-                        &self.gate_up,
+                        &self.swiglu,
                         self.weights.as_borrowed(),
                     ),
                 )
             },
-            DenseMLPBenchCase::GateUpQmmBm8Bn32 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm8Bn32),
-            DenseMLPBenchCase::GateUpQmmBm16Bn32 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm16Bn32),
-            DenseMLPBenchCase::GateUpQmvBn8Bk32 => self.forced_gate_up_replay(DenseAffinePolicy::QmvBn8Bk32),
-            DenseMLPBenchCase::GateUpQmmBm32Bn32 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm32Bn32),
-            DenseMLPBenchCase::SwiGLU => {
-                build_single_invocation_replay(
-                    &self.stream,
-                    self.compute.invoke_swiglu(
-                        self.shape,
-                        ReplayU32::Fixed(self.shape.num_total_tokens),
-                        &self.gate_up,
-                        &self.swiglu,
-                    ),
-                )
-            },
+            DenseMLPBenchCase::GateUpSwiGLUQmmBm8Bn16 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm8Bn32),
+            DenseMLPBenchCase::GateUpSwiGLUQmmBm16Bn16 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm16Bn32),
+            DenseMLPBenchCase::GateUpSwiGLUQmvBn8Bk32 => self.forced_gate_up_replay(DenseAffinePolicy::QmvBn8Bk32),
+            DenseMLPBenchCase::GateUpSwiGLUQmmBm32Bn16 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm32Bn32),
             DenseMLPBenchCase::DownAuto => {
                 build_single_invocation_replay(
                     &self.stream,
@@ -339,10 +320,7 @@ impl<'a> RealDenseMLPFixture<'a> {
                 num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
                 hidden_state: &self.hidden_state,
                 next_hidden_state: &self.output,
-                scratch: DenseMLPScratchBindings {
-                    gate_up: &self.gate_up,
-                    swiglu: &self.swiglu,
-                },
+                scratch: DenseMLPScratchBindings { swiglu: &self.swiglu },
                 weights: self.weights.as_borrowed(),
             },
         );
@@ -356,12 +334,6 @@ impl<'a> RealDenseMLPFixture<'a> {
     fn forced_full_replay(&self, policy: DenseAffinePolicy) -> ReplayProgram {
         let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
         self.record_forced_gate_up(&mut recorder, policy);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_swiglu(
-            self.shape,
-            ReplayU32::Fixed(self.shape.num_total_tokens),
-            &self.gate_up,
-            &self.swiglu,
-        )));
         self.record_forced_down(&mut recorder, policy);
         recorder.build()
     }
@@ -384,16 +356,16 @@ impl<'a> RealDenseMLPFixture<'a> {
         policy: DenseAffinePolicy,
     ) {
         let kernel = match policy {
-            DenseAffinePolicy::QmvBn8Bk32 => &self.gate_up_qmv_bn8_bk32,
-            DenseAffinePolicy::QmmBm8Bn32 => &self.gate_up_qmm_bm8_bn32,
-            DenseAffinePolicy::QmmBm16Bn32 => &self.gate_up_qmm_bm16_bn32,
-            DenseAffinePolicy::QmmBm32Bn32 => &self.gate_up_qmm_bm32_bn32,
+            DenseAffinePolicy::QmvBn8Bk32 => &self.gate_up_swiglu_qmv_bn8_bk32,
+            DenseAffinePolicy::QmmBm8Bn32 => &self.gate_up_swiglu_qmm_bm8_bn16,
+            DenseAffinePolicy::QmmBm16Bn32 => &self.gate_up_swiglu_qmm_bm16_bn16,
+            DenseAffinePolicy::QmmBm32Bn32 => &self.gate_up_swiglu_qmm_bm32_bn16,
         };
         let weights = self.weights.as_borrowed();
         recorder.record_with_barrier_before(ReplayOp::opaque(kernel.invoke(
             self.shape.num_total_tokens,
             ReplayU32::Fixed(self.shape.num_total_tokens),
-            &self.gate_up,
+            &self.swiglu,
             0,
             &self.hidden_state,
             0,
@@ -691,9 +663,10 @@ dense_mlp real-weight replay bench
 Options:
   --model-dir PATH
   --tokens 1,2,4,8,10,16,32,64
-  --cases full_auto,full_qmv_bn8_bk32,full_qmm_bm8_bn32,full_qmm_bm16_bn32,full_qmm_bm32_bn32,gate_up_auto,\
-         gate_up_qmv_bn8_bk32,gate_up_qmm_bm8_bn32,gate_up_qmm_bm16_bn32,gate_up_qmm_bm32_bn32,swiglu,down_auto,\
-         down_qmv_bn8_bk32,down_qmm_bm8_bn32,down_qmm_bm16_bn32,down_qmm_bm32_bn32
+  --cases full_auto,full_qmv_bn8_bk32,full_qmm_bm8,full_qmm_bm16,full_qmm_bm32,gate_up_swiglu_auto,\
+         gate_up_swiglu_qmv_bn8_bk32,gate_up_swiglu_qmm_bm8_bn16,gate_up_swiglu_qmm_bm16_bn16,\
+         gate_up_swiglu_qmm_bm32_bn16,down_auto,down_qmv_bn8_bk32,down_qmm_bm8_bn32,down_qmm_bm16_bn32,\
+         down_qmm_bm32_bn32
   --iters N
   --warmup-iters N
   --runs N

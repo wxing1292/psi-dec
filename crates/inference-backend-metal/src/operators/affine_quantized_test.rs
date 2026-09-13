@@ -16,19 +16,19 @@ fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> Config {
 #[test]
 fn test_adaptive_large_vocabulary_qmm_crossover() {
     assert_eq!(
-        Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 4),
+        Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 4, Epilogue::Identity),
         KernelKind::QmvBn8Bk32
     );
     assert_eq!(
-        Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5),
+        Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5, Epilogue::Identity),
         KernelKind::QmmBm8Bn32
     );
     assert_eq!(
-        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5, Epilogue::Identity),
         KernelKind::QmvBn8Bk32
     );
     assert_eq!(
-        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6, Epilogue::Identity),
         KernelKind::QmmBm8Bn32
     );
 }
@@ -36,11 +36,11 @@ fn test_adaptive_large_vocabulary_qmm_crossover() {
 #[test]
 fn test_adaptive_qmm_tile_crossover() {
     assert_eq!(
-        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 16),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 16, Epilogue::Identity),
         KernelKind::QmmBm16Bn32
     );
     assert_eq!(
-        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 17),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 17, Epilogue::Identity),
         KernelKind::QmmBm32Bn32
     );
 }
@@ -48,14 +48,32 @@ fn test_adaptive_qmm_tile_crossover() {
 #[test]
 fn test_adaptive_dense_projection_crossover() {
     let large_projection = adaptive_config(34_816, 5120, Dtype::Bfloat16);
-    assert_eq!(Selector::key(large_projection, 5), KernelKind::QmvBn8Bk32);
-    assert_eq!(Selector::key(large_projection, 6), KernelKind::QmmBm8Bn32);
-    assert_eq!(Selector::key(large_projection, 8), KernelKind::QmmBm8Bn32);
-    assert_eq!(Selector::key(large_projection, 9), KernelKind::QmmBm16Bn32);
+    assert_eq!(
+        Selector::key(large_projection, 5, Epilogue::Identity),
+        KernelKind::QmvBn8Bk32
+    );
+    assert_eq!(
+        Selector::key(large_projection, 6, Epilogue::Identity),
+        KernelKind::QmmBm8Bn32
+    );
+    assert_eq!(
+        Selector::key(large_projection, 8, Epilogue::Identity),
+        KernelKind::QmmBm8Bn32
+    );
+    assert_eq!(
+        Selector::key(large_projection, 9, Epilogue::Identity),
+        KernelKind::QmmBm16Bn32
+    );
 
     let common_projection = adaptive_config(1024, 2048, Dtype::Bfloat16);
-    assert_eq!(Selector::key(common_projection, 8), KernelKind::QmvBn8Bk32);
-    assert_eq!(Selector::key(common_projection, 18), KernelKind::QmmBm32Bn32);
+    assert_eq!(
+        Selector::key(common_projection, 8, Epilogue::Identity),
+        KernelKind::QmvBn8Bk32
+    );
+    assert_eq!(
+        Selector::key(common_projection, 18, Epilogue::Identity),
+        KernelKind::QmmBm32Bn32
+    );
 }
 
 #[test]
@@ -70,18 +88,24 @@ fn test_adaptive_topology_boundaries_follow_selector() {
         (adaptive_config(1024, 2048, Dtype::Bfloat16), &[18][..]),
     ];
 
-    for (config, expected) in cases {
-        assert_eq!(&*adaptive_topology_boundaries(config), expected, "config={config:?}");
-
-        let boundaries = adaptive_topology_boundaries(config);
-        let policy = ReplayBucketPolicy::with_topology_boundaries(64, &boundaries);
-        for num_active_rows in 1..=64 {
-            let num_total_rows = policy.capacity(num_active_rows);
+    for epilogue in [Epilogue::Identity, Epilogue::SwiGLU] {
+        for (config, expected) in cases {
             assert_eq!(
-                Selector::key(config, num_active_rows as i32),
-                Selector::key(config, num_total_rows as i32),
-                "config={config:?} num_active_rows={num_active_rows} num_total_rows={num_total_rows}"
+                &*adaptive_topology_boundaries(config, epilogue),
+                expected,
+                "config={config:?}"
             );
+
+            let boundaries = adaptive_topology_boundaries(config, epilogue);
+            let policy = ReplayBucketPolicy::with_topology_boundaries(64, &boundaries);
+            for num_active_rows in 1..=64 {
+                let num_total_rows = policy.capacity(num_active_rows);
+                assert_eq!(
+                    Selector::key(config, num_active_rows as i32, epilogue),
+                    Selector::key(config, num_total_rows as i32, epilogue),
+                    "config={config:?} num_active_rows={num_active_rows} num_total_rows={num_total_rows}"
+                );
+            }
         }
     }
 }
@@ -422,7 +446,7 @@ fn test_qmv_reference() {
 
     execute_matmul(
         &stream,
-        Kernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m, Epilogue::Identity)).invoke(
             m as u32,
             ReplayU32::Fixed(m as u32),
             &output,
@@ -486,7 +510,7 @@ fn test_qmv_fast_reference() {
 
     execute_matmul(
         &stream,
-        Kernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m, Epilogue::Identity)).invoke(
             m as u32,
             ReplayU32::Fixed(m as u32),
             &output,
@@ -547,7 +571,7 @@ fn test_qmm_reference() {
 
     execute_matmul(
         &stream,
-        Kernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m, Epilogue::Identity)).invoke(
             m as u32,
             ReplayU32::Fixed(m as u32),
             &output,
@@ -713,7 +737,7 @@ fn test_qmv_bf16() {
 
     execute_matmul(
         &stream,
-        Kernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m, Epilogue::Identity)).invoke(
             m as u32,
             ReplayU32::Fixed(m as u32),
             &output,
@@ -791,7 +815,7 @@ fn test_qmv_fast_bf16() {
 
     execute_matmul(
         &stream,
-        Kernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m, Epilogue::Identity)).invoke(
             m as u32,
             ReplayU32::Fixed(m as u32),
             &output,
@@ -866,7 +890,7 @@ fn test_qmm_bf16() {
 
     execute_matmul(
         &stream,
-        Kernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m, Epilogue::Identity)).invoke(
             m as u32,
             ReplayU32::Fixed(m as u32),
             &output,

@@ -549,10 +549,6 @@ impl MoEForwardFixture {
             ),
         };
         let shared_scratch = DenseMLPScratch {
-            gate_up: Buffer::new_zeroed(
-                device,
-                num_tokens as usize * INTERMEDIATE_DIM as usize * 2 * Dtype::Bfloat16.item_size(),
-            ),
             swiglu: Buffer::new_zeroed(device, dense_config.swiglu_bytes(dense_shape)),
         };
         let replay = build_moe_forward_replay(
@@ -1172,16 +1168,12 @@ impl DenseMLPWeights {
 }
 
 struct DenseMLPScratch {
-    gate_up: Buffer,
     swiglu: Buffer,
 }
 
 impl DenseMLPScratch {
     fn as_borrowed(&self) -> dense_mlp::Scratch<'_> {
-        dense_mlp::Scratch {
-            gate_up: &self.gate_up,
-            swiglu: &self.swiglu,
-        }
+        dense_mlp::Scratch { swiglu: &self.swiglu }
     }
 }
 

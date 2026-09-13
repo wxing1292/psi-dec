@@ -122,7 +122,6 @@ impl QuantizedDenseMLPFixture {
             replay_next_hidden_state: Buffer::new_zeroed(device, down_config.output_bytes(tokens_i32)),
         };
         let scratch = QuantizedDenseMLPOwnedScratch {
-            gate_up: Buffer::new_zeroed(device, gate_up_config.output_bytes(tokens_i32)),
             swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape)),
             replay_swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape)),
         };
@@ -191,11 +190,11 @@ fn build_gate_up_swiglu_replay(
     weights: &QuantizedDenseMLPOwnedWeights,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(compute.invoke_gate_up(
+    builder.record(compute.invoke_gate_up_swiglu(
         shape,
         inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         &buffers.hidden_state,
-        &scratch.gate_up,
+        &scratch.swiglu,
         dense_mlp::Weights {
             gate_up_weight: &weights.gate_up_weight,
             gate_up_scales: &weights.gate_up_scales,
@@ -204,12 +203,6 @@ fn build_gate_up_swiglu_replay(
             down_scales: &weights.down_scales,
             down_biases: &weights.down_biases,
         },
-    ));
-    builder.record_with_barrier_before(compute.invoke_swiglu(
-        shape,
-        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
-        &scratch.gate_up,
-        &scratch.swiglu,
     ));
     builder.build()
 }
@@ -231,7 +224,6 @@ fn build_forward_replay(
             next_hidden_state: &buffers.replay_next_hidden_state,
         },
         dense_mlp::Scratch {
-            gate_up: &scratch.gate_up,
             swiglu: &scratch.replay_swiglu,
         },
         dense_mlp::Weights {
@@ -252,7 +244,6 @@ struct QuantizedDenseMLPOwnedBuffers {
 }
 
 struct QuantizedDenseMLPOwnedScratch {
-    gate_up: Buffer,
     swiglu: Buffer,
     replay_swiglu: Buffer,
 }

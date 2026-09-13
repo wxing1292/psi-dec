@@ -605,7 +605,6 @@ impl GatedMoE {
                 next_hidden_state: scratch.hidden,
             },
             dense_mlp::Scratch {
-                gate_up: scratch.dense_mlp.gate_up,
                 swiglu: scratch.dense_mlp.swiglu,
             },
             weights.shared_experts,

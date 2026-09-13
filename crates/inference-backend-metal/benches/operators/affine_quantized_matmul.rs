@@ -94,6 +94,10 @@ impl BenchKernel {
     fn name(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Exact(affine_quantized::KernelKind::QmvBn4Bk32) => "qmv-bn4-bk32",
+            Self::Exact(affine_quantized::KernelKind::QmmBm8Bn16) => "qmm-bm8-bn16",
+            Self::Exact(affine_quantized::KernelKind::QmmBm16Bn16) => "qmm-bm16-bn16",
+            Self::Exact(affine_quantized::KernelKind::QmmBm32Bn16) => "qmm-bm32-bn16",
             Self::Exact(affine_quantized::KernelKind::QmvBn8Bk32) => "qmv-bn8-bk32",
             Self::Exact(affine_quantized::KernelKind::QmvQuadBn64) => "qmv-quad-bn64",
             Self::Exact(affine_quantized::KernelKind::QmmBm8Bn32) => "qmm-bm8-bn32",

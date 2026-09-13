@@ -207,17 +207,12 @@ METAL_FUNC void qmv_gate_up_swiglu(
 }
 
 template <typename T, const int group_size, const int bits>
-[[kernel]] void dense_gate_up_swiglu(
-    const device uint32_t* w [[buffer(0)]],
-    const device T* scales [[buffer(1)]],
-    const device T* biases [[buffer(2)]],
-    const device T* x [[buffer(3)]],
-    device T* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+[[kernel]] void
+dense_gate_up_swiglu(const device uint32_t *w [[buffer(0)]], const device T *scales [[buffer(1)]],
+                     const device T *biases [[buffer(2)]], const device T *x [[buffer(3)]], device T *y [[buffer(4)]],
+                     const constant int &in_vec_size [[buffer(5)]], const constant int &out_vec_size [[buffer(6)]],
+                     uint3 tid [[threadgroup_position_in_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]],
+                     uint simd_lid [[thread_index_in_simdgroup]]) {
   const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
       (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
   const int in_vec_size_g = in_vec_size / group_size;

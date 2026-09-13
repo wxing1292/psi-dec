@@ -358,7 +358,6 @@ impl ForcedMoEKernels {
                 next_hidden_state: scratch.hidden,
             },
             dense_mlp::Scratch {
-                gate_up: scratch.dense_mlp.gate_up,
                 swiglu: scratch.dense_mlp.swiglu,
             },
             weights.shared_experts,
@@ -462,10 +461,6 @@ impl<'a> RealMoEFixture<'a> {
             Buffer::new_zeroed(device, shared_expert_gate_config.output_bytes(num_tokens_i32));
         let output = Buffer::new_zeroed(device, combine_config.output_bytes(combine_shape));
         let shared_scratch = DenseMLPScratch {
-            gate_up: Buffer::new_zeroed(
-                device,
-                num_tokens as usize * INTERMEDIATE_DIM as usize * 2 * Dtype::Bfloat16.item_size(),
-            ),
             swiglu: Buffer::new_zeroed(device, dense_config.swiglu_bytes(dense_shape)),
         };
         let kernels = ForcedMoEKernels::new(device);
@@ -824,16 +819,12 @@ impl DenseMLPWeights {
 }
 
 struct DenseMLPScratch {
-    gate_up: Buffer,
     swiglu: Buffer,
 }
 
 impl DenseMLPScratch {
     fn as_borrowed(&self) -> dense_mlp::Scratch<'_> {
-        dense_mlp::Scratch {
-            gate_up: &self.gate_up,
-            swiglu: &self.swiglu,
-        }
+        dense_mlp::Scratch { swiglu: &self.swiglu }
     }
 
     fn as_shared_scratch<'a>(
@@ -844,10 +835,7 @@ impl DenseMLPScratch {
         SharedExpertsScratchBindings {
             hidden: shared_hidden,
             gate_logits: shared_expert_gate_logits,
-            dense_mlp: DenseMLPScratchBindings {
-                gate_up: &self.gate_up,
-                swiglu: &self.swiglu,
-            },
+            dense_mlp: DenseMLPScratchBindings { swiglu: &self.swiglu },
         }
     }
 }

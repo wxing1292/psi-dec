@@ -76,7 +76,6 @@ impl ReplayLayer for DenseMLP {
             next_hidden_state: input.next_hidden_state,
         };
         let scratch = dense_mlp::Scratch {
-            gate_up: input.scratch.gate_up,
             swiglu: input.scratch.swiglu,
         };
         let invocation = self.compute.invoke(

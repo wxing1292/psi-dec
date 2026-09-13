@@ -15,20 +15,30 @@ use crate::test_support::ReplayTestCache;
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.dense_mlp.num_active_tokens");
 
 #[test]
-fn test_replay_matches_reference_across_active_counts_layouts_and_topologies() {
+fn test_replay_bucketing() {
     for (config, cases) in [
         (
             standard_config(),
             &[
-                (4_u32, &[1_u32, 4, 2, 3][..], 0x1000_0001_u32),
-                (8, &[1_u32, 8, 3, 7, 2, 6, 4, 5][..], 0x1000_0002),
+                (4_u32, &[1_u32, 4, 3, 2][..], 0x1000_0001_u32),
+                (8, &[1_u32, 8, 7, 3][..], 0x1000_0002),
                 (12, &[9_u32, 12, 10, 11][..], 0x1000_0003),
                 (20, &[17_u32, 20, 18, 19][..], 0x1000_0004),
             ][..],
         ),
         (
+            Config {
+                hidden_dim: 512,
+                ..standard_config()
+            },
+            &[(4_u32, &[1_u32, 4, 3, 2][..], 0x3000_0001_u32)][..],
+        ),
+        (
             mixed_layout_config(),
-            &[(8_u32, &[1_u32, 8, 3, 7, 2, 6, 4, 5][..], 0x2000_0001_u32)][..],
+            &[
+                (8_u32, &[1_u32, 8, 7, 3][..], 0x2000_0001_u32),
+                (20, &[1_u32, 20, 18, 3][..], 0x2000_0002),
+            ][..],
         ),
     ] {
         let fixture = DenseMLPFixture::new(20, config);
@@ -55,7 +65,6 @@ struct DenseMLPFixture {
     num_allocated_tokens: u32,
     hidden_state: Buffer,
     next_hidden_state: Buffer,
-    gate_up: Buffer,
     swiglu: Buffer,
     weights: DenseMLPWeights,
 }
@@ -72,7 +81,6 @@ impl DenseMLPFixture {
         Self {
             hidden_state: Buffer::new_zeroed(&device, config.input_bytes(shape)),
             next_hidden_state: Buffer::new_zeroed(&device, config.output_bytes(shape)),
-            gate_up: Buffer::new_zeroed(&device, config.gate_up_output_bytes(shape)),
             swiglu: Buffer::new_zeroed(&device, config.swiglu_bytes(shape)),
             stream,
             config,
@@ -91,10 +99,7 @@ impl DenseMLPFixture {
                 hidden_state: &self.hidden_state,
                 next_hidden_state: &self.next_hidden_state,
             },
-            Scratch {
-                gate_up: &self.gate_up,
-                swiglu: &self.swiglu,
-            },
+            Scratch { swiglu: &self.swiglu },
             self.weights.bindings(),
         ));
         builder.build()
