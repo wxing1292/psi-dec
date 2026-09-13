@@ -311,6 +311,7 @@ impl ForcedMoEKernels {
                         sparse_mlp::ExpertMajorBuffers {
                             packed_input: scratch.topk_experts.packed_input,
                             experts_by_route: scratch.topk_experts.experts_by_route,
+                            expert_offsets: scratch.topk_experts.expert_offsets,
                             packed_output: scratch.topk_experts.routed_hidden,
                         },
                         sparse_mlp::Scratch {

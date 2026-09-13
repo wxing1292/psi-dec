@@ -686,7 +686,11 @@ impl MoEForwardFixture {
             replay,
             expert_major_replay,
         };
-        fixture.assert_token_major_and_expert_major_replay_match_bitwise();
+        fixture.assert_token_major_and_expert_major_replay_match();
+        let counts = fixture.expert_counts.read_typed::<u32>(0, NUM_EXPERTS as usize);
+        let active = counts.iter().filter(|&&count| count > 0).count();
+        let max_rows = counts.iter().copied().max().unwrap();
+        eprintln!("MoE fixture tokens={num_tokens} active_experts={active} max_rows_per_expert={max_rows}");
         fixture
     }
 
@@ -782,7 +786,7 @@ impl MoEForwardFixture {
         }
     }
 
-    fn assert_token_major_and_expert_major_replay_match_bitwise(&self) {
+    fn assert_token_major_and_expert_major_replay_match(&self) {
         self.run_token_major_replay();
         self.run_expert_major_replay();
         let replay = self
@@ -791,10 +795,16 @@ impl MoEForwardFixture {
         let expert_major = self
             .expert_major_output
             .read_typed::<u16>(0, self.expert_major_output.len_bytes() / size_of::<u16>());
-        assert_eq!(
-            replay, expert_major,
-            "MoE forward token_major and expert_major output bits must match"
-        );
+        // QMM and QMV use different F32 reduction orders. Use the sparse
+        // owner's CPU-reference tolerance instead of requiring identical bits.
+        for (index, (&expected, &actual)) in replay.iter().zip(&expert_major).enumerate() {
+            let expected = half::bf16::from_bits(expected).to_f32();
+            let actual = half::bf16::from_bits(actual).to_f32();
+            assert!(
+                (actual - expected).abs() <= 2.0e-5 + 8.0e-3 * expected.abs(),
+                "MoE token-major/expert-major mismatch at {index}: expected={expected}, actual={actual}"
+            );
+        }
     }
 }
 
@@ -1050,6 +1060,7 @@ where
         sparse_mlp::ExpertMajorBuffers {
             packed_input: record.packed_input,
             experts_by_route: record.experts_by_route,
+            expert_offsets: record.expert_offsets,
             packed_output: record.routed_hidden,
         },
         sparse_mlp::Scratch {

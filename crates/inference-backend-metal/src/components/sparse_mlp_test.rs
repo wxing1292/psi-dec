@@ -15,7 +15,6 @@ use crate::metal::Stream;
 use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.sparse_mlp.num_active_tokens");
-const ACTIVE_SEQUENCE: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Layout {
@@ -24,15 +23,22 @@ enum Layout {
 }
 
 #[test]
-fn test_replay_matches_reference_across_active_counts_layouts_and_topologies() {
-    for intermediate_dim in [64, 512] {
-        let fixture = SparseMLPFixture::new(8, 2, intermediate_dim);
+fn test_replay_bucketing() {
+    for (num_total_tokens, intermediate_dim, group_size, active_sequence) in [
+        (4, 64, 32, [1, 4, 3, 2]),
+        (17, 512, 32, [1, 17, 16, 3]),
+        // Nine tokens put three-row QMV and four-row QMM segments in one replay.
+        (49, 64, 32, [1, 49, 9, 10]),
+        // Two F32 K tiles share each quantization group, including mixed QMV/QMM segments.
+        (49, 64, 64, [1, 49, 9, 10]),
+    ] {
+        let fixture = SparseMLPFixture::new(num_total_tokens, 2, intermediate_dim, group_size);
         let mut cache = ReplayTestCache::new();
         for layout in [Layout::TokenMajor, Layout::ExpertMajor] {
             let key = (fixture.num_total_tokens, intermediate_dim, layout);
             let (_, cache_hit) = cache.record(key, || fixture.replay(layout));
             assert!(!cache_hit);
-            for (case_index, num_active_tokens) in ACTIVE_SEQUENCE.into_iter().enumerate() {
+            for (case_index, num_active_tokens) in active_sequence.into_iter().enumerate() {
                 let work = fixture.write_work(
                     num_active_tokens,
                     0x8100_0000_u32
@@ -62,20 +68,21 @@ struct SparseMLPFixture {
     token_major_swiglu: Buffer,
     expert_major_input: Buffer,
     experts_by_route: Buffer,
+    expert_offsets: Buffer,
     expert_major_output: Buffer,
     expert_major_swiglu: Buffer,
     weights: SparseMLPWeights,
 }
 
 impl SparseMLPFixture {
-    fn new(num_total_tokens: u32, num_experts_per_token: u32, intermediate_dim: u32) -> Self {
+    fn new(num_total_tokens: u32, num_experts_per_token: u32, intermediate_dim: u32, group_size: u32) -> Self {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = Config {
             num_experts: 5,
             hidden_dim: 64,
             intermediate_dim,
-            group_size: 32,
+            group_size,
             bits: 4,
             dtype: Dtype::Bfloat16,
         };
@@ -101,6 +108,7 @@ impl SparseMLPFixture {
             token_major_swiglu: Buffer::new_zeroed(&device, config.swiglu_bytes(num_total_routes)),
             expert_major_input: Buffer::new_zeroed(&device, config.expert_major_input_bytes(expert_shape)),
             experts_by_route: Buffer::new_zeroed(&device, route_index_bytes),
+            expert_offsets: Buffer::new_zeroed(&device, (config.num_experts as usize + 1) * size_of::<u32>()),
             expert_major_output: Buffer::new_zeroed(&device, config.expert_major_output_bytes(expert_shape)),
             expert_major_swiglu: Buffer::new_zeroed(&device, config.swiglu_bytes(num_total_routes)),
             stream,
@@ -164,6 +172,7 @@ impl SparseMLPFixture {
                     ExpertMajorBuffers {
                         packed_input: &self.expert_major_input,
                         experts_by_route: &self.experts_by_route,
+                        expert_offsets: &self.expert_offsets,
                         packed_output: &self.expert_major_output,
                     },
                     Scratch {
@@ -197,13 +206,20 @@ impl SparseMLPFixture {
         self.token_indices.write_typed(0, &token_indices);
         self.expert_indices.write_typed(0, &expert_indices);
         self.route_indices.write_typed(0, &route_indices);
-        self.experts_by_route.write_typed(0, &expert_indices);
+        let mut experts_by_route = expert_indices.clone();
+        experts_by_route[..num_active_routes].sort_unstable();
+        self.experts_by_route.write_typed(0, &experts_by_route);
+        let offsets = (0..=self.config.num_experts)
+            .map(|expert| experts_by_route[..num_active_routes].partition_point(|&value| value < expert) as u32)
+            .collect::<Vec<_>>();
+        self.expert_offsets.write_typed(0, &offsets);
 
         ActiveSparseMLPInput {
             token_hidden: token_hidden[..num_active_tokens as usize * hidden_dim].to_vec(),
             packed_hidden: packed_hidden[..num_active_routes * hidden_dim].to_vec(),
             token_indices: token_indices[..num_active_routes].to_vec(),
             expert_indices: expert_indices[..num_active_routes].to_vec(),
+            experts_by_route: experts_by_route[..num_active_routes].to_vec(),
             route_indices: route_indices[..num_active_routes].to_vec(),
         }
     }
@@ -233,7 +249,10 @@ impl SparseMLPFixture {
         let expected = quantized_sparse_mlp_reference(QuantizedSparseMLPReferenceInput {
             hidden,
             token_indices,
-            expert_indices: &input.expert_indices,
+            expert_indices: match layout {
+                Layout::TokenMajor => &input.expert_indices,
+                Layout::ExpertMajor => &input.experts_by_route,
+            },
             swiglu_indices: &input.route_indices,
             hidden_dim: self.config.hidden_dim as usize,
             intermediate_dim: self.config.intermediate_dim as usize,
@@ -259,6 +278,7 @@ struct ActiveSparseMLPInput {
     packed_hidden: Vec<f32>,
     token_indices: Vec<u32>,
     expert_indices: Vec<u32>,
+    experts_by_route: Vec<u32>,
     route_indices: Vec<u32>,
 }
 

@@ -264,7 +264,8 @@ choices so that a replay bucket cannot cross either topology boundary.
 `dense_mlp::Compute` owns one adaptive `affine_quantized::Matmul` for gate/up and one for down.
 Each `affine_quantized::Matmul` owns the QMV/QMM candidates and selects its kernel.
 QMM uses Metal TensorOps with F32 cooperative accumulators. The BM8, BM16, and BM32 tiles share
-one implementation in `operators/metal/affine_quantized_qmm_tensor_ops.metal`.
+the `affine_qmm_tile` implementation in `operators/metal/affine_quantized_tensor_ops.metal`.
+The ordinary QMM entry point remains in `operators/metal/affine_quantized_qmm_tensor_ops.metal`.
 Each thread block loads an input tile and dequantizes one weight tile into threadgroup memory.
 The SIMDgroups reuse these tiles across output rows. Same-dtype operands keep their existing storage-dtype
 rounding; mixed-dtype operands use F32. QMV remains the small-row path.

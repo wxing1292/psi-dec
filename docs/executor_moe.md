@@ -335,8 +335,10 @@ Inactive commands do not read route inputs or write SwiGLU and output tails.
 
 A fixed active value declares no replay parameter.
 A parameter active value declares one replay parameter.
-Route count does not select a different sparse MLP kernel in either explicit path.
-The two explicit paths have different command topology.
+Token-major uses QMV. Expert-major records QMV alone below the affine batch crossover.
+At larger recorded capacities, it records complementary QMV and QMM commands. The active expert segment lengths
+select which command writes each segment. The total token capacity fixes this command topology.
+The two explicit layouts also have different command topology.
 The full MoE owner must keep the token-major/expert-major path boundary at token count `5` in its composite policy.
 The sparse leaf does not select the path.
 The full `GatedMoE` execution composes the selected leaf path.
@@ -429,12 +431,32 @@ expert_indices
 `routes_by_expert[expert_route]` maps compact expert-major row to the original token-major route.
 `routes_by_token[token_route]` maps the original token-major route back to its compact expert-major row.
 `expert_offsets[e]..expert_offsets[e + 1]` is the ragged route segment for expert `e`.
+Active expert IDs must be in `0..num_experts`. The routing owner establishes this invariant. The affine kernels
+trust these IDs after they exclude inactive routes. Weight and row address offsets use 64-bit arithmetic.
 MoE semantics require compact expert grouping and the inverse route map.
 Original route order inside each expert is not a forward contract.
 
 Expert-major sparse compute uses ragged rows with shape `{ num_experts, num_routes }`.
 For each `expert_route` in `0..num_routes`, `experts_by_route[expert_route]` selects the expert.
 It does not allocate `num_experts * routes_per_expert` rows.
+Each active QMM thread block covers up to eight rows of one expert and 32 output columns.
+The recorded grid contains one candidate per route and output-column tile. `expert_offsets` identifies the starts
+of eight-row tiles within each expert. Other candidates return before loading operands or reaching a barrier.
+Different expert tiles can execute independently.
+The gate/up and down stages reuse `affine_qmm_tile` from `operators/metal/affine_quantized_tensor_ops.metal`.
+F32 operands use a 32-element K tile. For group size 64, each thread block uses 5760 bytes: an `8 × 36` input tile
+and a `32 × 36` weight tile. Gate/up reuses this scratch across its two projections and keeps both F32 cooperative
+accumulators for the fused activation. Short-segment QMV retains its paired gate/up dot products within each SIMDgroup.
+The private `ExpertMajorKernels` owner compiles and selects both families for gate/up and down. Each stage retains
+its own buffer bindings.
+One weight tile is dequantized once for all rows in that tile.
+The affine batch crossover keeps small recorded batches on direct QMV. This avoids complementary dispatch overhead.
+At larger capacities, expert segments with at least four rows use QMM. Shorter segments use QMV.
+This per-expert crossover controls weight reuse inside the ragged eight-row tile.
+QMV and QMM commands declare disjoint output segments and share one parent replay submission.
+The complementary QMV command derives its row-task count from a 1024-threadblock target and the column-tile count.
+Each task walks multiple routes and skips QMM segments. Both families apply SwiGLU before storing the gate/up result.
+The existing compact route maps and pack/scatter stages do not change.
 
 Token-major and expert-major replay paths remain explicit benchmark probes.
 The production Metal backend uses token-major for `num_tokens <= 4`.
@@ -721,7 +743,10 @@ Top-k ordering differences alone are not a performance target.
 Route probability semantics must identify logits or already-softmaxed probabilities.
 They must also identify whether routing renormalizes selected top-k probabilities.
 
-The expected parity result is bitwise-equal token-major and expert-major output.
+Token-major QMV and expert-major TensorOps QMM must match the sparse CPU reference within its numerical tolerance.
+Expert QMM uses F32 dequantized operands and accumulators. QMV applies scale and bias to packed-weight dot products.
+The different F32 reduction orders can change output bits.
+The sparse activation retains its existing storage-dtype rounding stages.
 The current production backend uses token-major for `num_tokens <= 4`.
 It uses expert-major for larger microbatches.
 

@@ -35,7 +35,6 @@ impl Config {
         assert!(self.num_experts > 0);
         assert!(self.hidden_dim > 0);
         assert!(self.intermediate_dim > 0);
-        self.stacked_intermediate_dim();
         assert!(matches!(self.group_size, 32 | 64 | 128));
         assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
         assert_eq!(
@@ -52,9 +51,6 @@ impl Config {
         i32::try_from(self.hidden_dim).expect("sparse MLP hidden_dim must fit i32");
         i32::try_from(self.num_experts).expect("sparse MLP expert count must fit i32");
         i32::try_from(self.intermediate_dim).expect("sparse MLP intermediate_dim must fit i32");
-        i32::try_from(self.stacked_intermediate_dim()).expect("sparse MLP stacked intermediate_dim must fit i32");
-        i32::try_from(self.group_size).expect("sparse MLP group_size must fit i32");
-        i32::try_from(self.bits).expect("sparse MLP bits must fit i32");
     }
 
     pub fn gate_up_config(self) -> affine_quantized::ExpertConfig {
@@ -68,12 +64,12 @@ impl Config {
     fn expert_affine_config(self, n: u32, k: u32) -> affine_quantized::ExpertConfig {
         self.validate();
         affine_quantized::ExpertConfig {
-            num_experts: to_i32(self.num_experts, "sparse MLP expert count"),
+            num_experts: self.num_experts as i32,
             matmul: affine_quantized::Config::same_dtype(
-                to_i32(n, "sparse MLP output dimension"),
-                to_i32(k, "sparse MLP input dimension"),
-                to_i32(self.group_size, "sparse MLP group size"),
-                to_i32(self.bits, "sparse MLP bits"),
+                n as i32,
+                k as i32,
+                self.group_size as i32,
+                self.bits as i32,
                 self.dtype,
             ),
         }
@@ -181,12 +177,6 @@ impl Config {
             self.dtype,
         )
     }
-
-    fn stacked_intermediate_dim(self) -> u32 {
-        self.intermediate_dim
-            .checked_mul(2)
-            .expect("sparse MLP stacked gate/up dim must fit u32")
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -275,6 +265,7 @@ pub struct TokenMajorBuffers<'a> {
 pub struct ExpertMajorBuffers<'a> {
     pub packed_input: &'a Buffer,
     pub experts_by_route: &'a Buffer,
+    pub expert_offsets: &'a Buffer,
     pub packed_output: &'a Buffer,
 }
 
@@ -621,6 +612,7 @@ impl Operator for ExpertMajorInvocation<'_> {
             self.weights.up_scales,
             self.weights.up_biases,
             self.buffers.experts_by_route,
+            self.buffers.expert_offsets,
         );
         gate_up_swiglu.record(recorder);
         let down = self.kernels.down.invoke(
@@ -634,6 +626,7 @@ impl Operator for ExpertMajorInvocation<'_> {
             self.weights.down_scales,
             self.weights.down_biases,
             self.buffers.experts_by_route,
+            self.buffers.expert_offsets,
         );
         recorder.record_with_barrier_before(down);
     }

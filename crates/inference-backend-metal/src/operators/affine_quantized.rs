@@ -259,10 +259,10 @@ impl RouteActivity {
     }
 
     fn bind(self, recorder: &CommandRecorder<'_>, token_binding_index: usize, topk_binding_index: usize) {
-        let ReplayU32::Parameter(key) = self.num_active_tokens else {
-            panic!("fixed route activity does not require replay bindings")
-        };
-        recorder.bind_u32(token_binding_index, key, 1, self.num_total_tokens);
+        match self.num_active_tokens {
+            ReplayU32::Fixed(value) => recorder.set_u32(token_binding_index, value),
+            ReplayU32::Parameter(key) => recorder.bind_u32(token_binding_index, key, 1, self.num_total_tokens),
+        }
         recorder.set_u32(topk_binding_index, self.num_experts_per_token);
     }
 
@@ -285,14 +285,12 @@ pub struct GatherGateUpSwiGLUKernel {
 
 pub struct RaggedExpertMajorGateUpSwiGLUKernel {
     config: ExpertConfig,
-    kernel: CompiledKernel,
-    parameterized_kernel: CompiledKernel,
+    kernels: ExpertMajorKernels,
 }
 
 pub struct RaggedExpertMajorMatmulKernel {
     config: ExpertConfig,
-    kernel: CompiledKernel,
-    parameterized_kernel: CompiledKernel,
+    kernels: ExpertMajorKernels,
 }
 
 impl GatherMatmulKernel {
@@ -460,46 +458,85 @@ impl GatherGateUpSwiGLUKernel {
     }
 }
 
+struct ExpertMajorKernels {
+    qmv: CompiledKernel,
+    qmv_all: CompiledKernel,
+    qmm: CompiledKernel,
+}
+
+impl ExpertMajorKernels {
+    fn new(device: &Device, config: Config, entry: &str) -> Self {
+        let args = [
+            metal_type_string(config.input_dtype).to_string(),
+            config.group_size.to_string(),
+            config.bits.to_string(),
+            EXPERT_QMM_MIN_ROWS.to_string(),
+        ];
+        let qmm_name = format!("{entry}_qmm");
+        let template = template_definition(&qmm_name, &qmm_name, &args);
+        let source = affine_quantized_source(&format!(
+            "{MIXED_AFFINE_SOURCE}\n{TENSOR_OPS_SOURCE}\n{EXPERT_MAJOR_TENSOR_OPS_SOURCE}\n{template}"
+        ));
+        let qmm = CompiledKernel::new_tensor_ops(device, &source, &qmm_name);
+        validate_qmm_pipeline(device, 32, Dtype::Float32, KernelKind::QmmBm8Bn32, &qmm);
+        let qmv_name = format!("{entry}_qmv");
+        let template = template_definition(&qmv_name, &qmv_name, &args);
+        let source = affine_quantized_source(&format!(
+            "{GATE_UP_SWIGLU_SOURCE}\n{EXPERT_MAJOR_QMV_SOURCE}\n{template}"
+        ));
+        let qmv = CompiledKernel::new(device, &source, &qmv_name);
+        let qmv_all_name = format!("{entry}_qmv_all");
+        let template = template_definition(&qmv_all_name, &qmv_all_name, &args[..3]);
+        let source = affine_quantized_source(&format!(
+            "{GATE_UP_SWIGLU_SOURCE}\n{EXPERT_MAJOR_QMV_SOURCE}\n{template}"
+        ));
+        let qmv_all = CompiledKernel::new(device, &source, &qmv_all_name);
+        Self { qmv, qmv_all, qmm }
+    }
+
+    fn record(
+        &self,
+        recorder: &CommandRecorder<'_>,
+        config: Config,
+        activity: RouteActivity,
+        num_total_routes: i32,
+        output: &Buffer,
+        bind: impl Fn(),
+    ) {
+        // Small batches use direct QMV to avoid the complementary dispatch overhead.
+        // Larger batches select QMM by actual per-expert reuse.
+        let num_kernels = if activity.num_total_tokens < adaptive_qmv_batch_limit(config) as u32 {
+            1
+        } else {
+            2
+        };
+        let qmv = if num_kernels == 1 { &self.qmv_all } else { &self.qmv };
+        let qmv_row_tasks = if num_kernels == 1 {
+            num_total_routes
+        } else {
+            num_total_routes.min(ceil_div_i32(EXPERT_QMV_THREADBLOCKS, ceil_div_i32(config.n, 8)))
+        };
+        let kernels = [(qmv, 8, qmv_row_tasks), (&self.qmm, 32, num_total_routes)];
+        // Both families select disjoint expert segments from the same offsets.
+        recorder.record_disjoint_buffers(&[output], || {
+            for &(kernel, bn, num_row_tasks) in &kernels[..num_kernels] {
+                recorder.set_kernel(kernel);
+                bind();
+                recorder.dispatch_threadblocks(
+                    (num_row_tasks as usize, ceil_div_i32(config.n, bn) as usize, 1),
+                    (32, 2, 1),
+                );
+            }
+        });
+    }
+}
+
 impl RaggedExpertMajorGateUpSwiGLUKernel {
     pub fn new(device: &Device, config: ExpertConfig) -> Self {
         config.validate();
-        let matmul = config.matmul;
-        let type_string = metal_type_string(matmul.input_dtype);
-        let kernel_name = format!(
-            "expert_major_gate_up_swiglu_{type_string}_gs_{}_b_{}",
-            matmul.group_size, matmul.bits
-        );
-        let exact_template_definition = template_definition(
-            &kernel_name,
-            "expert_major_gate_up_swiglu",
-            &[
-                type_string.to_string(),
-                matmul.group_size.to_string(),
-                matmul.bits.to_string(),
-            ],
-        );
-        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
-        let kernel = CompiledKernel::new(device, &source, &kernel_name);
-        let parameterized_kernel_name = format!(
-            "expert_major_gate_up_swiglu_bucketed_{type_string}_gs_{}_b_{}",
-            matmul.group_size, matmul.bits
-        );
-        let parameterized_template_definition = template_definition(
-            &parameterized_kernel_name,
-            "expert_major_gate_up_swiglu_bucketed",
-            &[
-                type_string.to_string(),
-                matmul.group_size.to_string(),
-                matmul.bits.to_string(),
-            ],
-        );
-        let parameterized_source =
-            affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{parameterized_template_definition}"));
-        let parameterized_kernel = CompiledKernel::new(device, &parameterized_source, &parameterized_kernel_name);
         Self {
             config,
-            kernel,
-            parameterized_kernel,
+            kernels: ExpertMajorKernels::new(device, config.matmul, "expert_major_gate_up_swiglu"),
         }
     }
 
@@ -519,6 +556,7 @@ impl RaggedExpertMajorGateUpSwiGLUKernel {
         up_scales: &'a Buffer,
         up_biases: &'a Buffer,
         experts_by_route: &'a Buffer,
+        expert_offsets: &'a Buffer,
     ) -> RaggedExpertMajorGateUpSwiGLUInvocation<'a> {
         RaggedExpertMajorGateUpSwiGLUInvocation {
             kernel: self,
@@ -532,6 +570,7 @@ impl RaggedExpertMajorGateUpSwiGLUKernel {
             up_scales,
             up_biases,
             experts_by_route,
+            expert_offsets,
             route_activity: RouteActivity::new(
                 self.config,
                 shape.num_routes,
@@ -546,43 +585,9 @@ impl RaggedExpertMajorGateUpSwiGLUKernel {
 impl RaggedExpertMajorMatmulKernel {
     pub fn new(device: &Device, config: ExpertConfig) -> Self {
         config.validate();
-        let matmul = config.matmul;
-        let type_string = metal_type_string(matmul.input_dtype);
-        let kernel_name = format!(
-            "expert_major_down_matmul_{type_string}_gs_{}_b_{}",
-            matmul.group_size, matmul.bits
-        );
-        let exact_template_definition = template_definition(
-            &kernel_name,
-            "expert_major_down_matmul",
-            &[
-                type_string.to_string(),
-                matmul.group_size.to_string(),
-                matmul.bits.to_string(),
-            ],
-        );
-        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
-        let kernel = CompiledKernel::new(device, &source, &kernel_name);
-        let parameterized_kernel_name = format!(
-            "expert_major_down_matmul_bucketed_{type_string}_gs_{}_b_{}",
-            matmul.group_size, matmul.bits
-        );
-        let parameterized_template_definition = template_definition(
-            &parameterized_kernel_name,
-            "expert_major_down_matmul_bucketed",
-            &[
-                type_string.to_string(),
-                matmul.group_size.to_string(),
-                matmul.bits.to_string(),
-            ],
-        );
-        let parameterized_source =
-            affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{parameterized_template_definition}"));
-        let parameterized_kernel = CompiledKernel::new(device, &parameterized_source, &parameterized_kernel_name);
         Self {
             config,
-            kernel,
-            parameterized_kernel,
+            kernels: ExpertMajorKernels::new(device, config.matmul, "expert_major_down"),
         }
     }
 
@@ -599,6 +604,7 @@ impl RaggedExpertMajorMatmulKernel {
         scales: &'a Buffer,
         biases: &'a Buffer,
         experts_by_route: &'a Buffer,
+        expert_offsets: &'a Buffer,
     ) -> RaggedExpertMajorMatmulInvocation<'a> {
         RaggedExpertMajorMatmulInvocation {
             kernel: self,
@@ -609,6 +615,7 @@ impl RaggedExpertMajorMatmulKernel {
             scales,
             biases,
             experts_by_route,
+            expert_offsets,
             route_activity: RouteActivity::new(
                 self.config,
                 shape.num_routes,
@@ -661,6 +668,7 @@ pub struct RaggedExpertMajorGateUpSwiGLUInvocation<'a> {
     up_scales: &'a Buffer,
     up_biases: &'a Buffer,
     experts_by_route: &'a Buffer,
+    expert_offsets: &'a Buffer,
     route_activity: RouteActivity,
 }
 
@@ -673,6 +681,7 @@ pub struct RaggedExpertMajorMatmulInvocation<'a> {
     scales: &'a Buffer,
     biases: &'a Buffer,
     experts_by_route: &'a Buffer,
+    expert_offsets: &'a Buffer,
     route_activity: RouteActivity,
 }
 
@@ -690,29 +699,27 @@ impl Operator for RaggedExpertMajorMatmulInvocation<'_> {
             self.scales,
             self.biases,
             self.experts_by_route,
+            self.expert_offsets,
         );
 
-        let kernel = if self.route_activity.uses_parameter() {
-            &self.kernel.parameterized_kernel
-        } else {
-            &self.kernel.kernel
-        };
-        recorder.set_kernel(kernel);
-        recorder.set_buffer_read(0, self.weight, 0);
-        recorder.set_buffer_read(1, self.scales, 0);
-        recorder.set_buffer_read(2, self.biases, 0);
-        recorder.set_buffer_read(3, self.input, 0);
-        recorder.set_buffer_read(4, self.experts_by_route, 0);
-        recorder.set_buffer_write(5, self.output, 0);
-        recorder.set_i32(6, matmul.k);
-        recorder.set_i32(7, matmul.n);
-        recorder.set_i32(8, config.num_experts);
-        if self.route_activity.uses_parameter() {
-            self.route_activity.bind(recorder, 9, 10);
-        }
-        recorder.dispatch_threadblocks(
-            (shape.num_routes as usize, ceil_div_i32(matmul.n, 8) as usize, 1),
-            (32, 2, 1),
+        self.kernel.kernels.record(
+            recorder,
+            matmul,
+            self.route_activity,
+            shape.num_routes,
+            self.output,
+            || {
+                recorder.set_buffer_read(0, self.weight, 0);
+                recorder.set_buffer_read(1, self.scales, 0);
+                recorder.set_buffer_read(2, self.biases, 0);
+                recorder.set_buffer_read(3, self.input, 0);
+                recorder.set_buffer_read(4, self.experts_by_route, 0);
+                recorder.set_buffer_write(5, self.output, 0);
+                recorder.set_i32(6, matmul.k);
+                recorder.set_i32(7, matmul.n);
+                self.route_activity.bind(recorder, 8, 9);
+                recorder.set_buffer_read(10, self.expert_offsets, 0);
+            },
         );
     }
 }
@@ -734,32 +741,30 @@ impl Operator for RaggedExpertMajorGateUpSwiGLUInvocation<'_> {
             self.up_scales,
             self.up_biases,
             self.experts_by_route,
+            self.expert_offsets,
         );
 
-        let kernel = if self.route_activity.uses_parameter() {
-            &self.kernel.parameterized_kernel
-        } else {
-            &self.kernel.kernel
-        };
-        recorder.set_kernel(kernel);
-        recorder.set_buffer_read(0, self.gate_weight, 0);
-        recorder.set_buffer_read(1, self.gate_scales, 0);
-        recorder.set_buffer_read(2, self.gate_biases, 0);
-        recorder.set_buffer_read(3, self.up_weight, 0);
-        recorder.set_buffer_read(4, self.up_scales, 0);
-        recorder.set_buffer_read(5, self.up_biases, 0);
-        recorder.set_buffer_read(6, self.input, 0);
-        recorder.set_buffer_read(7, self.experts_by_route, 0);
-        recorder.set_buffer_write(8, self.output, 0);
-        recorder.set_i32(9, matmul.k);
-        recorder.set_i32(10, matmul.n);
-        recorder.set_i32(11, config.num_experts);
-        if self.route_activity.uses_parameter() {
-            self.route_activity.bind(recorder, 12, 13);
-        }
-        recorder.dispatch_threadblocks(
-            (shape.num_routes as usize, ceil_div_i32(matmul.n, 8) as usize, 1),
-            (32, 2, 1),
+        self.kernel.kernels.record(
+            recorder,
+            matmul,
+            self.route_activity,
+            shape.num_routes,
+            self.output,
+            || {
+                recorder.set_buffer_read(0, self.gate_weight, 0);
+                recorder.set_buffer_read(1, self.gate_scales, 0);
+                recorder.set_buffer_read(2, self.gate_biases, 0);
+                recorder.set_buffer_read(3, self.up_weight, 0);
+                recorder.set_buffer_read(4, self.up_scales, 0);
+                recorder.set_buffer_read(5, self.up_biases, 0);
+                recorder.set_buffer_read(6, self.input, 0);
+                recorder.set_buffer_read(7, self.experts_by_route, 0);
+                recorder.set_buffer_write(8, self.output, 0);
+                recorder.set_i32(9, matmul.k);
+                recorder.set_i32(10, matmul.n);
+                self.route_activity.bind(recorder, 11, 12);
+                recorder.set_buffer_read(13, self.expert_offsets, 0);
+            },
         );
     }
 }
@@ -1011,6 +1016,7 @@ fn validate_ragged_expert_major_gate_up_swiglu_buffer_ranges(
     up_scales: &Buffer,
     up_biases: &Buffer,
     experts_by_route: &Buffer,
+    expert_offsets: &Buffer,
 ) {
     config.validate();
     shape.validate();
@@ -1041,6 +1047,7 @@ fn validate_ragged_expert_major_gate_up_swiglu_buffer_ranges(
     assert!(affine_param_bytes <= up_scales.len_bytes());
     assert!(affine_param_bytes <= up_biases.len_bytes());
     assert!(route_index_bytes <= experts_by_route.len_bytes());
+    assert!((config.num_experts as usize + 1) * size_of::<u32>() <= expert_offsets.len_bytes());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1053,6 +1060,7 @@ fn validate_ragged_expert_major_down_matmul_buffer_ranges(
     scales: &Buffer,
     biases: &Buffer,
     experts_by_route: &Buffer,
+    expert_offsets: &Buffer,
 ) {
     config.validate();
     shape.validate();
@@ -1080,6 +1088,7 @@ fn validate_ragged_expert_major_down_matmul_buffer_ranges(
     assert!(affine_param_bytes <= scales.len_bytes());
     assert!(affine_param_bytes <= biases.len_bytes());
     assert!(route_index_bytes <= experts_by_route.len_bytes());
+    assert!((config.num_experts as usize + 1) * size_of::<u32>() <= expert_offsets.len_bytes());
 }
 
 fn packed_dim(k: i32, bits: i32) -> i32 {
@@ -1109,7 +1118,23 @@ impl Kernel {
             KernelKind::QmvBn8Bk32 | KernelKind::QmvQuadBn64 => CompiledKernel::new(device, &source, &kernel_name),
             KernelKind::QmmBm8Bn32 | KernelKind::QmmBm16Bn32 | KernelKind::QmmBm32Bn32 => {
                 let kernel = CompiledKernel::new_tensor_ops(device, &source, &kernel_name);
-                validate_qmm_pipeline(device, config, kind, &kernel);
+                let bm = match kind {
+                    KernelKind::QmmBm8Bn32 => 8,
+                    KernelKind::QmmBm16Bn32 => 16,
+                    KernelKind::QmmBm32Bn32 => 32,
+                    _ => unreachable!(),
+                };
+                validate_qmm_pipeline(
+                    device,
+                    qmm_bk(config, bm),
+                    if config.uses_same_dtype() {
+                        config.input_dtype
+                    } else {
+                        Dtype::Float32
+                    },
+                    kind,
+                    &kernel,
+                );
                 kernel
             },
         };
@@ -1487,11 +1512,10 @@ fn affine_qmm_bn32_source(config: Config, bm: usize) -> (String, String) {
     let input_type = metal_type_string(config.input_dtype);
     let output_type = metal_type_string(config.output_dtype);
     let scale_bias_type = metal_type_string(config.scale_bias_dtype);
-    let aligned = config.n % 32 == 0;
     let bk = qmm_bk(config, bm);
     let kernel_name = format!(
-        "affine_qmm_tensor_ops_bm{bm}_bn32_bk{bk}_{input_type}_{scale_bias_type}_{output_type}_gs_{}_b_{}_alN_{}",
-        config.group_size, config.bits, aligned
+        "affine_qmm_tensor_ops_bm{bm}_bn32_bk{bk}_{input_type}_{scale_bias_type}_{output_type}_gs_{}_b_{}",
+        config.group_size, config.bits
     );
     let template_definition = template_definition(
         &kernel_name,
@@ -1502,7 +1526,6 @@ fn affine_qmm_bn32_source(config: Config, bm: usize) -> (String, String) {
             output_type.to_string(),
             config.group_size.to_string(),
             config.bits.to_string(),
-            aligned.to_string(),
             bm.to_string(),
             bk.to_string(),
         ],
@@ -1510,7 +1533,7 @@ fn affine_qmm_bn32_source(config: Config, bm: usize) -> (String, String) {
     (
         kernel_name,
         affine_quantized_source(&format!(
-            "{MIXED_AFFINE_SOURCE}\n{QMM_TENSOR_OPS_SOURCE}\n{template_definition}"
+            "{MIXED_AFFINE_SOURCE}\n{TENSOR_OPS_SOURCE}\n{QMM_TENSOR_OPS_SOURCE}\n{template_definition}"
         )),
     )
 }
@@ -1618,6 +1641,8 @@ fn adaptive_qmv_batch_limit(config: Config) -> i32 {
     }
 }
 
+const EXPERT_QMV_THREADBLOCKS: i32 = 1024;
+const EXPERT_QMM_MIN_ROWS: i32 = 4;
 const QMM_BM8_MAX_ROWS: i32 = 8;
 const QMM_BM16_MAX_ROWS: i32 = 16;
 
@@ -1666,7 +1691,7 @@ fn qmm_bk(config: Config, bm: usize) -> usize {
     }
 }
 
-fn validate_qmm_pipeline(device: &Device, config: Config, kind: KernelKind, kernel: &CompiledKernel) {
+fn validate_qmm_pipeline(device: &Device, bk: usize, operand_dtype: Dtype, kind: KernelKind, kernel: &CompiledKernel) {
     let (bm, num_simdgroups): (usize, usize) = match kind {
         KernelKind::QmmBm8Bn32 => (8, 2),
         KernelKind::QmmBm16Bn32 => (16, 2),
@@ -1684,13 +1709,7 @@ fn validate_qmm_pipeline(device: &Device, config: Config, kind: KernelKind, kern
         "QMM BM={bm} BN=32 requires {num_threads} threads, pipeline supports {}",
         kernel.max_total_threads_per_threadblock()
     );
-    let operand_dtype = if config.uses_same_dtype() {
-        config.input_dtype
-    } else {
-        Dtype::Float32
-    };
     let item_size = operand_dtype.item_size();
-    let bk = qmm_bk(config, bm);
     let bk_padded = bk + 16 / item_size;
     let expected_threadblock_memory = (bm + 32)
         .checked_mul(bk_padded)
@@ -1745,13 +1764,19 @@ fn affine_quantized_source(template_definition: &str) -> String {
     source
 }
 
+const EXPERT_MAJOR_QMV_SOURCE: &str = include_str!("metal/affine_quantized_expert_major_qmv.metal");
+
+const EXPERT_MAJOR_TENSOR_OPS_SOURCE: &str = include_str!("metal/affine_quantized_expert_major_tensor_ops.metal");
+
+const TENSOR_OPS_SOURCE: &str = include_str!("metal/affine_quantized_tensor_ops.metal");
+
 const QMM_TENSOR_OPS_SOURCE: &str = include_str!("metal/affine_quantized_qmm_tensor_ops.metal");
 
 const MIXED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_mixed.metal");
 
 const GUARDED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_guarded_qmv.metal");
 
-const GATE_UP_SWIGLU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_swiglu_qmv_qmm.metal");
+const GATE_UP_SWIGLU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_swiglu_qmv.metal");
 
 fn mlx_metal_header_root() -> PathBuf {
     find_mlx_metal_header_root(
