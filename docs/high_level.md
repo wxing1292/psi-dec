@@ -74,7 +74,7 @@ protocol from outside the process. Make sure that the server stops cleanly.
 
 Do expensive GPU checks during final acceptance. Do them earlier only when they answer a correctness question.
 
-Before handing off broad Rust changes, run the [repository compile gates](../AGENTS.md#verification).
+Before handing off broad Rust changes, run the [repository compile gates](../AGENTS.md#verify-the-changed-contract).
 For documentation-only changes, check links, source references, command accuracy, and `git diff --check`.
 
 Run Metal and GPU commands one at a time. Coordinate these commands across processes. Do not use parallel workspace
