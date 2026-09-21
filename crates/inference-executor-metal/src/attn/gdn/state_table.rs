@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::mem::size_of;
-use std::mem::take;
 use std::rc::Rc;
 
 use inference_backend_metal::components::gdn::compute::ReplayBuffers;
@@ -547,7 +546,7 @@ impl GDNRequestStateTable {
     }
 
     pub fn commit(&self, dst_state_versions: &[u32]) -> Vec<backend_state_replay::Job> {
-        let pending_commits = take(&mut *self.pending_commits.borrow_mut());
+        let mut pending_commits = self.pending_commits.borrow_mut();
         let mut publishes_out = self.publishes.borrow_mut();
         let mut request_table = self.request_table().borrow_mut();
         assert_eq!(pending_commits.len(), dst_state_versions.len());
@@ -598,7 +597,7 @@ impl GDNRequestStateTable {
             }
         }
         publishes_out.clear();
-        for (request, &dst_state_version) in pending_commits.iter().zip(dst_state_versions) {
+        for (request, &dst_state_version) in pending_commits.drain(..).zip(dst_state_versions) {
             let publishes = request_table.commit(request.req_slot, dst_state_version);
             debug_assert!(publishes.len() <= self.max_publish_jobs_per_req);
             publishes_out.extend(publishes);

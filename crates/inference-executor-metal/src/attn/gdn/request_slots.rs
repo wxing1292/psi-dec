@@ -300,42 +300,29 @@ impl GDNRequestSlots {
                 state_version,
                 "GDN commit state_version must select a materialized convolution state slot",
             );
-            let mut publishes = Vec::new();
-            let mut remaining_publish_pages = Vec::new();
-            for (publish_state_version, page_ids) in self.pending_publish_pages[req_slot_index].drain(..) {
-                if publish_state_version <= state_version {
-                    let (src_recurrent_state_slot, src_conv_state_slot) =
-                        if publish_state_version == self.current_state_versions[req_slot_index] {
-                            (
-                                self.current_recurrent_state_slots[req_slot_index],
-                                self.current_conv_state_slots[req_slot_index],
-                            )
-                        } else {
-                            (
-                                find_materialized_state_slot(
-                                    &self.materialized_recurrent_state_slots[req_slot_index],
-                                    publish_state_version,
-                                    "GDN publish state_version must select a materialized recurrent state slot",
-                                ),
-                                find_materialized_state_slot(
-                                    &self.materialized_conv_state_slots[req_slot_index],
-                                    publish_state_version,
-                                    "GDN publish state_version must select a materialized convolution state slot",
-                                ),
-                            )
-                        };
-                    publishes.push(GDNStatePublish {
-                        req_slot: req_slot_index.try_into().expect("GDN request slot must fit u32"),
-                        src_recurrent_state_slot,
-                        src_conv_state_slot,
-                        state_version: publish_state_version,
-                        page_ids,
-                    });
-                } else {
-                    remaining_publish_pages.push((publish_state_version, page_ids));
-                }
+            let num_publishes = self.pending_publish_pages[req_slot_index]
+                .partition_point(|(publish_state_version, _)| *publish_state_version <= state_version);
+            let mut publishes = Vec::with_capacity(num_publishes);
+            for (publish_state_version, page_ids) in self.pending_publish_pages[req_slot_index].drain(..num_publishes) {
+                // Pending publications are newer than the current state and have prepared destinations.
+                let src_recurrent_state_slot = find_materialized_state_slot(
+                    &self.materialized_recurrent_state_slots[req_slot_index],
+                    publish_state_version,
+                    "GDN publish state_version must select a materialized recurrent state slot",
+                );
+                let src_conv_state_slot = find_materialized_state_slot(
+                    &self.materialized_conv_state_slots[req_slot_index],
+                    publish_state_version,
+                    "GDN publish state_version must select a materialized convolution state slot",
+                );
+                publishes.push(GDNStatePublish {
+                    req_slot,
+                    src_recurrent_state_slot,
+                    src_conv_state_slot,
+                    state_version: publish_state_version,
+                    page_ids,
+                });
             }
-            self.pending_publish_pages[req_slot_index] = remaining_publish_pages;
             self.free_recurrent_state_slots
                 .push_back(self.current_recurrent_state_slots[req_slot_index]);
             self.free_conv_state_slots

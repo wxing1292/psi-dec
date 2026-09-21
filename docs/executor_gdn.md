@@ -302,6 +302,8 @@ Commit performs these steps:
 Allocation must precede promotion for the entire batch. Otherwise, a later request could reuse a source slot that an earlier GPU job still reads.
 Final and boundary targets share one destination when their versions match.
 Rejected boundaries are not materialized or published. Their pending page mappings remain available for a later accepted forward.
+Pending page mappings stay sorted by state version. Commit drains only the accepted prefix and retains the allocation
+for future mappings. It also consumes the batch commit records and reuses their allocation from initialization.
 
 `Qwen3xGDNState` retains the pending commit submission. `finish_commit` waits for reconstruction and publication.
 It owns the commit replay cache and a separate Metal stream.
