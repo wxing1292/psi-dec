@@ -137,7 +137,9 @@ impl Selector {
             limits: SelectorLimits {
                 max_map_task_templates,
                 partial_state_group_capacity,
-                max_active_partial_state_groups: max_map_task_templates,
+                max_active_partial_state_groups: partial_state_group_capacity
+                    .try_into()
+                    .expect("GQA active partial-state budget must fit u32"),
             },
         }
     }
@@ -596,12 +598,12 @@ mod tests {
         let selection = selection(&[65536], &[25]);
         assert!(!is_single_q(&selection));
         assert_eq!(selection.q_token_ranges().len(), 4);
-        assert_eq!(selection.map_task_templates().len(), 23);
-        assert_eq!(selection.replay_shape().num_total_sdpa_map_task_templates, 24);
-        assert_eq!(selection.metrics().num_active_partial_state_groups, 128);
-        assert_eq!(selection.metrics().num_active_partial_states, 128 * 24);
-        assert_eq!(selection.metrics().num_reserved_partial_state_groups, 184);
-        assert_eq!(selection.metrics().num_replay_reserved_partial_state_groups, 192);
+        assert_eq!(selection.map_task_templates().len(), 128);
+        assert_eq!(selection.replay_shape().num_total_sdpa_map_task_templates, 128);
+        assert_eq!(selection.metrics().num_active_partial_state_groups, 800);
+        assert_eq!(selection.metrics().num_active_partial_states, 800 * 24);
+        assert_eq!(selection.metrics().num_reserved_partial_state_groups, 1024);
+        assert_eq!(selection.metrics().num_replay_reserved_partial_state_groups, 1024);
     }
 
     #[test]

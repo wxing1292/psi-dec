@@ -259,6 +259,11 @@ Q-token ranges.
 The selector assigns additional KV splits to the Q-token range with the most remaining KV-iteration work. KV splits for
 one Q-token range are contiguous. This is the existing greedy allocation policy.
 
+The Map task-template capacity is `max_tokens`. The partial-state capacity is
+`max_tokens * largest registered max_q_tokens`. The active partial-state budget uses this full allocated capacity.
+For `max_tokens=128` and eight-token Q ranges, 128 input tokens can use 128 Map task templates and 1024 partial-state
+groups. Each Q range can therefore use eight KV splits. This policy does not increase scratch allocation.
+
 For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` values select the
 `SDPAPartialOutput`s for the reducer.
 
@@ -1175,8 +1180,9 @@ ragged per-request token counts.
 `--gqa-contexts-per-req` supplies the matching existing context length for each ragged request. It requires
 `--gqa-tokens-per-req` and cannot be combined with `--contexts`.
 
-`--max-tokens` fixes the token capacity, Map task-template capacity, and maximum active partial-state-group count for
-both forced SplitKV candidates. The default is 128, which matches the server default. Each case reports Q-token
+`--max-tokens` fixes the token and Map task-template capacities for both forced SplitKV candidates.
+Each candidate derives its partial-state capacity and active budget from its registered Q-range width.
+The default is 128, which matches the server default. Each case reports Q-token
 ranges, Map task templates, active and reserved partial-state groups, replay slots, and KV iterations per Map
 task template.
 

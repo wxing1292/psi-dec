@@ -125,10 +125,10 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
   File creation, file opening, pattern generation, correctness validation, and cleanup remain outside all timed cases.
 - `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It derives FP8
   E4M3FN KV tokens per page from the production 32 KiB page size and the selected model profile. It can run an explicit
-  untimed
-  `--validate-split-kv-tiled-q` comparison. `--max-tokens` fixes the segment-metadata capacity and the current
-  active-partial-state scheduling budget for both candidates. The default is the server default of 128. Each case
-  reports the active KV splits, fixed-TQ reserved partial slots, active partial states, and segment distribution.
+  untimed `--validate-split-kv-tiled-q` comparison. `--max-tokens` fixes the token and Map task-template capacities.
+  Each candidate derives its partial-state capacity and active budget from its registered Q-range width.
+  The default is the server default of 128. Each case reports the active KV splits, fixed-TQ reserved partial slots,
+  active partial states, and segment distribution.
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SplitKV-only variants, and exact QKV/output
   projection kernels.
 - `qwen3_gqa` exposes static SplitKV tile geometry as CLI arguments. It can validate SingleQ output against TiledQ

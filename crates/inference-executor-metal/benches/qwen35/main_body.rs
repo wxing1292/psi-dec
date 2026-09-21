@@ -688,7 +688,7 @@ fn print_gqa_split_plan(gqa_state: &Qwen3xGQAState, max_tokens: usize, component
     println!(
         "split_plan component={component} variant={variant_name} max_tokens={max_tokens} num_active_q_tokens={} \
          num_q_token_ranges={} num_active_q_tokens_per_q_token_range={num_active_q_tokens_per_q_token_range:?} \
-         num_map_task_templates={} max_map_task_templates={max_tokens} max_active_partial_state_groups={max_tokens} \
+         num_map_task_templates={} max_map_task_templates={max_tokens} \
          num_active_partial_state_groups={num_active_partial_state_groups} \
          num_reserved_partial_state_groups={reserved_partial_state_groups} num_replay_map_task_template_slots={} \
          num_replay_reserved_partial_state_groups={replay_reserved_partial_state_groups} \

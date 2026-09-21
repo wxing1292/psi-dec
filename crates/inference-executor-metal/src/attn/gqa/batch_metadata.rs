@@ -298,14 +298,33 @@ mod tests {
         let tiled_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], &tiled_selection);
         assert_eq!(metadata.q_token_ranges().read_typed::<u32>(0, 4), vec![0, 2, 2, 5]);
         assert_eq!(
-            metadata.sdpa_map_task_templates().read_typed::<u32>(0, 12),
-            vec![0, 0, 9, 1, 0, 8, 1, 8, 23, u32::MAX, u32::MAX, u32::MAX]
+            metadata.sdpa_map_task_templates().read_typed::<u32>(0, 18),
+            vec![
+                0,
+                0,
+                8,
+                0,
+                8,
+                9,
+                1,
+                0,
+                8,
+                1,
+                8,
+                16,
+                1,
+                16,
+                23,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX
+            ]
         );
         assert_eq!(
             metadata.cu_sdpa_partial_outputs().read_typed::<u32>(0, 3),
-            vec![0, 1, 3]
+            vec![0, 2, 5]
         );
-        assert_eq!(tiled_shape, GQAReplayShape::new(5, 5, 2, 2, 3, 4, true));
+        assert_eq!(tiled_shape, GQAReplayShape::new(5, 5, 2, 2, 5, 6, true));
         assert_eq!(metadata.variant(), tiled);
     }
 
