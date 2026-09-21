@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ops::Range;
 
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
@@ -41,14 +42,14 @@ impl RequestShape {
 pub struct SelectorLimits {
     pub max_map_task_templates: u32,
     pub partial_state_group_capacity: usize,
-    pub max_active_partial_state_groups: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QTokenRange {
     pub request_index: u32,
     pub flat_q_token_indices: Range<u32>,
-    pub max_visible_kv_tokens: u32,
+    /// KV-token count visible to the last Q token in this causal range.
+    pub num_visible_kv_tokens: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,7 +68,7 @@ pub struct SelectionMetrics {
     pub num_active_partial_states: u64,
     pub num_reserved_partial_state_groups: u64,
     pub num_replay_reserved_partial_state_groups: u64,
-    pub max_kv_iterations_per_map_task: u32,
+    pub max_kv_iterations_per_split: u32,
     pub num_logical_qk_token_pairs: u64,
 }
 
@@ -129,6 +130,7 @@ impl Selector {
         let max_map_task_templates = max_tokens
             .try_into()
             .expect("GQA SDPA Map task-template capacity must fit u32");
+        // A full Map-template batch fits without a second partial-state budget.
         let partial_state_group_capacity = max_tokens
             .checked_mul(registry.max_q_tokens_per_map_task() as usize)
             .expect("GQA SDPA partial-state-group capacity must fit usize");
@@ -137,9 +139,6 @@ impl Selector {
             limits: SelectorLimits {
                 max_map_task_templates,
                 partial_state_group_capacity,
-                max_active_partial_state_groups: partial_state_group_capacity
-                    .try_into()
-                    .expect("GQA active partial-state budget must fit u32"),
             },
         }
     }
@@ -202,7 +201,7 @@ impl Selector {
 struct QTokenRangeWork {
     q_token_range: QTokenRange,
     num_kv_iterations: u32,
-    num_map_tasks: u32,
+    num_kv_splits: u32,
 }
 
 fn materialize_candidate(
@@ -216,29 +215,29 @@ fn materialize_candidate(
     assert!(variant.supports(config));
     let map = variant.map.thread_block;
     let mut ranges = build_q_token_ranges(request_shapes, map.max_q_tokens, map.kv_tokens_per_iteration);
-    allocate_map_tasks(&mut ranges, limits);
+    allocate_kv_splits(&mut ranges, limits.max_map_task_templates);
 
     let mut q_token_ranges = Vec::with_capacity(ranges.len());
     let mut map_task_templates = Vec::new();
     let mut cu_partial_outputs_by_q_token_range = Vec::with_capacity(ranges.len() + 1);
     cu_partial_outputs_by_q_token_range.push(0);
-    let mut max_kv_iterations_per_map_task = 0;
+    let mut max_kv_iterations_per_split = 0;
     for (q_token_range_index, range) in ranges.iter().enumerate() {
         q_token_ranges.push(range.q_token_range.clone());
-        for map_task_index in 0..range.num_map_tasks {
+        for kv_split_index in 0..range.num_kv_splits {
             let kv_iteration_begin =
-                range.num_kv_iterations as u64 * u64::from(map_task_index) / u64::from(range.num_map_tasks);
+                range.num_kv_iterations as u64 * u64::from(kv_split_index) / u64::from(range.num_kv_splits);
             let kv_iteration_end =
-                range.num_kv_iterations as u64 * u64::from(map_task_index + 1) / u64::from(range.num_map_tasks);
-            let num_kv_iterations = (kv_iteration_end - kv_iteration_begin)
+                range.num_kv_iterations as u64 * u64::from(kv_split_index + 1) / u64::from(range.num_kv_splits);
+            let num_kv_iterations_per_split = (kv_iteration_end - kv_iteration_begin)
                 .try_into()
                 .expect("GQA SDPA KV-iteration count must fit u32");
-            max_kv_iterations_per_map_task = max_kv_iterations_per_map_task.max(num_kv_iterations);
+            max_kv_iterations_per_split = max_kv_iterations_per_split.max(num_kv_iterations_per_split);
             let kv_token_begin = kv_iteration_begin
                 .checked_mul(u64::from(map.kv_tokens_per_iteration))
                 .and_then(|value| value.try_into().ok())
                 .expect("GQA SDPA KV-token begin must fit u32");
-            let kv_token_end = range.q_token_range.max_visible_kv_tokens.min(
+            let kv_token_end = range.q_token_range.num_visible_kv_tokens.min(
                 kv_iteration_end
                     .checked_mul(u64::from(map.kv_tokens_per_iteration))
                     .and_then(|value| value.try_into().ok())
@@ -285,7 +284,7 @@ fn materialize_candidate(
         .iter()
         .map(|range| {
             u64::from(range.q_token_range.flat_q_token_indices.end - range.q_token_range.flat_q_token_indices.start)
-                * u64::from(range.num_map_tasks)
+                * u64::from(range.num_kv_splits)
         })
         .sum::<u64>();
     let num_reserved_partial_state_groups = u64::from(num_map_task_templates) * u64::from(map.max_q_tokens);
@@ -339,7 +338,7 @@ fn materialize_candidate(
             .expect("GQA active partial-state count must fit u64"),
         num_reserved_partial_state_groups,
         num_replay_reserved_partial_state_groups,
-        max_kv_iterations_per_map_task,
+        max_kv_iterations_per_split,
         num_logical_qk_token_pairs,
     };
 
@@ -367,7 +366,7 @@ fn build_q_token_ranges(
         let mut flat_q_token_begin = flat_request_begin;
         while flat_q_token_begin < flat_request_end {
             let flat_q_token_end = flat_q_token_begin.saturating_add(max_q_tokens).min(flat_request_end);
-            let max_visible_kv_tokens = shape
+            let num_visible_kv_tokens = shape
                 .num_history_tokens
                 .checked_add(flat_q_token_end - flat_request_begin)
                 .expect("GQA visible KV-token count must fit u32");
@@ -375,10 +374,10 @@ fn build_q_token_ranges(
                 q_token_range: QTokenRange {
                     request_index: request_index.try_into().expect("GQA request index must fit u32"),
                     flat_q_token_indices: flat_q_token_begin..flat_q_token_end,
-                    max_visible_kv_tokens,
+                    num_visible_kv_tokens,
                 },
-                num_kv_iterations: max_visible_kv_tokens.div_ceil(kv_tokens_per_iteration),
-                num_map_tasks: 1,
+                num_kv_iterations: num_visible_kv_tokens.div_ceil(kv_tokens_per_iteration),
+                num_kv_splits: 1,
             });
             flat_q_token_begin = flat_q_token_end;
         }
@@ -388,40 +387,34 @@ fn build_q_token_ranges(
     ranges
 }
 
-fn allocate_map_tasks(ranges: &mut [QTokenRangeWork], limits: SelectorLimits) {
-    let mut num_map_tasks = ranges.len();
-    let mut num_active_partial_state_groups = ranges
-        .iter()
-        .map(|range| {
-            (range.q_token_range.flat_q_token_indices.end - range.q_token_range.flat_q_token_indices.start) as usize
-        })
-        .sum::<usize>();
-    assert!(num_map_tasks <= limits.max_map_task_templates as usize);
-    assert!(num_active_partial_state_groups <= limits.max_active_partial_state_groups as usize);
+fn allocate_kv_splits(ranges: &mut [QTokenRangeWork], max_map_task_templates: u32) {
+    let num_map_task_templates = ranges.len();
+    debug_assert!(num_map_task_templates <= max_map_task_templates as usize);
+    if num_map_task_templates == max_map_task_templates as usize {
+        return;
+    }
+    if let [range] = ranges {
+        range.num_kv_splits = range.num_kv_iterations.min(max_map_task_templates);
+        return;
+    }
 
-    while num_map_tasks < limits.max_map_task_templates as usize
-        && num_active_partial_state_groups < limits.max_active_partial_state_groups as usize
-    {
-        let candidate = ranges
-            .iter()
-            .enumerate()
-            .filter(|(_, range)| {
-                let num_active_q_tokens = (range.q_token_range.flat_q_token_indices.end
-                    - range.q_token_range.flat_q_token_indices.start)
-                    as usize;
-                num_active_partial_state_groups + num_active_q_tokens <= limits.max_active_partial_state_groups as usize
-                    && range.num_map_tasks < range.num_kv_iterations
-            })
-            .map(|(index, range)| (index, range.num_kv_iterations.div_ceil(range.num_map_tasks)))
-            .max_by_key(|&(index, iterations_per_task)| (iterations_per_task, Reverse(index)));
-        let Some((index, _)) = candidate else {
+    // Largest per-split KV work first; earlier Q ranges win ties.
+    let mut candidates = ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, range)| range.num_kv_splits < range.num_kv_iterations)
+        .map(|(index, range)| (range.num_kv_iterations.div_ceil(range.num_kv_splits), Reverse(index)))
+        .collect::<BinaryHeap<_>>();
+
+    for _ in num_map_task_templates..max_map_task_templates as usize {
+        let Some((_, Reverse(index))) = candidates.pop() else {
             break;
         };
-        num_active_partial_state_groups += (ranges[index].q_token_range.flat_q_token_indices.end
-            - ranges[index].q_token_range.flat_q_token_indices.start)
-            as usize;
-        ranges[index].num_map_tasks += 1;
-        num_map_tasks += 1;
+        let range = &mut ranges[index];
+        range.num_kv_splits += 1;
+        if range.num_kv_splits < range.num_kv_iterations {
+            candidates.push((range.num_kv_iterations.div_ceil(range.num_kv_splits), Reverse(index)));
+        }
     }
 }
 
@@ -595,6 +588,14 @@ mod tests {
         let tail_selection = selection(&[1024, 65536], &[64, 1]);
         assert!(is_single_q(&tail_selection));
 
+        let mixed_selection = selection(&[8192, 65536], &[64, 64]);
+        let num_kv_splits = mixed_selection
+            .cu_partial_outputs_by_q_token_range()
+            .windows(2)
+            .map(|offsets| offsets[1] - offsets[0])
+            .collect::<Vec<_>>();
+        assert_eq!(num_kv_splits, [vec![2; 8], vec![14; 8]].concat());
+
         let selection = selection(&[65536], &[25]);
         assert!(!is_single_q(&selection));
         assert_eq!(selection.q_token_ranges().len(), 4);
@@ -608,21 +609,39 @@ mod tests {
 
     #[test]
     fn test_selection_map_tasks_cover_each_visible_kv_range_once() {
-        let selection = selection(&[1024], &[25]);
-        for (range_index, range) in selection.q_token_ranges().iter().enumerate() {
+        for (history_tokens, q_tokens) in [
+            (vec![1024], vec![25]),
+            (vec![8192, 65536], vec![64, 64]),
+            (vec![0], vec![1]),
+            (vec![0], vec![128]),
+            (vec![65536; 128], vec![1; 128]),
+        ] {
+            let selection = selection(&history_tokens, &q_tokens);
             let offsets = selection.cu_partial_outputs_by_q_token_range();
-            let templates =
-                &selection.map_task_templates()[offsets[range_index] as usize..offsets[range_index + 1] as usize];
-            assert_eq!(templates.first().unwrap().request_local_kv_token_indices.start, 0);
+            let map = selection.variant().map.thread_block;
+            let num_kv_iterations = selection
+                .q_token_ranges()
+                .iter()
+                .map(|range| range.num_visible_kv_tokens.div_ceil(map.kv_tokens_per_iteration))
+                .sum::<u32>();
             assert_eq!(
-                templates.last().unwrap().request_local_kv_token_indices.end,
-                range.max_visible_kv_tokens
+                selection.map_task_templates().len(),
+                num_kv_iterations.min(128) as usize
             );
-            for pair in templates.windows(2) {
+            for (range_index, range) in selection.q_token_ranges().iter().enumerate() {
+                let templates =
+                    &selection.map_task_templates()[offsets[range_index] as usize..offsets[range_index + 1] as usize];
+                assert_eq!(templates.first().unwrap().request_local_kv_token_indices.start, 0);
                 assert_eq!(
-                    pair[0].request_local_kv_token_indices.end,
-                    pair[1].request_local_kv_token_indices.start
+                    templates.last().unwrap().request_local_kv_token_indices.end,
+                    range.num_visible_kv_tokens
                 );
+                for pair in templates.windows(2) {
+                    assert_eq!(
+                        pair[0].request_local_kv_token_indices.end,
+                        pair[1].request_local_kv_token_indices.start
+                    );
+                }
             }
         }
     }

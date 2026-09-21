@@ -226,15 +226,25 @@ of the row range and the Map TaskTemplate range. It does not assume `begin = 0` 
 partial zero weight.
 
 The selector creates request-local `gqa::sdpa::QTokenRange` values. A range contains `request_index`,
-`flat_q_token_indices`, and `max_visible_kv_tokens`. A `QTokenRange` is dynamic task metadata. It is not a kernel
-tile or a complete Map task.
+`flat_q_token_indices`, and `num_visible_kv_tokens`. This token count is the KV extent visible to the last Q token
+in the causal range. A `QTokenRange` is dynamic task metadata. It is not a kernel tile or a complete Map task.
 
 The selector calculates the number of KV iterations:
 
 ```text
 num_kv_iterations
-    = ceil(max_visible_kv_tokens / map.thread_block.kv_tokens_per_iteration)
+    = ceil(num_visible_kv_tokens / map.thread_block.kv_tokens_per_iteration)
 ```
+
+`num_kv_iterations` counts internal KV loop iterations. It does not count context tokens.
+`num_kv_splits` counts the KV segments assigned to one Q-token range. Each segment produces one Map task template.
+`num_map_task_templates` counts these templates across the complete batch.
+
+The selector starts with one split per Q-token range. A max-heap selects the range with the largest
+`ceil(num_kv_iterations / num_kv_splits)`. Earlier Q-token ranges win ties. The selector increments that range's
+split count and updates its heap priority. It stops when the batch reaches the Map task-template capacity or every
+split contains one KV iteration. A batch that already fills the capacity does not build the heap.
+A single Q-token range directly receives `min(num_kv_iterations, max_map_task_templates)` splits.
 
 It then distributes consecutive KV iterations across Map tasks. A tail task can contain fewer KV iterations. Adjacent
 task ranges do not overlap and do not leave gaps.
@@ -302,7 +312,7 @@ num_active_partial_state_groups
 num_active_partial_states
 num_reserved_partial_state_groups
 num_replay_reserved_partial_state_groups
-max_kv_iterations_per_map_task
+max_kv_iterations_per_split
 num_logical_qk_token_pairs
 ```
 

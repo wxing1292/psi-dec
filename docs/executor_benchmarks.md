@@ -126,7 +126,7 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
 - `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It derives FP8
   E4M3FN KV tokens per page from the production 32 KiB page size and the selected model profile. It can run an explicit
   untimed `--validate-split-kv-tiled-q` comparison. `--max-tokens` fixes the token and Map task-template capacities.
-  Each candidate derives its partial-state capacity and active budget from its registered Q-range width.
+  Each candidate derives its partial-state capacity from its registered Q-range width.
   The default is the server default of 128. Each case reports the active KV splits, fixed-TQ reserved partial slots,
   active partial states, and segment distribution.
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SplitKV-only variants, and exact QKV/output
@@ -187,7 +187,7 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
   `all_layers` does not include final norm and does not measure the complete Main stage.
   For the 27B schedule, `layer3` is the first GQA layer. The bench records fixed active extents and does not submit
   dynamic replay arguments. `--max-tokens` defaults to 128. It fixes the scratch and metadata capacity and the current
-  active-partial-state scheduling budget. GQA cases report the selected variant, padded replay extent, and materialized
+  Map task-template scheduling budget. GQA cases report the selected variant, padded replay extent, and materialized
   segment distribution.
 - `qwen35_main` records the production `Qwen35Main` owner.
   Its implicit `main` case includes all transformer layers and final norm.
