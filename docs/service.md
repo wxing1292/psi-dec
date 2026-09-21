@@ -364,23 +364,34 @@ The proposal count is independent of `--max-tokens-per-request`.
 That option limits the Main verification batch.
 The scheduler may verify only a proposal prefix.
 
-The service specialization module provides the model-independent worker build and process lifecycle.
-`SpecializedWorker` uses `escargot` to build an executable for the active profile and target.
-It owns the dedicated target directory, build environment, artifact path, and process replacement.
-A model launcher supplies its worker manifest, binary name, specialization target directory, build environment, and worker arguments.
-
-`qwen3_5_dense` and `qwen3_5_sparse` are thin model-specific launchers.
-Each launcher validates the normal CLI. For MTP with K speculative tokens, it calculates `L = K + 1`.
+`inference-runtime-launcher` owns the Qwen CLI schemas, worker package generation, Cargo builds, and process replacement.
+It has no dependency on runtime core, model executors, or Metal.
+The service consumes the same CLI schemas and validation.
+`qwen3_5_dense` and `qwen3_5_sparse` validate the normal CLI without instantiating a model runtime.
+For MTP with K speculative tokens, the launcher calculates `L = K + 1`.
 For Vanilla, DSpark, and DFlash2, it uses `L = 1`.
-It configures `SpecializedWorker` to build a const-specialized copy of the same `qwen3_5_dense` or `qwen3_5_sparse` binary.
-The `inference-runtime-service` `build.rs` generates compile-time const `L`.
-An internal environment marker makes the specialized binary run the model instead of starting another build.
-The launcher then replaces itself with that specialized binary.
 
-Each cache-lane count uses `target/qwen3_5_specialized/cache_lanes_L` as its Cargo target directory.
-Cargo fingerprints the source, features, target, and active debug or release profile in that directory.
-A warm launch checks and reuses the existing artifact.
-A cold launch requires the repository source, Cargo, the pinned Rust toolchain, and access to all required build inputs.
+Each launcher generates a small package under `target/specialized/<binary>_lanes_L`.
+Its entry point calls the matching service function with const `L`.
+Each L has a distinct package and executable name.
+The service library and its dependencies do not depend on L.
+The launcher replaces itself with the worker after Cargo finishes.
+The worker enters the service directly.
+
+All workers share the launcher's Cargo target directory, target mode, and profile.
+An explicit `--target` remains explicit. A native build remains native.
+A custom target directory or profile also applies to the worker.
+The launcher `build.rs` records this build location. It does not generate model constants.
+Worker manifests copy the workspace profiles and dependency overrides (`[patch]` and `[replace]`).
+The launcher resolves relative override paths from the source workspace.
+Worker lockfiles use the workspace dependency versions. A missing worker lockfile is restored from the workspace lockfile.
+A cold worker build acquires the service dependencies once. Later workers reuse them.
+The repository source, Cargo, and the selected Rust toolchain must remain available.
+
+Cargo checks source and dependency freshness on each launch.
+Generation preserves unchanged file timestamps. A warm launch reuses the existing executable.
+Changing L selects another small worker package without rebuilding unchanged dependencies.
+The package generation lock and Cargo build lock serialize concurrent builds.
 
 The gRPC address defaults to `127.0.0.1:50051`. The HTTP address defaults to `127.0.0.1:8000`.
 

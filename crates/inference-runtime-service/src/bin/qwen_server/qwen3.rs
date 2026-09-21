@@ -13,10 +13,10 @@ use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
+use inference_runtime_launcher::args::Qwen3Args;
 
 use crate::codec::qwen::QwenCodec;
 use crate::executor::ReplayableModelExecutors;
-use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::config::Qwen3Config;
 use crate::qwen_server::config::Qwen3ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;

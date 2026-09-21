@@ -1853,26 +1853,29 @@ fn template_definition(kernel_name: &str, function_name: &str, args: &[String]) 
 }
 
 fn affine_quantized_source(template_definition: &str) -> String {
-    let root = mlx_metal_header_root();
-    let mut included = HashSet::new();
-    let mut source = String::new();
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/utils.h",
-        &mut included,
-    ));
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/steel/gemm/gemm.h",
-        &mut included,
-    ));
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/quantized.h",
-        &mut included,
-    ));
-    source.push_str(template_definition);
-    source
+    static HEADERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let headers = HEADERS.get_or_init(|| {
+        let root = mlx_metal_header_root();
+        let mut included = HashSet::new();
+        let mut source = String::new();
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/utils.h",
+            &mut included,
+        ));
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/steel/gemm/gemm.h",
+            &mut included,
+        ));
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/quantized.h",
+            &mut included,
+        ));
+        source
+    });
+    format!("{headers}{template_definition}")
 }
 
 const EXPERT_MAJOR_QMV_SOURCE: &str = include_str!("metal/affine_quantized_expert_major_qmv.metal");

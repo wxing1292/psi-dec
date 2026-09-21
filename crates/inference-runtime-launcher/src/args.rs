@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use clap::Args;
 use clap::Parser;
 use clap::ValueEnum;
-use inference_runtime_core::config::ExecutorHibernationMode;
+use inference_error::Result;
+use inference_error::log_info_invalid_argument;
 
 #[derive(Args, Debug)]
 pub struct QwenSpecArgs {
@@ -65,7 +66,7 @@ pub struct Qwen3Args {
         value_name = "MODE",
         help = "Executor hibernation state scope: all or selected"
     )]
-    pub executor_hibernation_mode: ExecutorHibernationMode,
+    pub executor_hibernation_mode: QwenHibernationMode,
 
     #[arg(
         long,
@@ -122,7 +123,7 @@ pub struct Qwen3ASRArgs {
         value_name = "MODE",
         help = "Executor hibernation state scope: all or selected"
     )]
-    pub executor_hibernation_mode: ExecutorHibernationMode,
+    pub executor_hibernation_mode: QwenHibernationMode,
 
     #[arg(long, default_value = "8192", help = "Total shared Qwen3-ASR KV-cache pages")]
     pub num_cache_pages: NonZeroUsize,
@@ -178,7 +179,7 @@ pub struct Qwen35Args {
         value_name = "MODE",
         help = "Executor hibernation state scope: all or selected"
     )]
-    pub executor_hibernation_mode: ExecutorHibernationMode,
+    pub executor_hibernation_mode: QwenHibernationMode,
 
     #[arg(
         long,
@@ -203,6 +204,64 @@ pub struct Qwen35Args {
         help = "Maximum tokens from one request in one forward transaction"
     )]
     pub max_tokens_per_request: NonZeroUsize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum QwenHibernationMode {
+    All,
+    Selected,
+}
+
+impl Qwen35Args {
+    /// Validates the CLI capacities and returns the runtime cache-lane count.
+    pub fn num_cache_lanes(&self) -> Result<usize> {
+        if self.spec.hf_spec_model_dir.is_some() != self.spec.spec_type.is_some() {
+            return Err(log_info_invalid_argument!(
+                "--hf-spec-model-dir and --spec-type must be specified together"
+            ));
+        }
+        if self.spec.num_spec_tokens.is_some() && self.spec.spec_type.is_none() {
+            return Err(log_info_invalid_argument!("--num-spec-tokens requires --spec-type"));
+        }
+        if self.max_tokens_per_request > self.max_tokens {
+            return Err(log_info_invalid_argument!(
+                "--max-tokens-per-request={} must not exceed --max-tokens={}",
+                self.max_tokens_per_request,
+                self.max_tokens
+            ));
+        }
+        if u32::try_from(self.max_requests.get()).is_err() {
+            return Err(log_info_invalid_argument!(
+                "--max-requests must fit the u32 request-slot domain"
+            ));
+        }
+        if i32::try_from(self.max_tokens.get()).is_err() {
+            return Err(log_info_invalid_argument!("--max-tokens must fit i32"));
+        }
+        if u32::try_from(self.max_tokens_per_request.get()).is_err() {
+            return Err(log_info_invalid_argument!("--max-tokens-per-request must fit u32"));
+        }
+        if u32::try_from(self.num_cache_pages.get()).is_err() {
+            return Err(log_info_invalid_argument!(
+                "--num-cache-pages must fit the u32 page-ID domain"
+            ));
+        }
+        if self.spec.spec_type != Some(QwenSpecType::MTP) {
+            return Ok(1);
+        }
+        let tokens = self.spec.num_spec_tokens.unwrap_or(NonZeroUsize::MIN);
+        if tokens > self.max_tokens_per_request {
+            return Err(log_info_invalid_argument!(
+                "--max-tokens-per-request={} must be at least --num-spec-tokens={tokens} for MTP cache-lane \
+                 initialization",
+                self.max_tokens_per_request
+            ));
+        }
+        tokens
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| log_info_invalid_argument!("MTP cache-lane count must fit usize"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -231,11 +290,11 @@ pub enum QwenLogLevel {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use inference_runtime_core::config::ExecutorHibernationMode;
 
     use super::Qwen3ASRArgs;
     use super::Qwen3Args;
     use super::Qwen35Args;
+    use super::QwenHibernationMode;
 
     #[test]
     fn test_scheduler_defaults() {
@@ -246,7 +305,7 @@ mod tests {
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 320 * 1024);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
-        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
+        assert_eq!(args.executor_hibernation_mode, QwenHibernationMode::Selected);
     }
 
     #[test]
@@ -262,7 +321,7 @@ mod tests {
         assert_eq!(args.spec.hf_spec_model_dir, None);
         assert_eq!(args.spec.spec_type, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
-        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
+        assert_eq!(args.executor_hibernation_mode, QwenHibernationMode::Selected);
     }
 
     #[test]
@@ -276,7 +335,7 @@ mod tests {
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 8 * 1024);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
-        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
+        assert_eq!(args.executor_hibernation_mode, QwenHibernationMode::Selected);
     }
 
     #[test]
@@ -301,9 +360,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(qwen3.executor_hibernation_mode, ExecutorHibernationMode::All);
-        assert_eq!(qwen3_asr.executor_hibernation_mode, ExecutorHibernationMode::All);
-        assert_eq!(qwen35.executor_hibernation_mode, ExecutorHibernationMode::All);
+        assert_eq!(qwen3.executor_hibernation_mode, QwenHibernationMode::All);
+        assert_eq!(qwen3_asr.executor_hibernation_mode, QwenHibernationMode::All);
+        assert_eq!(qwen35.executor_hibernation_mode, QwenHibernationMode::All);
     }
 
     #[test]

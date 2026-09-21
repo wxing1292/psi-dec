@@ -202,8 +202,10 @@ See the [performance helper guide](docs/service.md#end-to-end-performance-helper
 ## Workspace map
 
 ```text
+inference-error             shared typed errors and error logging
+inference-runtime-launcher  Qwen CLI and const-specialized worker builds
 inference-runtime-core      scheduling, lifecycle, and cache ownership
-inference-runtime-service   inference API, RPC, codecs, and server binaries
+inference-runtime-service   inference API, RPC, codecs, and model services
 inference-executor-core     backend-neutral model/component contracts
 inference-executor-metal    Qwen execution, replay, sampling, MTP, DSpark, and DFlash2
 inference-backend-metal     Metal resources, kernels, and ICB runtime

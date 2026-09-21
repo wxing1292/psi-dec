@@ -12,10 +12,10 @@ use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
+use inference_runtime_launcher::args::Qwen3ASRArgs;
 
 use crate::asr::Qwen3ASRService;
 use crate::executor::ReplayableModelExecutors;
-use crate::qwen_server::args::Qwen3ASRArgs;
 use crate::qwen_server::config::Qwen3ASRConfig;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::context_window;

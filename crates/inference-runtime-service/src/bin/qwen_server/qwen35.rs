@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -20,24 +19,18 @@ use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
+use inference_runtime_launcher::args::Qwen35Args;
 
 use crate::codec::qwen::QwenCodec;
 use crate::executor::ReplayableModelExecutors;
-use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::config::Qwen35Config;
 use crate::qwen_server::config::Qwen35ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::context_window;
 use crate::rpc::HTTPService;
 use crate::runtime::serve_replay_model;
-use crate::specialization::SpecializedWorker;
 
 const TOKENS_PER_CACHE_BLOCK: usize = 2048;
-const QWEN35_DENSE_BIN: &str = "qwen3_5_dense";
-const QWEN35_SPARSE_BIN: &str = "qwen3_5_sparse";
-const QWEN35_BUILD_CACHE_LANES_ENV: &str = "PSI_QWEN35_CACHE_LANES";
-const QWEN35_SPECIALIZED_RUN_ENV: &str = "PSI_QWEN35_SPECIALIZED_WORKER";
-const QWEN35_SPECIALIZED_TARGET_DIR_NAME: &str = "qwen3_5_specialized";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelKind {
@@ -52,51 +45,14 @@ impl ModelKind {
             ModelKind::Sparse => "qwen3.5 sparse 35B-A3B",
         }
     }
-
-    fn binary(self) -> &'static str {
-        match self {
-            ModelKind::Dense => QWEN35_DENSE_BIN,
-            ModelKind::Sparse => QWEN35_SPARSE_BIN,
-        }
-    }
 }
 
 pub fn run_dense<const L: usize>() {
-    run_or_launch::<L>(ModelKind::Dense);
+    run_worker::<L>(ModelKind::Dense, Qwen35Args::parse());
 }
 
 pub fn run_sparse<const L: usize>() {
-    run_or_launch::<L>(ModelKind::Sparse);
-}
-
-fn run_or_launch<const L: usize>(kind: ModelKind) {
-    if std::env::var_os(QWEN35_SPECIALIZED_RUN_ENV).is_some() {
-        run_worker::<L>(kind, Qwen35Args::parse());
-    } else {
-        launch_or_exit(kind);
-    }
-}
-
-fn launch_or_exit(kind: ModelKind) {
-    if let Err(error) = launch_worker(kind) {
-        eprintln!("unable to start {}: {error}", kind.label());
-        std::process::exit(1);
-    }
-}
-
-fn launch_worker(kind: ModelKind) -> Result<()> {
-    let config = Qwen35Config::from_args(Qwen35Args::parse())?;
-    let num_cache_lanes = config.num_cache_lanes();
-    let service_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let worker_manifest = service_manifest_dir.join("Cargo.toml");
-    let worker_target_dir = service_manifest_dir
-        .join("../../target")
-        .join(QWEN35_SPECIALIZED_TARGET_DIR_NAME)
-        .join(format!("cache_lanes_{num_cache_lanes}"));
-    SpecializedWorker::new(worker_manifest, kind.binary(), worker_target_dir)
-        .build_env(QWEN35_BUILD_CACHE_LANES_ENV, num_cache_lanes.to_string())
-        .run_env(QWEN35_SPECIALIZED_RUN_ENV, "1")
-        .exec(std::env::args_os().skip(1))
+    run_worker::<L>(ModelKind::Sparse, Qwen35Args::parse());
 }
 
 fn run_worker<const L: usize>(kind: ModelKind, args: Qwen35Args) {

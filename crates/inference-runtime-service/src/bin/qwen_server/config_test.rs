@@ -4,15 +4,15 @@ use std::time::Duration;
 use clap::Parser;
 use inference_runtime_core::Error;
 use inference_runtime_core::config::ExecutorHibernationMode;
+use inference_runtime_launcher::args::Qwen3ASRArgs;
+use inference_runtime_launcher::args::Qwen3Args;
+use inference_runtime_launcher::args::Qwen35Args;
 
 use super::Qwen3ASRConfig;
 use super::Qwen3Config;
 use super::Qwen3ModelMode;
 use super::Qwen35Config;
 use super::Qwen35ModelMode;
-use crate::qwen_server::args::Qwen3ASRArgs;
-use crate::qwen_server::args::Qwen3Args;
-use crate::qwen_server::args::Qwen35Args;
 
 fn parse_qwen35(extra: &[&str]) -> Qwen35Args {
     let mut args = vec!["qwen3.5", "--hf-model-dir", "model"];

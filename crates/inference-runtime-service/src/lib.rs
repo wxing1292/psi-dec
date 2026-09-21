@@ -10,7 +10,6 @@ pub mod qwen_server;
 pub mod runtime;
 pub mod rpc;
 pub mod source_uri;
-pub mod specialization;
 pub mod telemetry;
 pub mod tool;
 

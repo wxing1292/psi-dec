@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/inference-error",
+  "crates/inference-runtime-launcher",
   "crates/inference-backend-metal",
   "crates/inference-executor-core",
   "crates/inference-executor-metal",
@@ -34,13 +36,14 @@ crossbeam-utils = "0.8"
 dashmap = "6.2"
 delegate = "0.13"
 event-listener = "5.4"
-escargot = "0.5.15"
 futures-lite = "2.6"
 futures-util = "0.3"
 half = "2.7"
 hdrhistogram = "7.6"
 hf-chat-template = "1.0"
 hound = "3.5"
+inference-error = { path = "crates/inference-error" }
+inference-runtime-launcher = { path = "crates/inference-runtime-launcher" }
 inference-backend-metal = { path = "crates/inference-backend-metal" }
 inference-executor-core = { path = "crates/inference-executor-core" }
 inference-executor-metal = { path = "crates/inference-executor-metal" }
@@ -91,6 +94,7 @@ thiserror = "2.0"
 tokenizers = "0.23"
 tokio = "1.53"
 tokio-stream = "0.1"
+toml = "1.1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"

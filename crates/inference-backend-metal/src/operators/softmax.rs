@@ -90,7 +90,7 @@ impl Kernel {
         let source = softmax_source();
         Self {
             constants,
-            kernel: CompiledKernel::new(device, &source, "block_softmax_bfloat16"),
+            kernel: CompiledKernel::new(device, source, "block_softmax_bfloat16"),
         }
     }
 
@@ -146,30 +146,33 @@ impl Operator for Invocation<'_> {
     }
 }
 
-fn softmax_source() -> String {
-    let root = mlx_metal_header_root();
-    let mut included = HashSet::new();
-    let mut source = String::new();
-    source.push_str(
-        "#include <metal_stdlib>\n#include <metal_common>\n#include <metal_simdgroup>\nusing namespace metal;\n",
-    );
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/defines.h",
-        &mut included,
-    ));
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/utils.h",
-        &mut included,
-    ));
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/softmax.h",
-        &mut included,
-    ));
-    source.push_str(PARAMETERIZED_SOFTMAX_SOURCE);
-    source
+fn softmax_source() -> &'static str {
+    static EXPANDED_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPANDED_SOURCE.get_or_init(|| {
+        let root = mlx_metal_header_root();
+        let mut included = HashSet::new();
+        let mut source = String::new();
+        source.push_str(
+            "#include <metal_stdlib>\n#include <metal_common>\n#include <metal_simdgroup>\nusing namespace metal;\n",
+        );
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/defines.h",
+            &mut included,
+        ));
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/utils.h",
+            &mut included,
+        ));
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/softmax.h",
+            &mut included,
+        ));
+        source.push_str(PARAMETERIZED_SOFTMAX_SOURCE);
+        source
+    })
 }
 
 // This kernel is the MLX single-row softmax with one fixed-capacity replay guard.

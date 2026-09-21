@@ -2,6 +2,10 @@
 
 Runtime core owns scheduling, request lifecycle, and page and cache ownership.
 
+`inference-error` owns the shared `Error`, `Result`, and error logging macros.
+Runtime core re-exports these items to preserve its caller API.
+The launcher uses the same error contract without depending on runtime core.
+
 Recommendation: Keep runtime core model-agnostic and separate from the model executor.
 
 ## Selection

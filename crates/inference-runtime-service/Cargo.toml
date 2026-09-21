@@ -5,9 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-build = "build.rs"
 
 [dependencies]
+inference-runtime-launcher = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
 async-channel = { workspace = true }
 async-stream = { workspace = true }
@@ -16,7 +16,6 @@ base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 crossbeam-channel = { workspace = true }
 delegate = { workspace = true }
-escargot = { workspace = true }
 futures-util = { workspace = true }
 hf-chat-template = { workspace = true }
 hound = { workspace = true }

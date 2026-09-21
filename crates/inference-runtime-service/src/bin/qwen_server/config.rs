@@ -8,13 +8,14 @@ use inference_runtime_core::Result;
 use inference_runtime_core::config::ExecutorHibernationMode;
 use inference_runtime_core::config::SchedulerConfig;
 use inference_runtime_core::log_info_invalid_argument;
+use inference_runtime_launcher::args::Qwen3ASRArgs;
+use inference_runtime_launcher::args::Qwen3Args;
+use inference_runtime_launcher::args::Qwen35Args;
+use inference_runtime_launcher::args::QwenHibernationMode;
+use inference_runtime_launcher::args::QwenLogLevel;
+use inference_runtime_launcher::args::QwenProfileMode;
+use inference_runtime_launcher::args::QwenSpecType;
 
-use crate::qwen_server::args::Qwen3ASRArgs;
-use crate::qwen_server::args::Qwen3Args;
-use crate::qwen_server::args::Qwen35Args;
-use crate::qwen_server::args::QwenLogLevel;
-use crate::qwen_server::args::QwenProfileMode;
-use crate::qwen_server::args::QwenSpecType;
 use crate::telemetry::ProfileMode;
 use crate::telemetry::ProfilingConfig;
 use crate::telemetry::TelemetryConfig;
@@ -99,7 +100,7 @@ impl Qwen3Config {
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
             executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
-            executor_hibernation_mode: args.executor_hibernation_mode,
+            executor_hibernation_mode: executor_hibernation_mode(args.executor_hibernation_mode),
             num_cache_pages: args.num_cache_pages.get(),
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
@@ -195,7 +196,7 @@ impl Qwen3ASRConfig {
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
             executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
-            executor_hibernation_mode: args.executor_hibernation_mode,
+            executor_hibernation_mode: executor_hibernation_mode(args.executor_hibernation_mode),
             num_cache_pages: args.num_cache_pages.get(),
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
@@ -290,36 +291,9 @@ pub struct Qwen35Config {
 
 impl Qwen35Config {
     pub fn from_args(args: Qwen35Args) -> Result<Self> {
+        let num_cache_lanes = args.num_cache_lanes()?;
         let spec_checkpoint = normalize_spec_checkpoint(args.spec.hf_spec_model_dir, args.spec.spec_type)?;
-        let is_mtp = matches!(
-            spec_checkpoint.as_ref(),
-            Some(SpecCheckpoint {
-                spec_type: QwenSpecType::MTP,
-                ..
-            })
-        );
-        if args.spec.num_spec_tokens.is_some() && spec_checkpoint.is_none() {
-            return Err(log_info_invalid_argument!("--num-spec-tokens requires --spec-type"));
-        }
-        let num_mtp_tokens = is_mtp.then(|| args.spec.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
-        validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
-        validate_mtp_scheduler_capacity(num_mtp_tokens, args.max_tokens_per_request)?;
-        if u32::try_from(args.max_requests.get()).is_err() {
-            return Err(log_info_invalid_argument!(
-                "--max-requests must fit the u32 request-slot domain"
-            ));
-        }
-        if i32::try_from(args.max_tokens.get()).is_err() {
-            return Err(log_info_invalid_argument!("--max-tokens must fit i32"));
-        }
-        if u32::try_from(args.max_tokens_per_request.get()).is_err() {
-            return Err(log_info_invalid_argument!("--max-tokens-per-request must fit u32"));
-        }
-        if u32::try_from(args.num_cache_pages.get()).is_err() {
-            return Err(log_info_invalid_argument!(
-                "--num-cache-pages must fit the u32 page-ID domain"
-            ));
-        }
+        let num_mtp_tokens = NonZeroUsize::new(num_cache_lanes - 1);
 
         let model_mode = match spec_checkpoint {
             None => Qwen35ModelMode::Vanilla,
@@ -364,7 +338,7 @@ impl Qwen35Config {
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
             executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
-            executor_hibernation_mode: args.executor_hibernation_mode,
+            executor_hibernation_mode: executor_hibernation_mode(args.executor_hibernation_mode),
             num_cache_pages: args.num_cache_pages.get(),
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
@@ -435,22 +409,6 @@ fn normalize_spec_checkpoint(
     }
 }
 
-fn validate_mtp_scheduler_capacity(
-    num_spec_tokens: Option<NonZeroUsize>,
-    max_tokens_per_request: NonZeroUsize,
-) -> Result<()> {
-    let Some(num_spec_tokens) = num_spec_tokens else {
-        return Ok(());
-    };
-    if num_spec_tokens.get() > max_tokens_per_request.get() {
-        return Err(log_info_invalid_argument!(
-            "--max-tokens-per-request={max_tokens_per_request} must be at least --num-spec-tokens={num_spec_tokens} \
-             for MTP cache-lane initialization"
-        ));
-    }
-    Ok(())
-}
-
 fn validate_scheduler_token_capacity(max_tokens: NonZeroUsize, max_tokens_per_request: NonZeroUsize) -> Result<()> {
     if max_tokens_per_request.get() > max_tokens.get() {
         return Err(log_info_invalid_argument!(
@@ -458,6 +416,13 @@ fn validate_scheduler_token_capacity(max_tokens: NonZeroUsize, max_tokens_per_re
         ));
     }
     Ok(())
+}
+
+fn executor_hibernation_mode(mode: QwenHibernationMode) -> ExecutorHibernationMode {
+    match mode {
+        QwenHibernationMode::All => ExecutorHibernationMode::All,
+        QwenHibernationMode::Selected => ExecutorHibernationMode::Selected,
+    }
 }
 
 impl From<QwenProfileMode> for ProfileMode {

@@ -77,7 +77,7 @@ pub struct Kernel {
 impl Kernel {
     pub fn new(device: &Device) -> Self {
         Self {
-            kernel: CompiledKernel::new(device, &source(), "bias_activation_bf16"),
+            kernel: CompiledKernel::new(device, source(), "bias_activation_bf16"),
         }
     }
 
@@ -153,12 +153,15 @@ fn debug_assert_range(buffer: &Buffer, offset_bytes: usize, len_bytes: usize, na
     debug_assert!(end_bytes <= buffer.len_bytes(), "{name} byte range exceeds its buffer");
 }
 
-fn source() -> String {
-    let root = find_mlx_metal_header_root("erf.h", |_| true, "BF16 GELU");
-    let mut included = HashSet::new();
-    let mut source = read_mlx_metal_header(&root, "mlx/backend/metal/kernels/erf.h", &mut included);
-    source.push_str(SOURCE);
-    source
+fn source() -> &'static str {
+    static EXPANDED_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPANDED_SOURCE.get_or_init(|| {
+        let root = find_mlx_metal_header_root("erf.h", |_| true, "BF16 GELU");
+        let mut included = HashSet::new();
+        let mut source = read_mlx_metal_header(&root, "mlx/backend/metal/kernels/erf.h", &mut included);
+        source.push_str(SOURCE);
+        source
+    })
 }
 
 #[cfg(test)]

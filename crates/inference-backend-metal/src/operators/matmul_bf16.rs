@@ -153,13 +153,13 @@ impl Registry {
                 (
                     gemv_kind,
                     Variant {
-                        kernel: CompiledKernel::new(device, &gemv_source, gemv_kernel_name),
+                        kernel: CompiledKernel::new(device, gemv_source, gemv_kernel_name),
                     },
                 ),
                 (
                     KernelKind::GemmBm64Bn64Bk16Wm2Wn2,
                     Variant {
-                        kernel: CompiledKernel::new(device, &gemm_source, GEMM_KERNEL_NAME),
+                        kernel: CompiledKernel::new(device, gemm_source, GEMM_KERNEL_NAME),
                     },
                 ),
             ],
@@ -287,67 +287,73 @@ fn debug_assert_range(buffer: &Buffer, offset_bytes: usize, len_bytes: usize, na
     debug_assert!(end_bytes <= buffer.len_bytes(), "{name} byte range exceeds its buffer");
 }
 
-fn gemv_source() -> String {
-    let root = find_mlx_metal_header_root("gemv.metal", |_| true, "BF16 matmul GEMV");
-    read_mlx_metal_header(&root, "mlx/backend/metal/kernels/gemv.metal", &mut HashSet::new())
+fn gemv_source() -> &'static str {
+    static EXPANDED_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPANDED_SOURCE.get_or_init(|| {
+        let root = find_mlx_metal_header_root("gemv.metal", |_| true, "BF16 matmul GEMV");
+        read_mlx_metal_header(&root, "mlx/backend/metal/kernels/gemv.metal", &mut HashSet::new())
+    })
 }
 
-fn gemm_source() -> String {
-    let root = find_mlx_metal_header_root("steel/gemm/kernels/steel_gemm_fused.h", |_| true, "BF16 matmul GEMM");
-    let mut included = HashSet::new();
-    let mut source = read_mlx_metal_header(&root, "mlx/backend/metal/kernels/defines.h", &mut included);
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/utils.h",
-        &mut included,
-    ));
-    source.push_str(&read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/steel/gemm/gemm.h",
-        &mut included,
-    ));
-    let mut fused = read_mlx_metal_header(
-        &root,
-        "mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h",
-        &mut included,
-    );
-    for (declaration, value) in [
-        (
-            "constant bool has_batch [[function_constant(10)]];",
-            "constant bool has_batch = false;",
-        ),
-        (
-            "constant bool use_out_source [[function_constant(100)]];",
-            "constant bool use_out_source = false;",
-        ),
-        (
-            "constant bool do_axpby [[function_constant(110)]];",
-            "constant bool do_axpby = false;",
-        ),
-        (
-            "constant bool align_M [[function_constant(200)]];",
-            "constant bool align_M = false;",
-        ),
-        (
-            "constant bool align_N [[function_constant(201)]];",
-            "constant bool align_N = false;",
-        ),
-        (
-            "constant bool align_K [[function_constant(202)]];",
-            "constant bool align_K = true;",
-        ),
-    ] {
-        let declaration_start = fused
-            .find(declaration)
-            .unwrap_or_else(|| panic!("BF16 matmul MLX source is missing {declaration:?}"));
-        fused.replace_range(declaration_start..declaration_start + declaration.len(), value);
-    }
-    source.push_str(&fused);
-    source.push_str(&format!(
-        "\ntemplate [[host_name(\"{GEMM_KERNEL_NAME}\")]] [[kernel]] decltype(gemm<bfloat16_t, 64, 64, 16, 2, 2, \
-         false, true, float>) gemm<bfloat16_t, 64, 64, 16, 2, 2, false, true, float>;\n"
-    ));
-    source
+fn gemm_source() -> &'static str {
+    static EXPANDED_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPANDED_SOURCE.get_or_init(|| {
+        let root = find_mlx_metal_header_root("steel/gemm/kernels/steel_gemm_fused.h", |_| true, "BF16 matmul GEMM");
+        let mut included = HashSet::new();
+        let mut source = read_mlx_metal_header(&root, "mlx/backend/metal/kernels/defines.h", &mut included);
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/utils.h",
+            &mut included,
+        ));
+        source.push_str(&read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/steel/gemm/gemm.h",
+            &mut included,
+        ));
+        let mut fused = read_mlx_metal_header(
+            &root,
+            "mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h",
+            &mut included,
+        );
+        for (declaration, value) in [
+            (
+                "constant bool has_batch [[function_constant(10)]];",
+                "constant bool has_batch = false;",
+            ),
+            (
+                "constant bool use_out_source [[function_constant(100)]];",
+                "constant bool use_out_source = false;",
+            ),
+            (
+                "constant bool do_axpby [[function_constant(110)]];",
+                "constant bool do_axpby = false;",
+            ),
+            (
+                "constant bool align_M [[function_constant(200)]];",
+                "constant bool align_M = false;",
+            ),
+            (
+                "constant bool align_N [[function_constant(201)]];",
+                "constant bool align_N = false;",
+            ),
+            (
+                "constant bool align_K [[function_constant(202)]];",
+                "constant bool align_K = true;",
+            ),
+        ] {
+            let declaration_start = fused
+                .find(declaration)
+                .unwrap_or_else(|| panic!("BF16 matmul MLX source is missing {declaration:?}"));
+            fused.replace_range(declaration_start..declaration_start + declaration.len(), value);
+        }
+        source.push_str(&fused);
+        source.push_str(&format!(
+            "\ntemplate [[host_name(\"{GEMM_KERNEL_NAME}\")]] [[kernel]] decltype(gemm<bfloat16_t, 64, 64, 16, 2, 2, \
+             false, true, float>) gemm<bfloat16_t, 64, 64, 16, 2, 2, false, true, float>;\n"
+        ));
+        source
+    })
 }
 
 #[cfg(test)]

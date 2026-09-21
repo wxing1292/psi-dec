@@ -1,7 +1,8 @@
-mod error;
-pub use error::Error;
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub use inference_error::Error;
+pub use inference_error::Result;
+pub use inference_error::log_err_internal;
+pub use inference_error::log_err_unavailable;
+pub use inference_error::log_info_invalid_argument;
 pub trait SSS: Send + Sync + 'static {}
 impl<T> SSS for T where T: Send + Sync + 'static {}
 

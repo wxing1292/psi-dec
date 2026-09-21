@@ -64,7 +64,7 @@ impl Compute {
         config.validate();
         Self {
             config,
-            kernel: CompiledKernel::new(device, &source(), "layer_norm_loopedbfloat16"),
+            kernel: CompiledKernel::new(device, source(), "layer_norm_loopedbfloat16"),
         }
     }
 
@@ -118,19 +118,22 @@ impl Operator for Invocation<'_> {
     }
 }
 
-fn source() -> String {
-    let root = find_mlx_metal_header_root("layer_norm.metal", |_| true, "LayerNorm");
-    let mut included = HashSet::new();
-    let mut source = read_mlx_metal_header(&root, "mlx/backend/metal/kernels/layer_norm.metal", &mut included);
-    let declaration = "constant bool has_w [[function_constant(20)]];";
-    let declaration_start = source
-        .find(declaration)
-        .unwrap_or_else(|| panic!("LayerNorm MLX source is missing {declaration:?}"));
-    source.replace_range(
-        declaration_start..declaration_start + declaration.len(),
-        "constant bool has_w = true;",
-    );
-    source
+fn source() -> &'static str {
+    static EXPANDED_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPANDED_SOURCE.get_or_init(|| {
+        let root = find_mlx_metal_header_root("layer_norm.metal", |_| true, "LayerNorm");
+        let mut included = HashSet::new();
+        let mut source = read_mlx_metal_header(&root, "mlx/backend/metal/kernels/layer_norm.metal", &mut included);
+        let declaration = "constant bool has_w [[function_constant(20)]];";
+        let declaration_start = source
+            .find(declaration)
+            .unwrap_or_else(|| panic!("LayerNorm MLX source is missing {declaration:?}"));
+        source.replace_range(
+            declaration_start..declaration_start + declaration.len(),
+            "constant bool has_w = true;",
+        );
+        source
+    })
 }
 
 #[cfg(test)]

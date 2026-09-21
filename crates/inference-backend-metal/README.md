@@ -62,6 +62,18 @@ Weights, workspace, and runtime input use the same Metal allocation types despit
 `MetalRuntime` owns one compute `Stream` and one `BufferIO`.
 See [Execution Resources](#execution-resources) for retention and residency, and [End-To-End Lifecycle](#end-to-end-lifecycle) for resource creation and submission.
 
+### Compilation reuse
+
+`CompiledKernel` caches libraries by Metal device, complete source text, and MSL language version.
+Each cached library owns its pipelines, indexed by function name.
+Different entry points in the same source reuse one library.
+The library and pipeline caches belong to the compiling thread and live until that thread exits.
+
+MLX-derived operators expand their immutable header source once per process.
+The affine quantized operator shares one expanded header prefix across its specializations.
+Header paths and contents must remain fixed after their first use. Restart the process to use changed headers.
+These caches do not persist across process restarts.
+
 ### TensorOps kernels
 
 `CompiledKernel::new_tensor_ops` compiles TensorOps source with MSL 4.0. The pipeline cache includes the language version.
