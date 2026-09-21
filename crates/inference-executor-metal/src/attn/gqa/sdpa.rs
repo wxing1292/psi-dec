@@ -170,22 +170,59 @@ impl Selector {
             "GQA total token count must not exceed the metadata capacity"
         );
 
-        let candidates = self
-            .registry
-            .variants()
+        let config = self.registry.config();
+        let variants = self.registry.variants();
+        let materialize =
+            |variant| materialize_candidate(variant, config, request_shapes, self.limits, policy, num_total_tokens);
+        let single_q = variants
             .iter()
-            .map(|&variant| {
-                materialize_candidate(
-                    variant,
-                    self.registry.config(),
-                    request_shapes,
-                    self.limits,
-                    policy,
-                    num_total_tokens,
-                )
+            .copied()
+            .find(|variant| variant.map.thread_block.max_q_tokens == 1);
+        let mut tiled_variants = variants
+            .iter()
+            .copied()
+            .filter(|variant| variant.map.thread_block.max_q_tokens > 1);
+        let Some(first_tiled) = tiled_variants.next() else {
+            return materialize(single_q.expect("GQA SDPA registry requires an execution"));
+        };
+        let Some(single_q) = single_q else {
+            return materialize(first_tiled);
+        };
+
+        // Q-range density rejects variants before KV split allocation and ABI materialization.
+        let num_q_token_ranges: u32 = request_shapes
+            .iter()
+            .map(|shape| shape.num_q_tokens.div_ceil(first_tiled.map.thread_block.max_q_tokens))
+            .sum();
+        if u64::from(num_tokens) < 2 * u64::from(num_q_token_ranges) {
+            return materialize(single_q);
+        }
+
+        let full_q_heads = tiled_variants
+            .map(|variant| variant.map.thread_block.max_q_heads)
+            .fold(first_tiled.map.thread_block.max_q_heads, u32::max);
+        let desired_q_heads = if !matches!((config.head_dim, config.tokens_per_page), (128, 8 | 16))
+            && u64::from(num_tokens) < 4 * u64::from(num_q_token_ranges)
+        {
+            config.q_heads_per_kv_head().div_ceil(2).min(full_q_heads)
+        } else {
+            full_q_heads
+        };
+        let tiled_q = variants
+            .iter()
+            .copied()
+            .find(|variant| {
+                variant.map.thread_block.max_q_tokens > 1 && variant.map.thread_block.max_q_heads == desired_q_heads
             })
-            .collect::<Vec<_>>();
-        select_candidate(self.registry.config(), candidates)
+            .unwrap_or(first_tiled);
+        let tiled_q = materialize(tiled_q);
+        if (config.head_dim, config.tokens_per_page) == (256, 16) {
+            let single_q = materialize(single_q);
+            if !prefer_d256_page16_tiled_q(&single_q, &tiled_q) {
+                return single_q;
+            }
+        }
+        tiled_q
     }
 
     fn validate_policy(&self, policy: &GQAReplayBucketPolicy) {
@@ -212,7 +249,6 @@ fn materialize_candidate(
     policy: &GQAReplayBucketPolicy,
     num_total_tokens: u32,
 ) -> Selection {
-    assert!(variant.supports(config));
     let map = variant.map.thread_block;
     let mut ranges = build_q_token_ranges(request_shapes, map.max_q_tokens, map.kv_tokens_per_iteration);
     allocate_kv_splits(&mut ranges, limits.max_map_task_templates);
@@ -229,20 +265,13 @@ fn materialize_candidate(
                 range.num_kv_iterations as u64 * u64::from(kv_split_index) / u64::from(range.num_kv_splits);
             let kv_iteration_end =
                 range.num_kv_iterations as u64 * u64::from(kv_split_index + 1) / u64::from(range.num_kv_splits);
-            let num_kv_iterations_per_split = (kv_iteration_end - kv_iteration_begin)
-                .try_into()
-                .expect("GQA SDPA KV-iteration count must fit u32");
+            let num_kv_iterations_per_split = (kv_iteration_end - kv_iteration_begin) as u32;
             max_kv_iterations_per_split = max_kv_iterations_per_split.max(num_kv_iterations_per_split);
-            let kv_token_begin = kv_iteration_begin
-                .checked_mul(u64::from(map.kv_tokens_per_iteration))
-                .and_then(|value| value.try_into().ok())
-                .expect("GQA SDPA KV-token begin must fit u32");
-            let kv_token_end = range.q_token_range.num_visible_kv_tokens.min(
-                kv_iteration_end
-                    .checked_mul(u64::from(map.kv_tokens_per_iteration))
-                    .and_then(|value| value.try_into().ok())
-                    .expect("GQA SDPA KV-token end must fit u32"),
-            );
+            let kv_token_begin = kv_iteration_begin as u32 * map.kv_tokens_per_iteration;
+            let kv_token_end = range
+                .q_token_range
+                .num_visible_kv_tokens
+                .min(kv_iteration_end as u32 * map.kv_tokens_per_iteration);
             map_task_templates.push(MapTaskTemplate {
                 q_token_range_index: q_token_range_index
                     .try_into()
@@ -370,13 +399,19 @@ fn build_q_token_ranges(
                 .num_history_tokens
                 .checked_add(flat_q_token_end - flat_request_begin)
                 .expect("GQA visible KV-token count must fit u32");
+            let num_kv_iterations = num_visible_kv_tokens.div_ceil(kv_tokens_per_iteration);
+            // Validate the padded input range once, before materializing its KV splits.
+            assert!(
+                num_kv_iterations <= u32::MAX / kv_tokens_per_iteration,
+                "GQA padded KV-token range must fit u32"
+            );
             ranges.push(QTokenRangeWork {
                 q_token_range: QTokenRange {
                     request_index: request_index.try_into().expect("GQA request index must fit u32"),
                     flat_q_token_indices: flat_q_token_begin..flat_q_token_end,
                     num_visible_kv_tokens,
                 },
-                num_kv_iterations: num_visible_kv_tokens.div_ceil(kv_tokens_per_iteration),
+                num_kv_iterations,
                 num_kv_splits: 1,
             });
             flat_q_token_begin = flat_q_token_end;
@@ -416,60 +451,6 @@ fn allocate_kv_splits(ranges: &mut [QTokenRangeWork], max_map_task_templates: u3
             candidates.push((range.num_kv_iterations.div_ceil(range.num_kv_splits), Reverse(index)));
         }
     }
-}
-
-fn select_candidate(config: backend_sdpa::Config, mut candidates: Vec<Selection>) -> Selection {
-    assert!(!candidates.is_empty());
-    if candidates.len() == 1 {
-        return candidates.pop().unwrap();
-    }
-
-    let single_q_index = candidates
-        .iter()
-        .position(|selection| selection.variant.map.thread_block.max_q_tokens == 1);
-    let tiled_indices = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, selection)| selection.variant.map.thread_block.max_q_tokens > 1)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let Some(&first_tiled_index) = tiled_indices.first() else {
-        return candidates.remove(single_q_index.expect("GQA SDPA registry requires an execution"));
-    };
-    let Some(single_q_index) = single_q_index else {
-        return candidates.remove(first_tiled_index);
-    };
-
-    let num_tokens = candidates[first_tiled_index].replay_shape.num_tokens;
-    let num_q_token_ranges = candidates[first_tiled_index].replay_shape.num_q_token_tiles;
-    if u64::from(num_tokens) < 2 * u64::from(num_q_token_ranges) {
-        return candidates.remove(single_q_index);
-    }
-
-    let full_q_heads = tiled_indices
-        .iter()
-        .map(|&index| candidates[index].variant.map.thread_block.max_q_heads)
-        .max()
-        .unwrap();
-    let desired_q_heads = if !matches!((config.head_dim, config.tokens_per_page), (128, 8 | 16))
-        && u64::from(num_tokens) < 4 * u64::from(num_q_token_ranges)
-    {
-        config.q_heads_per_kv_head().div_ceil(2).min(full_q_heads)
-    } else {
-        full_q_heads
-    };
-    let tiled_q_index = tiled_indices
-        .iter()
-        .copied()
-        .find(|&index| candidates[index].variant.map.thread_block.max_q_heads == desired_q_heads)
-        .unwrap_or(first_tiled_index);
-
-    if (config.head_dim, config.tokens_per_page) == (256, 16)
-        && !prefer_d256_page16_tiled_q(&candidates[single_q_index], &candidates[tiled_q_index])
-    {
-        return candidates.remove(single_q_index);
-    }
-    candidates.remove(tiled_q_index)
 }
 
 fn prefer_d256_page16_tiled_q(single_q: &Selection, tiled_q: &Selection) -> bool {

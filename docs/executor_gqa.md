@@ -638,14 +638,16 @@ tokens per KV page. `backend_sdpa::Registry::new(...)` derives legal `backend_sd
 contains one compatible Map and Reduce constant set. `supports(...)` checks only static capability and correctness
 conditions.
 
-`gqa::sdpa::Selector` owns the dynamic workload and replay capacity. It creates request-local Q-token ranges. It applies
-the current greedy KV-segment allocation separately to each candidate variant. It then computes complete candidate
-metrics and applies the current measured selection policy. The selected `gqa::sdpa::Selection` contains the variant,
+`gqa::sdpa::Selector` owns the dynamic workload and replay capacity. It first applies the request-local Q-range density
+and Q-head rules. It does not allocate KV splits or metadata for variants that these rules reject.
+For D=256 with 16-token pages, it still constructs both remaining candidates for the measured cost comparison.
+Each constructed candidate uses the same greedy KV-segment allocation and complete metrics.
+The selected `gqa::sdpa::Selection` contains the variant,
 the materialized Q-token ranges and Map task templates, cumulative partial-output offsets, replay shape, and metrics.
 
-The selector also constructs each dynamic candidate. GQA does not have a separate planner layer. It returns a rich
-selection because the variant, request-local work partition, and replay extents form one coupled result. The selection
-is the atomic boundary between dynamic choice and metadata upload.
+The selector also constructs the required dynamic candidates. GQA does not have a separate planner layer.
+It returns a rich selection because the variant, request-local work partition, and replay extents form one coupled result.
+The selection is the atomic boundary between dynamic choice and metadata upload.
 
 `GQAMetadataBuffers::update(...)` uploads the selection. Recording executes the stored variant and does not
 select again. Both current concrete kernel families partition a long visible KV range into independent KV segments.

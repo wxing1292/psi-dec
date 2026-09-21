@@ -160,8 +160,9 @@ backend_sdpa::Config
     -> gqa::sdpa::Selector
 
 gqa::sdpa::RequestShape[]
-    -> one candidate gqa::sdpa::Selection per legal variant
-    -> selection policy
+    -> Q-range density and Q-head policy
+    -> complete gqa::sdpa::Selection candidates still needed by the policy
+    -> D=256 page-16 cost comparison, when required
     -> selected gqa::sdpa::Selection
     -> GQAMetadataBuffers::update(...)
     -> Map kernel
@@ -224,6 +225,9 @@ also uploads one required half-open `visible_kv_token_ranges` entry per flat Q t
 of the row range and the Map TaskTemplate range. It does not assume `begin = 0` or infer an endpoint from
 `flat_token_indices`. A fully masked segment produces `exp_sum = 0` and `max_logit = -infinity`; Reduce gives that
 partial zero weight.
+
+Range construction validates that the KV endpoint, including iteration padding, fits `u32`.
+Task materialization uses this validated domain for ordinary arithmetic and casts.
 
 The selector creates request-local `gqa::sdpa::QTokenRange` values. A range contains `request_index`,
 `flat_q_token_indices`, and `num_visible_kv_tokens`. This token count is the KV extent visible to the last Q token
@@ -293,8 +297,11 @@ represent this result. Moving candidate construction into `GQAMetadataBuffers` w
 Returning unrelated parallel values would weaken the boundary and permit mismatched variant and task metadata.
 
 `gqa::sdpa::Selector` is not a stateless wrapper. It owns the legal variant registry and the allocation limits.
-For each dynamic workload, it materializes every complete candidate before it compares them. This work allocates and
-fills request-local vectors. Callers must not repeat it only to recover one field.
+For each dynamic workload, it applies the Q-range density and Q-head rules before materialization.
+These rules need only request lengths and variant constants. Most profiles then construct one complete candidate.
+The D=256 page-16 cost comparison still constructs both SingleQ and the selected TiledQ candidate.
+Each constructed candidate includes KV splits, metadata, replay capacities, and complete metrics.
+This work allocates and fills request-local vectors. Callers must not repeat it only to recover one field.
 
 The selector includes candidate materialization. GQA does not have a separate `Planner` type or a `Plan` type. The
 `Selection` name describes the returned value and does not introduce a second decision layer.
