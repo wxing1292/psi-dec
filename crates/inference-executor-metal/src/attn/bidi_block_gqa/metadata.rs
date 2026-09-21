@@ -1,6 +1,7 @@
 //! GPU metadata for history and block attention partials.
 
 use std::cell::Cell;
+use std::collections::BinaryHeap;
 
 use inference_backend_metal::components::gqa::sdpa::ExecutionVariant;
 use inference_backend_metal::metal::Buffer;
@@ -238,25 +239,18 @@ fn build_metal_metadata(
         .collect::<Vec<_>>();
     let num_kv_iterations = history_token_ranges
         .iter()
-        .map(|range| (range.end - range.start).div_ceil(kv_tokens_per_iteration) as usize)
+        .map(|range| {
+            let num_kv_iterations = (range.end - range.start).div_ceil(kv_tokens_per_iteration);
+            // History can start above zero. Its padded endpoint must fit the GPU metadata.
+            assert!(
+                num_kv_iterations <= (u32::MAX - range.start) / kv_tokens_per_iteration,
+                "BiDiBlockGQA padded history-token range must fit u32"
+            );
+            num_kv_iterations as usize
+        })
         .collect::<Vec<_>>();
-    let max_history_task_templates = max_sdpa_map_task_templates - q_token_range_indices.len();
-    let mut num_history_task_templates = vec![1usize; q_token_range_indices.len()];
-    let mut total_history_task_templates = q_token_range_indices.len();
-    while total_history_task_templates < max_history_task_templates {
-        let candidate = num_kv_iterations
-            .iter()
-            .zip(&num_history_task_templates)
-            .enumerate()
-            .filter(|&(_, (&iterations, &task_templates))| task_templates < iterations)
-            .max_by_key(|&(_, (&iterations, &task_templates))| iterations.div_ceil(task_templates))
-            .map(|(token_index, _)| token_index);
-        let Some(token_index) = candidate else {
-            break;
-        };
-        num_history_task_templates[token_index] += 1;
-        total_history_task_templates += 1;
-    }
+    let max_history_map_task_templates = max_sdpa_map_task_templates - q_token_range_indices.len();
+    let num_history_kv_splits = allocate_history_kv_splits(&num_kv_iterations, max_history_map_task_templates);
 
     let mut q_token_ranges = Vec::with_capacity(q_token_range_indices.len() * 2);
     let mut sdpa_map_task_templates = Vec::new();
@@ -275,28 +269,14 @@ fn build_metal_metadata(
         ]);
         let history_range = &history_token_ranges[q_token_range_index];
         let num_iterations = num_kv_iterations[q_token_range_index];
-        let num_tasks = num_history_task_templates[q_token_range_index];
-        for task_index in 0..num_tasks {
-            let iteration_begin = num_iterations * task_index / num_tasks;
-            let iteration_end = num_iterations * (task_index + 1) / num_tasks;
-            let kv_token_begin = history_range
-                .start
-                .checked_add(
-                    (iteration_begin as u64 * kv_tokens_per_iteration as u64)
-                        .try_into()
-                        .expect("BiDiBlockGQA history iteration begin must fit u32"),
-                )
-                .expect("BiDiBlockGQA history token begin must fit u32");
-            let kv_token_end = history_range.end.min(
-                history_range
-                    .start
-                    .checked_add(
-                        (iteration_end as u64 * kv_tokens_per_iteration as u64)
-                            .try_into()
-                            .expect("BiDiBlockGQA history iteration end must fit u32"),
-                    )
-                    .expect("BiDiBlockGQA history token end must fit u32"),
-            );
+        let num_kv_splits = num_history_kv_splits[q_token_range_index];
+        for kv_split_index in 0..num_kv_splits {
+            let iteration_begin = num_iterations * kv_split_index / num_kv_splits;
+            let iteration_end = num_iterations * (kv_split_index + 1) / num_kv_splits;
+            let kv_token_begin = history_range.start + iteration_begin as u32 * kv_tokens_per_iteration;
+            let kv_token_end = history_range
+                .end
+                .min(history_range.start + iteration_end as u32 * kv_tokens_per_iteration);
             sdpa_map_task_templates.extend_from_slice(&[
                 q_token_range_index
                     .try_into()
@@ -354,6 +334,35 @@ fn build_metal_metadata(
         cu_sdpa_partial_outputs,
         replay_shape,
     }
+}
+
+fn allocate_history_kv_splits(num_kv_iterations: &[usize], max_map_task_templates: usize) -> Vec<usize> {
+    debug_assert!(num_kv_iterations.len() <= max_map_task_templates);
+    if let &[iterations] = num_kv_iterations {
+        return vec![iterations.min(max_map_task_templates)];
+    }
+    let mut num_kv_splits = vec![1; num_kv_iterations.len()];
+    if num_kv_splits.len() == max_map_task_templates {
+        return num_kv_splits;
+    }
+
+    // Preserve the history allocator's tie order: later Q ranges win.
+    let mut candidates = num_kv_iterations
+        .iter()
+        .enumerate()
+        .filter(|&(_, &iterations)| iterations > 1)
+        .map(|(index, &iterations)| (iterations, index))
+        .collect::<BinaryHeap<_>>();
+    for _ in num_kv_splits.len()..max_map_task_templates {
+        let Some((_, index)) = candidates.pop() else {
+            break;
+        };
+        num_kv_splits[index] += 1;
+        if num_kv_splits[index] < num_kv_iterations[index] {
+            candidates.push((num_kv_iterations[index].div_ceil(num_kv_splits[index]), index));
+        }
+    }
+    num_kv_splits
 }
 
 #[cfg(test)]

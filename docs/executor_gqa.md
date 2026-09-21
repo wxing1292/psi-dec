@@ -661,6 +661,12 @@ that physical partial layout for one shared Reduce.
 DSpark and DFlash2 keep model-specific metadata construction.
 They do not use the general GQA request selector.
 
+BiDiBlockGQA reserves one local-block partial for each Q range before it assigns history KV splits.
+A max-heap assigns each additional history split to the range with the largest remaining work per split.
+It preserves the existing tie order: later Q ranges win. A single Q range receives its split count directly.
+Metadata construction validates the padded history endpoint before it creates individual task templates.
+This check includes the nonzero start of a sliding history range.
+
 For Qwen3x DSpark and Qwen3.5 DFlash2 GPU-prepared Spec Decode, `BiDiBlockGQAState` keeps ownership of the same metadata
 buffers.
 The complete replay sequence is CPU-recorded before submission. `SpecDecodeInput` rewrites accepted-dependent flat query
