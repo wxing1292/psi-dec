@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::check_finite;
 use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -33,6 +34,7 @@ use crate::model::residual_add::ResidualAdd;
 use crate::model::rms_norm::RMSNorm;
 
 pub struct Qwen35MTPLayer {
+    finite_check: Option<check_finite::Compute>,
     input_norm: RMSNorm,
     attention: Qwen3xGQA,
     residual_add: ResidualAdd,
@@ -96,6 +98,13 @@ impl Qwen35MTPLayer {
         let hidden_dim = config.text_config.hidden_size;
         let eps = config.text_config.rms_norm_eps;
         Ok(Self {
+            finite_check: crate::trace::qwen35_check_finite().then(|| {
+                check_finite::Compute::new(
+                    device,
+                    Dtype::Bfloat16,
+                    hidden_dim.try_into().expect("hidden dim must fit u32"),
+                )
+            }),
             input_norm: RMSNorm::new(device, hidden_dim, eps),
             attention,
             residual_add: ResidualAdd::new(device),
@@ -189,6 +198,19 @@ impl Qwen35MTPLayer {
             "qwen3.5 MTP active tokens must not exceed the replay capacity"
         );
         let hidden_dim = self.scratch.hidden_dim;
+        let check = |recorder: &mut R, stage: &str, buffer: &'a Buffer| {
+            if let Some(check) = &self.finite_check {
+                recorder.record(ReplayOp::opaque(check.invoke(
+                    check_finite::Input {
+                        buffer,
+                        num_total_rows: num_total_tokens,
+                        num_active_rows: num_active_tokens,
+                    },
+                    format!("MTP {stage}"),
+                )));
+            }
+        };
+        check(recorder, "input", input.residual_input);
         self.input_norm.record_with_barrier(
             recorder,
             num_total_tokens,
@@ -196,6 +218,7 @@ impl Qwen35MTPLayer {
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
+        check(recorder, "input_norm.output", &self.scratch.normalized_hidden);
         self.attention.record(
             recorder,
             &self.scratch.normalized_hidden,
@@ -204,6 +227,7 @@ impl Qwen35MTPLayer {
             input.gqa,
             num_active_tokens,
         );
+        check(recorder, "GQA.output", &self.scratch.branch_output);
         self.residual_add.record(
             recorder,
             num_total_tokens,
@@ -211,6 +235,11 @@ impl Qwen35MTPLayer {
             num_active_tokens,
             input.residual_input,
             &self.scratch.branch_output,
+            &self.scratch.post_attention_hidden,
+        );
+        check(
+            recorder,
+            "attention_residual.output",
             &self.scratch.post_attention_hidden,
         );
         self.post_attention_norm.record_with_barrier(
@@ -220,6 +249,7 @@ impl Qwen35MTPLayer {
             &self.scratch.post_attention_hidden,
             &self.scratch.normalized_hidden,
         );
+        check(recorder, "post_attention_norm.output", &self.scratch.normalized_hidden);
         self.mlp.record(
             recorder,
             &self.scratch.normalized_hidden,
@@ -227,6 +257,7 @@ impl Qwen35MTPLayer {
             num_total_tokens,
             num_active_tokens,
         );
+        check(recorder, "MLP.output", &self.scratch.branch_output);
         self.residual_add.record(
             recorder,
             num_total_tokens,
@@ -236,6 +267,7 @@ impl Qwen35MTPLayer {
             &self.scratch.branch_output,
             &self.scratch.residual_output,
         );
+        check(recorder, "output", &self.scratch.residual_output);
         &self.scratch.residual_output
     }
 }

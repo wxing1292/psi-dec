@@ -7,6 +7,32 @@ Qwen3.5 supports separate Vanilla, reusable-layer MTP, fixed-block DSpark, and D
 The `v3_x` directories contain version-neutral leaf components, utilities, and the Qwen3x DSpark and DFlash2 models.
 Each model owns its structural contracts and execution graph.
 
+## Numerical checkpoints
+
+Set `PSI_QWEN35_CHECK_FINITE=1` before starting the process to enable numerical checkpoints.
+The setting is read once. It is disabled by default.
+The backend `components/check_finite.rs` checks active F32 or BF16 rows and implements the same `SubmissionCheck`
+contract as sampling. It records one non-finite value with its row, column, dtype, and F32 bit pattern.
+
+Qwen3.5 Main and MTP record checks at layer inputs, input normalization, GQA or GDN outputs, attention residuals,
+post-attention normalization, MLP outputs, layer outputs, and final normalization.
+The shared GatherUnembed owner checks gathered hidden rows and logits.
+Main labels include the zero-based layer index. MTP labels refer to its shared trained layer.
+GatherUnembed labels refer to the shared Main/MTP output head.
+
+Only active rows are checked. Padding and unused scratch rows are excluded.
+Each checkpoint saves its failure on the GPU before later operations can overwrite the buffer.
+After successful GPU completion, the CPU reports the first failed checkpoint in recorded model order.
+This is the first observed failing boundary. It does not identify an instruction inside a fused kernel, and it does not
+inspect persistent cache contents or every intermediate tensor inside GQA, GDN, or MLP.
+The check rejects NaN, positive infinity, and negative infinity.
+
+The setting adds GPU scans and synchronization dependencies. It can prevent adjacent residual-add/RMSNorm fusion.
+Use this mode for correctness diagnosis, not throughput measurements.
+A Metal submission error takes precedence over checkpoint readback. If the GPU cannot complete the submission, the
+checkpoint diagnostic is not guaranteed to be available.
+See [service diagnostics](service.md#numerical-failure-diagnostics) for a complete capture command.
+
 ## Source layout
 
 ```text

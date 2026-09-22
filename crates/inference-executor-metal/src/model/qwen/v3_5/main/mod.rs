@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::check_finite;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
@@ -41,6 +43,7 @@ pub mod output;
 const QWEN35_MAIN_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("qwen3.5.main.num_active_tokens");
 
 pub struct Qwen35Main {
+    finite_check: Option<check_finite::Compute>,
     layers: Vec<Qwen35MainLayer>,
     final_norm: RMSNorm,
     residual_capture: Option<Rc<dyn MainResidualCapture>>,
@@ -108,6 +111,17 @@ impl Qwen35Main {
             topology_boundaries.extend(layer.mlp_replay_topology_boundaries());
         }
         Ok(Self {
+            finite_check: crate::trace::qwen35_check_finite().then(|| {
+                check_finite::Compute::new(
+                    device,
+                    Dtype::Bfloat16,
+                    config
+                        .text_config
+                        .hidden_size
+                        .try_into()
+                        .expect("hidden dim must fit u32"),
+                )
+            }),
             layers,
             final_norm: RMSNorm::new(device, config.text_config.hidden_size, config.text_config.rms_norm_eps),
             residual_capture,
@@ -242,6 +256,16 @@ impl Qwen35Main {
             hidden,
             args.hidden_output,
         );
+        if let Some(check) = &self.finite_check {
+            recorder.record(ReplayOp::opaque(check.invoke(
+                check_finite::Input {
+                    buffer: args.hidden_output,
+                    num_total_rows: num_total_tokens,
+                    num_active_rows: num_active_tokens,
+                },
+                "Main final_norm.output".to_owned(),
+            )));
+        }
         args.hidden_output
     }
 

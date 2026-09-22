@@ -996,6 +996,40 @@ submission completion or output readback.
 diagnostics. The end-to-end performance helpers enable only the `inference-runtime-service::perf` DEBUG target when
 the selected server logging level is INFO.
 
+### Numerical failure diagnostics
+
+For a Qwen3.5 numerical failure, run the following command from the repository root.
+It records the local revision, OS build, hardware, command, batch diagnostics, and panic output in one file.
+The model paths below match the 27B Main/MTP configuration. Keep the same input request that reproduces the failure.
+
+```sh
+set -o pipefail
+{
+  git rev-parse HEAD
+  git status --short
+  sw_vers
+  sysctl -n machdep.cpu.brand_string hw.memsize
+  set -x
+  PSI_QWEN35_CHECK_FINITE=1 PSI_QWEN35_STATE_TRACE=1 RUST_BACKTRACE=full \
+    cargo run --release --bin qwen3_5_dense -- \
+      --grpc-listen-addr 127.0.0.1:50061 \
+      --http-listen-addr 127.0.0.1:8000 \
+      --hf-model-dir ~/Workspace/models/Qwen3.8-27B-4bit \
+      --hf-spec-model-dir ~/Workspace/models/Qwen3.8-27B-MTP-4bit \
+      --spec-type mtp --num-spec-tokens 1 --logging debug
+} 2>&1 | tee /tmp/psi-dec-numerical-debug.log
+```
+
+Send the complete log and the reproducing request. A screenshot omits the preceding request and stage context.
+The numerical panic identifies the first observed failing checkpoint, its buffer coordinates, value, and bit pattern.
+Sampling failures include the available request slot, sample position, RNG domain, and sampling parameters.
+Metal submission failures include the Foundation description of `userInfo`, including underlying error descriptions.
+Use the preceding batch request log to associate a local row or request slot with the request ID.
+The [Qwen guide](executor_qwen.md#numerical-checkpoints) defines checkpoint coverage and limitations.
+The checks add GPU work. Do not compare this run's throughput with a normal run.
+
+### Lifecycle diagnostics
+
 Internal model `Start` and `Stop` commands emit INFO lifecycle events on the
 `inference-runtime-service::lifecycle` target.
 The events use `component="model"` with `start.begin`, `start.complete`, `stop.begin`, and `stop.complete` phases.

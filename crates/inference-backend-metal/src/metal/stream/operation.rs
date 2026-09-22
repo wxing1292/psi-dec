@@ -10,6 +10,7 @@ use objc2_metal::MTLResourceUsage;
 use crate::metal::Buffer;
 use crate::metal::CompiledKernel;
 use crate::metal::stream::MAX_BUFFER_BINDINGS;
+use crate::metal::stream::check::SubmissionCheck;
 use crate::metal::stream::parameter::CommandParameterLayoutBuilder;
 use crate::metal::stream::parameter::ReplayParameterKey;
 
@@ -118,6 +119,17 @@ impl<'a> CommandRecorder<'a> {
             .expect("Metal command must set a kernel before setting its barrier");
         assert!(!command.barrier_before, "Metal command barrier was set twice");
         command.barrier_before = true;
+    }
+
+    /// Retains the component's invariant check until submission completion.
+    pub fn set_submission_check(&self, check: Rc<dyn SubmissionCheck>) {
+        let mut active = self.active.borrow_mut();
+        let active = active.as_mut().expect("submission check requires an active command");
+        assert!(
+            active.submission_check.is_none(),
+            "Metal command already has a submission check"
+        );
+        active.submission_check = Some(check);
     }
 
     pub fn set_buffer_read(&self, index: usize, buffer: &Buffer, offset_bytes: usize) {
@@ -383,6 +395,7 @@ struct CommandMetadataBuilder {
     threadblock_memory_lengths: Vec<Option<usize>>,
     dispatch: Option<CommandDispatch>,
     barrier_before: bool,
+    submission_check: Option<Rc<dyn SubmissionCheck>>,
 }
 
 impl CommandMetadataBuilder {
@@ -393,6 +406,7 @@ impl CommandMetadataBuilder {
             threadblock_memory_lengths: vec![None; MAX_BUFFER_BINDINGS],
             dispatch: None,
             barrier_before: false,
+            submission_check: None,
         }
     }
 
@@ -414,6 +428,7 @@ impl CommandMetadataBuilder {
             threadblock_memory_lengths: self.threadblock_memory_lengths,
             dispatch: self.dispatch.expect("recorded Metal command missing dispatch"),
             barrier_before: self.barrier_before,
+            submission_check: self.submission_check,
         }
     }
 }
@@ -425,6 +440,7 @@ pub struct CommandMetadata {
     pub threadblock_memory_lengths: Vec<Option<usize>>,
     pub dispatch: CommandDispatch,
     pub barrier_before: bool,
+    pub submission_check: Option<Rc<dyn SubmissionCheck>>,
 }
 
 #[derive(Clone, Debug)]

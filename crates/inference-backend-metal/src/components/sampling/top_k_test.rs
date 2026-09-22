@@ -1,3 +1,6 @@
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+
 use half::bf16;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
@@ -9,6 +12,7 @@ use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::ReplayArguments;
+use crate::metal::ReplayProgram;
 use crate::metal::Stream;
 use crate::test_support::ReplayTestCache;
 
@@ -171,6 +175,11 @@ fn run_merge_case(dtype: Dtype, top_k: u32) {
             }
         }
     }
+    let (replay, _) = cache.record(cache_key, || unreachable!());
+    let mut arguments = ReplayArguments::new();
+    map.add_replay_arguments(shape, 1, &mut arguments);
+    reduce.add_replay_arguments(shape, 1, &mut arguments);
+    assert_invalid_logits_rejected(&stream, replay, &arguments, &logits, dtype, shape.vocab_size as usize);
 }
 
 fn run_sample_case(dtype: Dtype, top_k: u32) {
@@ -250,6 +259,40 @@ fn run_sample_case(dtype: Dtype, top_k: u32) {
             &sampled_token_ids,
             &sampled_token_probs,
         );
+    }
+    let (replay, _) = cache.record(cache_key, || unreachable!());
+    let mut arguments = ReplayArguments::new();
+    map.add_replay_arguments(shape, 1, &mut arguments);
+    reduce.add_replay_arguments(shape, 1, &mut arguments);
+    assert_invalid_logits_rejected(&stream, replay, &arguments, &logits, dtype, shape.vocab_size as usize);
+    if dtype == Dtype::Float32 && top_k > 1 {
+        req_slots.write_typed(0, &[2_u32]);
+        sample_positions.write_typed(0, &[394_u32]);
+        write_sampling_params(
+            &params,
+            2,
+            &SamplerConfig {
+                temperature: 0.1,
+                top_k: 2,
+                top_p: 1.0,
+                seed: 42,
+            },
+        );
+        logits.write_typed(shape.vocab_size as usize, &[f32::MAX, f32::MAX / 2.0]);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            stream.submit_replay_with_arguments(replay, &arguments).wait();
+        }))
+        .expect_err("normalization overflow must fail");
+        let message = failure.downcast_ref::<String>().unwrap();
+        for expected in [
+            "invalid probability normalization; row=0 code=2",
+            "req_slot=2 sample_position=394 domain=Target (Main/bonus)",
+            "top_k=2 temperature=0.1 top_p=1 seed=42",
+            "diagnostic_value=NaN",
+            "candidate_token=0",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
     }
 }
 
@@ -410,6 +453,50 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
             );
             assert_eq!(distribution_probs.read_typed::<f32>(offset, max_k as usize), probs);
         }
+    }
+    let (replay, _) = cache.record(cache_key, || unreachable!());
+    let mut arguments = ReplayArguments::new();
+    map.add_replay_arguments(shape, 1, &mut arguments);
+    reduce.add_replay_arguments(shape, 1, &mut arguments);
+    assert_invalid_logits_rejected(&stream, replay, &arguments, &logits, dtype, shape.vocab_size as usize);
+}
+
+// The fixture has one prefix row. Only the first active row is invalidated.
+// Panics occur on the CPU after GPU completion, so no GPU fault is injected.
+fn assert_invalid_logits_rejected(
+    stream: &Stream,
+    replay: &ReplayProgram,
+    arguments: &ReplayArguments,
+    logits: &Buffer,
+    dtype: Dtype,
+    vocab_size: usize,
+) {
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        match dtype {
+            Dtype::Float32 => logits.write_typed(vocab_size, &vec![invalid; vocab_size]),
+            Dtype::Bfloat16 => logits.write_typed(vocab_size, &vec![bf16::from_f32(invalid).to_bits(); vocab_size]),
+            _ => unreachable!(),
+        }
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            stream.submit_replay_with_arguments(replay, arguments).wait();
+        }))
+        .expect_err("an all-nonfinite logits row must fail its submission");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("shader panic must report its reason");
+        assert!(
+            message.contains("no finite logit candidates; row=0 code=1"),
+            "{message}"
+        );
+
+        // One finite candidate is valid, including token 0. Reuse also proves
+        // that the completed submission releases its allocator and error state.
+        match dtype {
+            Dtype::Float32 => logits.write_typed(vocab_size, &[1.0_f32]),
+            Dtype::Bfloat16 => logits.write_typed(vocab_size, &[bf16::from_f32(1.0).to_bits()]),
+            _ => unreachable!(),
+        }
+        stream.submit_replay_with_arguments(replay, arguments).wait();
     }
 }
 

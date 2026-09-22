@@ -43,7 +43,7 @@ pub struct ReplaySubmission {
     allocator_in_flight: Rc<Cell<bool>>,
     completion: Rc<CommitCompletion>,
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
-    _resources: Vec<Rc<ReplayResources>>,
+    resources: Vec<Rc<ReplayResources>>,
     _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     _command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     timestamps: Option<SubmissionTimestamps>,
@@ -76,7 +76,7 @@ impl ReplaySubmission {
             allocator_in_flight: stream.allocator_in_flight.clone(),
             completion: stream.completion.clone(),
             allocator: stream.allocator.clone(),
-            _resources: resources,
+            resources,
             _queue: stream.queue.clone(),
             _command_buffer: command_buffer,
             timestamps,
@@ -95,6 +95,9 @@ impl ReplaySubmission {
         }
         self.allocator.reset();
         self.allocator_in_flight.set(false);
+        for resources in &self.resources {
+            resources.assert_success();
+        }
     }
 
     pub fn gpu_timestamp_durations(&self) -> Option<Vec<Duration>> {

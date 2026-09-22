@@ -51,9 +51,7 @@ pub fn sparse_sample_row_with_domain_reference(
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap().then_with(|| left.0.cmp(&right.0)));
     candidates.truncate(distribution_len);
-    if candidates.is_empty() {
-        return build_sparse_sample_row(0, 1.0, &[(0, 1.0)], distribution_len);
-    }
+    assert!(!candidates.is_empty(), "sampling row has no finite logit candidates");
     if config.is_greedy() || candidates.len() == 1 {
         return build_sparse_sample_row(candidates[0].0 as u32, 1.0, &[(candidates[0].0, 1.0)], distribution_len);
     }
@@ -65,9 +63,10 @@ pub fn sparse_sample_row_with_domain_reference(
         .map(|(_, logit)| ((*logit / temperature) - max_scaled_logit).exp())
         .collect::<Vec<_>>();
     let total = weights.iter().sum::<f32>();
-    if total <= 0.0 || !total.is_finite() {
-        return build_sparse_sample_row(candidates[0].0 as u32, 1.0, &[(candidates[0].0, 1.0)], distribution_len);
-    }
+    assert!(
+        total > 0.0 && total.is_finite(),
+        "invalid sampling probability normalization"
+    );
 
     let mut kept_total = 0.0f32;
     let mut kept_count = 0usize;
@@ -194,9 +193,7 @@ fn sample_probability_row_reference(probabilities: &[f32], uniform: f32, reporte
         .copied()
         .filter(|probability| *probability > 0.0)
         .sum::<f32>();
-    if total <= 0.0 || !total.is_finite() {
-        return (0, 0.0);
-    }
+    assert!(total > 0.0 && total.is_finite(), "invalid rejection probability mass");
     let draw = uniform * total;
     let mut cumulative = 0.0f32;
     for (token_index, &probability) in probabilities.iter().enumerate() {
@@ -211,7 +208,7 @@ fn sample_probability_row_reference(probabilities: &[f32], uniform: f32, reporte
         .rev()
         .find(|(_, probability)| **probability > 0.0)
         .map(|(token_index, _)| (token_index as u32, reported_probs[token_index].max(0.0)))
-        .unwrap_or((0, 0.0))
+        .expect("positive rejection mass requires a supported token")
 }
 
 fn mix_u32(mut h: u32) -> u32 {
@@ -305,6 +302,44 @@ mod tests {
         assert_ne!(target, sampling_uniform(seed, position, SamplingDomain::Draft));
         assert_ne!(target, sampling_uniform(seed, position, SamplingDomain::Accept));
         assert_ne!(target, sampling_uniform(seed, position, SamplingDomain::Resample));
+    }
+
+    #[test]
+    #[should_panic(expected = "sampling row has no finite logit candidates")]
+    fn test_no_finite_candidates() {
+        sparse_sample_row_reference(
+            &SamplerConfig {
+                temperature: 0.7,
+                top_k: 3,
+                top_p: 0.8,
+                seed: 42,
+            },
+            &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            3,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid sampling probability normalization")]
+    fn test_invalid_normalization() {
+        sparse_sample_row_reference(
+            &SamplerConfig {
+                temperature: 0.1,
+                top_k: 2,
+                top_p: 1.0,
+                seed: 42,
+            },
+            &[f32::MAX, f32::MAX / 2.0],
+            2,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid rejection probability mass")]
+    fn test_empty_rejection_distribution() {
+        rejection_sample_reference(&[], &[vec![0.0; 3]], &[], 42, 0);
     }
 
     fn one_hot(vocab_size: usize, token_index: usize) -> Vec<f32> {

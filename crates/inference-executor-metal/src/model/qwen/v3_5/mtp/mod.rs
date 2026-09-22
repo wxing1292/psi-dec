@@ -43,8 +43,10 @@
 
 use std::rc::Rc;
 
+use inference_backend_metal::components::check_finite;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
@@ -87,6 +89,7 @@ const QWEN35_MTP_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new
 const QWEN35_MTP_FIRST_CACHE_LANE: usize = 1;
 
 pub struct Qwen35MTP {
+    finite_check: Option<check_finite::Compute>,
     layer: Qwen35MTPLayer,
     output_norm: RMSNorm,
     request_page_table: Option<Rc<GQARequestPageTable>>,
@@ -135,6 +138,13 @@ impl Qwen35MTP {
         let mut topology_boundaries = gqa_state.replay_token_topology_boundaries().into_vec();
         topology_boundaries.extend(layer.mlp_replay_topology_boundaries());
         Ok(Self {
+            finite_check: crate::trace::qwen35_check_finite().then(|| {
+                check_finite::Compute::new(
+                    device,
+                    Dtype::Bfloat16,
+                    hidden_dim.try_into().expect("hidden dim must fit u32"),
+                )
+            }),
             layer,
             output_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
             request_page_table: Some(Rc::clone(gqa_state.request_page_table())),
@@ -325,6 +335,16 @@ impl Qwen35MTP {
             hidden,
             args.hidden_output,
         );
+        if let Some(check) = &self.finite_check {
+            recorder.record(ReplayOp::opaque(check.invoke(
+                check_finite::Input {
+                    buffer: args.hidden_output,
+                    num_total_rows: num_total_tokens,
+                    num_active_rows: num_active_tokens,
+                },
+                "MTP output_norm.output".to_owned(),
+            )));
+        }
         args.hidden_output
     }
 

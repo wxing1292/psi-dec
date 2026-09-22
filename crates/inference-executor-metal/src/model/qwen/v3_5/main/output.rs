@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::check_finite;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
@@ -21,6 +23,7 @@ const QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS: ReplayParameterKey =
     ReplayParameterKey::new("qwen3.5.gather_unembed.num_active_rows");
 
 pub struct Qwen35GatherUnembed {
+    finite_checks: Option<(check_finite::Compute, check_finite::Compute)>,
     gather: Gather,
     unembed: Option<Rc<Unembed>>,
     replay_bucket_policy: ReplayBucketPolicy,
@@ -40,6 +43,12 @@ impl Qwen35GatherUnembed {
         let replay_bucket_policy =
             ReplayBucketPolicy::with_topology_boundaries(unembed.max_tokens(), &unembed.replay_topology_boundaries());
         Self {
+            finite_checks: crate::trace::qwen35_check_finite().then(|| {
+                (
+                    check_finite::Compute::new(device, Dtype::Bfloat16, hidden_dim),
+                    check_finite::Compute::new(device, Dtype::Bfloat16, unembed.vocab_size()),
+                )
+            }),
             gather: Gather::new(device, hidden_dim),
             unembed: Some(unembed),
             replay_bucket_policy,
@@ -114,6 +123,16 @@ impl Qwen35GatherUnembed {
             args.row_indices,
             args.hidden_output,
         );
+        if let Some((check, _)) = &self.finite_checks {
+            recorder.record(ReplayOp::opaque(check.invoke(
+                check_finite::Input {
+                    buffer: args.hidden_output,
+                    num_total_rows,
+                    num_active_rows,
+                },
+                "Qwen35 GatherUnembed gathered_hidden".to_owned(),
+            )));
+        }
         <Unembed as ReplayLayer>::record(
             self.loaded_unembed(),
             recorder,
@@ -123,7 +142,18 @@ impl Qwen35GatherUnembed {
                 hidden: args.hidden_output,
                 logits: args.logits,
             },
-        )
+        );
+        if let Some((_, check)) = &self.finite_checks {
+            recorder.record(ReplayOp::opaque(check.invoke(
+                check_finite::Input {
+                    buffer: args.logits,
+                    num_total_rows,
+                    num_active_rows,
+                },
+                "Qwen35 GatherUnembed logits".to_owned(),
+            )));
+        }
+        args.logits
     }
 
     pub fn prepare_replay(&self, num_active_rows: u32) -> (Qwen35GatherUnembedReplayKey, ReplayArguments) {
@@ -203,6 +233,39 @@ mod tests {
     const HIDDEN_DIM: u32 = 32;
     const GROUP_SIZE: u32 = 32;
     const NUM_TOTAL_ROWS: u32 = 8;
+
+    #[test]
+    fn test_nonfinite_hidden_reports_gather_before_unembed() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let runtime = MetalReplayRuntime::new(&stream);
+        let (mut component, _) = fixture_component(&device);
+        component.finite_checks = Some((
+            check_finite::Compute::new(&device, Dtype::Bfloat16, HIDDEN_DIM),
+            check_finite::Compute::new(&device, Dtype::Bfloat16, VOCAB_SIZE),
+        ));
+        let buffers = TestBuffers::new(&device);
+        let source_index = buffers.row_index_values[0] as usize * HIDDEN_DIM as usize + 5;
+        buffers.hidden_input.write_typed(source_index, &[bf16::NAN.to_bits()]);
+        let input = buffers.input(NUM_TOTAL_ROWS);
+        let mut replay = Replay::new("Qwen35 numerical diagnostic test", component);
+        let (key, _) = replay.record(&runtime, &input);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime
+                .submit_replay_with_arguments(
+                    replay.replay(&key),
+                    &ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, 1),
+                )
+                .wait();
+        }))
+        .expect_err("non-finite gathered hidden must fail before logits are consumed");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains("Qwen35 GatherUnembed gathered_hidden; row=0 column=5"),
+            "{message}"
+        );
+        assert!(message.contains("value=NaN"), "{message}");
+    }
 
     #[test]
     fn test_replay_matches_cpu_reference_across_active_counts() {

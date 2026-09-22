@@ -45,6 +45,8 @@ pub use replay::ReplayProgram;
 pub use replay::ReplayProgramBuilder;
 pub use replay::ReplayProgramStats;
 
+pub mod check;
+
 mod submission;
 pub use submission::ReplayExecution;
 pub use submission::ReplaySubmission;
@@ -69,7 +71,9 @@ impl CommitCompletion {
         let (feedback_tx, feedback) = sync_channel(1);
         let handler = RcBlock::new(move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
             let feedback = unsafe { feedback.as_ref() };
-            let error = feedback.error().map(|error| format!("{error:?}"));
+            let error = feedback
+                .error()
+                .map(|error| format!("{error:?}\nMetal error details: {}", error.userInfo().description()));
             let _ = feedback_tx.send(error);
         });
         Rc::new(Self {
@@ -466,6 +470,94 @@ mod tests {
             .wait();
 
         assert_eq!(values.read_typed::<f32>(0, 1), vec![3.0]);
+    }
+
+    #[test]
+    fn test_shader_failure_completion() {
+        use std::panic::AssertUnwindSafe;
+        use std::panic::catch_unwind;
+        use std::rc::Rc;
+
+        use objc2_metal::MTLComputePipelineState;
+
+        use super::check;
+
+        #[derive(Debug)]
+        struct TestCheck(Buffer);
+
+        impl check::SubmissionCheck for TestCheck {
+            fn reset(&self) {
+                self.0.write_typed(0, &[0_u32; 2]);
+            }
+
+            fn assert_success(&self) {
+                let status = self.0.read_typed::<u32>(0, 2);
+                if status[0] != 0 {
+                    panic!("invalid input; row={} code={}", status[1], status[0]);
+                }
+            }
+        }
+
+        struct FailOnce<'a> {
+            kernel: &'a CompiledKernel,
+            fail: &'a Buffer,
+        }
+        impl Operator for FailOnce<'_> {
+            fn record(self, recorder: &CommandRecorder<'_>) {
+                recorder.set_kernel(self.kernel);
+                recorder.set_buffer_read_write(0, self.fail, 0);
+                let device = Device::from_raw_retained(self.kernel.as_raw().device());
+                let check = Rc::new(TestCheck(Buffer::from_slice(&device, &[0_u32; 2])));
+                recorder.set_buffer_read_write(1, &check.0, 0);
+                recorder.set_submission_check(check);
+                recorder.dispatch_1d(1, 1);
+            }
+        }
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let kernel = CompiledKernel::new(
+            &device,
+            r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void fail_once(device uint* fail [[buffer(0)]], device atomic_uint* error [[buffer(1)]]) {
+                if (*fail != 0) {
+                    atomic_store_explicit(error, 1, memory_order_relaxed);
+                    atomic_store_explicit(error + 1, 7, memory_order_relaxed);
+                    *fail = 0;
+                }
+            }
+        "#,
+            "fail_once",
+        );
+        let fail = Buffer::from_slice(&device, &[1_u32]);
+        let mut builder = stream.create_replay_program();
+        builder.record(FailOnce {
+            kernel: &kernel,
+            fail: &fail,
+        });
+        let program = builder.build();
+        let arguments = ReplayArguments::new();
+        let submission = stream.submit_replay_sequence(&[
+            ReplayExecution::new(&program, &arguments),
+            ReplayExecution::new(&program, &arguments),
+        ]);
+        let failure = catch_unwind(AssertUnwindSafe(|| submission.wait()))
+            .expect_err("a later successful execution must not erase an earlier failure");
+        assert!(
+            failure
+                .downcast_ref::<String>()
+                .unwrap()
+                .contains("invalid input; row=7 code=1")
+        );
+        drop(submission);
+        assert_eq!(fail.read_typed::<u32>(0, 1), vec![0]);
+        stream.submit_replay(&program).wait();
+
+        fail.write_typed(0, &[1_u32]);
+        let submission = stream.submit_replay(&program);
+        drop(program);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(submission))).is_err());
     }
 
     #[test]

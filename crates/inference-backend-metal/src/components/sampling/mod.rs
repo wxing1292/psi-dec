@@ -37,6 +37,7 @@
 
 const SAMPLING_SOURCE: &str = include_str!("../metal/sampling.metal");
 const MAX_TOP_K: u32 = 256;
+mod failure;
 
 fn checked_num_threads(num_work_items: u32, num_threads_per_work_item: u32) -> u32 {
     num_work_items

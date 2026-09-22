@@ -5,6 +5,8 @@ use super::SAMPLING_SOURCE;
 use super::checked_bytes;
 use super::checked_num_threads;
 use super::checked_product;
+use super::failure::SamplingFailure;
+use super::failure::SamplingOperation;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::CompiledKernel;
@@ -281,6 +283,12 @@ impl Operator for Invocation<'_> {
             "sparse rejection runtime parameter buffer is too short"
         );
         recorder.set_kernel(&self.kernel.kernel);
+        SamplingFailure::record(
+            recorder,
+            &self.kernel.kernel,
+            SamplingOperation::Rejection,
+            format!("{:?}", self.shape),
+        );
         recorder.set_buffer_read(0, self.buffers.target_distribution_token_ids, 0);
         recorder.set_buffer_read(1, self.buffers.target_distribution_probs, 0);
         recorder.set_buffer_read(2, self.buffers.draft_distribution_token_ids, 0);

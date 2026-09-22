@@ -20,6 +20,7 @@ crates/inference-executor-core/src/sampling/
 crates/inference-backend-metal/src/components/
   sampling/top_k.rs           generic Metal top-k sampling components
   sampling/top_k_test.rs      focused Top-K Metal parity and replay contracts
+  sampling/failure.rs         sampling-owned GPU failure record and CPU diagnostics
   sampling/dflash2_selector.rs
                               DFlash2 edge scoring and sequential path walk
   sampling/rejection.rs       sparse rejection component
@@ -94,6 +95,32 @@ F32 reduction, F32 bitonic, BF16 reduction, and BF16 bitonic. `Selector::select(
 reduction for sample-only top-k <= 32. Larger top-k and write-distribution generation use the bitonic Map path. The
 selector performs the complete choice. The component does not have a separate planner or plan object.
 Unused static threadblock storage can reduce occupancy.
+
+Each active sampling row must contain at least one finite logit candidate.
+A row with no finite candidates must fail. An invalid probability normalization or rejection mass must also fail.
+The backend must not substitute token `0` or a greedy distribution for these failures.
+A valid distribution can still select token `0`.
+
+The sampling component owns a retained failure record and implements `SubmissionCheck`.
+The stream resets registered checks before submission and calls them after successful GPU completion.
+The stream does not allocate sampling records or interpret sampling error codes.
+The shader captures the first failure for each command, including the row, available request slot, sample position,
+RNG domain, distribution index, sampling parameters, and failed numerical value with its F32 bits.
+Sparse rejection also captures the target and draft distribution ranges.
+Unavailable request slots, sample positions, and distribution indices are marked as unavailable.
+Other fields are reported only when the operation owns them.
+The row is local to that command, not a request ID or an absolute token position.
+The CPU reports the operation and recorded shape with this snapshot. It does not read reused input or scratch buffers
+to reconstruct the failed invocation.
+`ReplaySubmission::wait()` panics before the executor reads samples or returns a batch response.
+This check is active in release builds. It does not require an environment variable.
+Commands already encoded in the same submission can finish before the CPU detects the failure.
+The executor must not consume any outputs from that failed submission.
+
+The default sampling contract still filters individual non-finite logits when finite candidates remain.
+To reject any NaN or infinity at Qwen3.5 computation boundaries, enable the
+[numerical checkpoints](executor_qwen.md#numerical-checkpoints).
+These checkpoints identify an upstream component before the sampler can discard its non-finite logits.
 
 Sampling returns only token IDs and probabilities.
 Partial candidates and reduced rows are private scratch, not model-level API state.

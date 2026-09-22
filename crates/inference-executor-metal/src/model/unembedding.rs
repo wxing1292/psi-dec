@@ -148,6 +148,10 @@ impl Unembed {
         }
     }
 
+    pub fn vocab_size(&self) -> u32 {
+        self.config.vocab_size
+    }
+
     pub fn max_tokens(&self) -> u32 {
         self.config.max_tokens
     }

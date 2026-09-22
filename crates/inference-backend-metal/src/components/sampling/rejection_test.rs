@@ -207,6 +207,27 @@ fn test_replay_bucketing() {
         submit(num_active_reqs);
         assert_active_outputs(num_active_reqs);
     }
+
+    // The last active request has no drafts. An empty target distribution
+    // must fail instead of returning token 0 with probability 0.
+    let final_row = 6 * shape.max_target_k as usize;
+    target_distribution_probs.write_typed(final_row, &[0.0_f32; 4]);
+    submit(3); // The invalid row is outside the active request prefix.
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| submit(4)))
+        .expect_err("zero rejection probability mass must fail");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("invalid rejection probability mass; row=3 code=4"),
+        "{message}"
+    );
+    assert!(message.contains("req_slot=unavailable"), "{message}");
+    assert!(message.contains("distribution_index=6"), "{message}");
+    assert!(message.contains("diagnostic_value=0 bits=0x00000000"), "{message}");
+    assert!(!message.contains("temperature="), "{message}");
+    assert!(!message.contains("top_p="), "{message}");
+    target_distribution_probs.write_typed(final_row, &padded_target_probs[final_row..final_row + 4]);
+    submit(4);
+    assert_active_outputs(4);
 }
 
 fn write_distributions_from_dense(rows: &[Vec<f32>], row_stride: usize) -> (Vec<i32>, Vec<f32>) {

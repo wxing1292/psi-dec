@@ -575,6 +575,9 @@ Metal invokes the commit feedback block
 allocator.reset()
         |
         v
+component submission checks -> panic on failure
+        |
+        v
 wait returns; dropping ReplaySubmission releases command state and ReplayResources
 ```
 
@@ -588,6 +591,14 @@ The allocator backs transient submission commands. It does not own these persist
 
 `wait()` proves completion and resets the allocator. It leaves the retained submission fields intact. Dropping the
 `ReplaySubmission` releases those fields.
+
+Operators can register a component-owned `SubmissionCheck` with `CommandRecorder::set_submission_check`.
+The component owns its record layout, ordinary buffer bindings, reset, and failure diagnostics.
+The replay retains the check. Bound buffers participate in normal dependency tracking and residency.
+Encoding resets checks before the queue commit. A failure must remain set across repeated executions of the command
+in that submission. After successful GPU completion, `wait()` resets the allocator and calls the checks in recorded
+order. A failed check causes a release-build panic before the caller reads outputs.
+This mechanism does not abort commands already encoded in the submission.
 
 ## Current Stream Contract
 

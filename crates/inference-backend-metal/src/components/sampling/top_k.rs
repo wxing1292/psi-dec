@@ -3,6 +3,8 @@ use super::SAMPLING_SOURCE;
 use super::checked_bytes;
 use super::checked_num_threads;
 use super::checked_product;
+use super::failure::SamplingFailure;
+use super::failure::SamplingOperation;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::CompiledKernel;
@@ -597,6 +599,12 @@ impl Operator for MergeInvocation<'_> {
         assert!(self.buffers.logits.len_bytes() >= checked_bytes("Metal top-k merge logit", outputs, size_of::<f32>()));
         let num_partitions = num_vocab_partitions(self.shape, self.partial_candidate_layout);
         recorder.set_kernel(self.kernel);
+        SamplingFailure::record(
+            recorder,
+            self.kernel,
+            SamplingOperation::Merge,
+            format!("{:?}", self.shape),
+        );
         recorder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
         recorder.set_buffer_write(2, self.buffers.token_ids, 0);
@@ -661,6 +669,12 @@ impl Operator for SampleInvocation<'_> {
         let num_partitions = num_vocab_partitions(self.shape, self.partial_candidate_layout);
         let num_candidates_per_partition = num_candidates_per_partition(self.shape);
         recorder.set_kernel(self.kernel);
+        SamplingFailure::record(
+            recorder,
+            self.kernel,
+            SamplingOperation::Sample,
+            format!("{:?}", self.shape),
+        );
         recorder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
         recorder.set_buffer_write(2, self.buffers.token_ids, 0);
@@ -741,6 +755,12 @@ impl Operator for WriteDistributionInvocation<'_> {
             "top-k write-distribution prob buffer too short for declared outputs"
         );
         recorder.set_kernel(self.kernel);
+        SamplingFailure::record(
+            recorder,
+            self.kernel,
+            SamplingOperation::WriteDistribution,
+            format!("{:?}", self.shape),
+        );
         recorder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
         recorder.set_buffer_write(2, self.buffers.distribution_token_ids, 0);
@@ -848,6 +868,12 @@ impl Operator for SampleAndWriteDistributionInvocation<'_> {
         let num_partitions = num_vocab_partitions(self.shape, self.partial_candidate_layout);
         let num_candidates_per_partition = num_candidates_per_partition(self.shape);
         recorder.set_kernel(self.kernel);
+        SamplingFailure::record(
+            recorder,
+            self.kernel,
+            SamplingOperation::SampleAndWriteDistribution,
+            format!("{:?}", self.shape),
+        );
         recorder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
         recorder.set_buffer_write(2, self.buffers.sampled_token_ids, 0);

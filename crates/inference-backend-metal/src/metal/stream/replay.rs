@@ -19,6 +19,7 @@ use crate::metal::stream::MAX_BUFFER_BINDINGS;
 use crate::metal::stream::Operator;
 use crate::metal::stream::Stream;
 use crate::metal::stream::TrackedGpuAllocation;
+use crate::metal::stream::check::SubmissionCheck;
 use crate::metal::stream::dependency::CommandDependencyTracker;
 use crate::metal::stream::operation::CommandBinding;
 use crate::metal::stream::operation::CommandDispatch;
@@ -96,6 +97,15 @@ pub struct ReplayResources {
     retained_pipelines: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     parameter_buffer_allocation: Option<TrackedGpuAllocation>,
     icb_allocation: TrackedGpuAllocation,
+    checks: Vec<Rc<dyn SubmissionCheck>>,
+}
+
+impl ReplayResources {
+    pub fn assert_success(&self) {
+        for check in &self.checks {
+            check.assert_success();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -155,7 +165,11 @@ impl ReplayProgram {
         let mut retained_buffers = Vec::new();
         let mut retained_pipelines = Vec::new();
         let mut dependencies = CommandDependencyTracker::default();
+        let mut checks = Vec::new();
         for (command_index, command_metadata) in commands.iter().enumerate() {
+            if let Some(check) = &command_metadata.submission_check {
+                checks.push(check.clone());
+            }
             let command = unsafe { icb.indirectComputeCommandAtIndex(command_index) };
             command.setComputePipelineState(&command_metadata.pipeline);
             retain_pipeline_once(&mut retained_pipelines, &command_metadata.pipeline);
@@ -247,6 +261,7 @@ impl ReplayProgram {
             retained_buffers,
             retained_pipelines,
             parameter_buffer_allocation,
+            checks,
             icb_allocation: TrackedGpuAllocation::new(icb_allocation_site, 0),
         });
 
@@ -288,6 +303,11 @@ pub fn encode_replay(
     arguments: &ReplayArguments,
 ) -> Rc<ReplayResources> {
     program.write_arguments(arguments);
+    // Encoding finishes before commit. Errors remain sticky across repeated
+    // executions of this program in the same submission.
+    for check in &program.resources.checks {
+        check.reset();
+    }
     // MTL4 executeCommandsInBuffer needs a current compute pipeline on the
     // encoder even though the ICB commands carry their own pipelines. The ICB
     // descriptor still keeps inheritPipelineState=false; this encoder state

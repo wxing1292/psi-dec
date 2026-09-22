@@ -6,12 +6,94 @@ using namespace metal;
 #define TILE_CURSOR_MAX 1024
 #define NEG_INF -3.4028234663852886e38f
 
+// The component owns this ABI and its CPU diagnostic formatter in failure.rs.
+enum sampling_error_code : uint {
+    sampling_success = 0,
+    sampling_no_finite_candidates = 1,
+    sampling_invalid_normalization = 2,
+    sampling_invalid_parameters = 3,
+    sampling_invalid_rejection_mass = 4,
+};
+
+struct sampling_status {
+    uint code;
+    float value;
+    int token;
+};
+
+struct sampling_failure_info {
+    uint row;
+    uint req_slot;
+    uint sample_position;
+    uint sampling_domain;
+    uint distribution_index;
+    uint seed;
+    uint top_k;
+    float temperature;
+    float top_p;
+    float value;
+    int token;
+    uint target_start;
+    uint target_end;
+    uint draft_start;
+    uint draft_end;
+};
+
+struct sampling_failure {
+    atomic_uint code;
+    sampling_failure_info info;
+};
+static_assert(sizeof(sampling_failure) == 64, "sampling failure ABI");
+
+static inline sampling_failure_info failure_info(uint row) {
+    sampling_failure_info info = {};
+    info.row = row;
+    info.req_slot = UINT_MAX;
+    info.sample_position = UINT_MAX;
+    info.distribution_index = UINT_MAX;
+    info.token = -1;
+    return info;
+}
+
+// No successful lane writes this record. The first failure remains intact
+// even when later commands reuse the input and scratch buffers.
+static inline void record_sampling_failure(
+    device sampling_failure* failure, uint code, sampling_failure_info info
+) {
+    uint expected = 0;
+    while (expected == 0) {
+        if (atomic_compare_exchange_weak_explicit(
+                &failure->code, &expected, code, memory_order_relaxed, memory_order_relaxed)) {
+            failure->info = info;
+            return;
+        }
+    }
+}
+
 struct sampling_params {
     float temperature;
     float top_p;
     uint seed;
     uint top_k;
 };
+
+static inline void record_top_k_failure(
+    device sampling_failure* failure, sampling_status status, uint row,
+    sampling_params params, uint req_slot, uint position, uint domain, uint distribution
+) {
+    sampling_failure_info info = failure_info(row);
+    info.req_slot = req_slot;
+    info.sample_position = position;
+    info.sampling_domain = domain;
+    info.distribution_index = distribution;
+    info.seed = params.seed;
+    info.top_k = params.top_k;
+    info.temperature = params.temperature;
+    info.top_p = params.top_p;
+    info.value = status.value;
+    info.token = status.token;
+    record_sampling_failure(failure, status.code, info);
+}
 
 struct rejection_runtime_params {
     uint seed;
@@ -331,8 +413,12 @@ static inline void merge_distribution(
     threadgroup float* weights,
     threadgroup float* reduce_values,
     threadgroup int* reduce_tokens,
-    threadgroup ushort* tile_cursors
+    threadgroup ushort* tile_cursors,
+    threadgroup sampling_status& status
 ) {
+    if (lane == 0) {
+        status = {sampling_success, 0.0f, -1};
+    }
     for (uint slot = lane; slot < top_k; slot += THREADGROUP_SIZE) {
         top_logits[slot] = NEG_INF;
         top_tokens[slot] = -1;
@@ -412,8 +498,7 @@ static inline void merge_distribution(
 
     if (lane == 0) {
         if (top_tokens[0] < 0 || !metal::isfinite(top_logits[0])) {
-            top_tokens[0] = 0;
-            weights[0] = 1.0f;
+            status = {sampling_no_finite_candidates, top_logits[0], top_tokens[0]};
             return;
         }
         bool greedy = (temperature == 0.0f) || (top_k == 1) || (top_p == 0.0f);
@@ -431,7 +516,7 @@ static inline void merge_distribution(
             total += weights[slot];
         }
         if (!(total > 0.0f) || !metal::isfinite(total)) {
-            weights[0] = 1.0f;
+            status = {sampling_invalid_normalization, total, top_tokens[0]};
             return;
         }
         float kept_total = 0.0f;
@@ -506,6 +591,7 @@ kernel void top_k_merge_tiles(
     constant uint& num_tiles [[buffer(6)]],
     constant uint& tile_top_k [[buffer(7)]],
     constant uint& vocab_tile_size [[buffer(8)]],
+    device sampling_failure* failure [[buffer(30)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads || top_k == 0u || top_k > TOP_K_MAX) {
@@ -519,11 +605,18 @@ kernel void top_k_merge_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
+    threadgroup sampling_status status;
     merge_distribution(
         lane, row, top_k, num_tiles, tile_top_k, vocab_tile_size, 1.0f, 1.0f,
         tile_token_ids, tile_logits, top_logits, top_tokens, weights,
-        reduce_values, reduce_tokens, tile_cursors);
+        reduce_values, reduce_tokens, tile_cursors, status);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (status.code != sampling_success) {
+        if (lane == 0) {
+            record_top_k_failure(failure, status, row, sampling_params{1.0f, 1.0f, 0, top_k}, UINT_MAX, UINT_MAX, 0, UINT_MAX);
+        }
+        return;
+    }
     const ulong output_base = (ulong)row * (ulong)top_k;
     for (uint slot = lane; slot < top_k; slot += THREADGROUP_SIZE) {
         token_ids[output_base + (ulong)slot] = top_tokens[slot];
@@ -546,6 +639,7 @@ kernel void top_k_sample_tiles(
     constant uint& num_tiles_u [[buffer(11)]],
     constant uint& tile_top_k_u [[buffer(12)]],
     constant uint& vocab_tile_size_u [[buffer(13)]],
+    device sampling_failure* failure [[buffer(30)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -559,15 +653,25 @@ kernel void top_k_sample_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
+    threadgroup sampling_status status;
     sampling_params request_params = params[req_slots[row]];
     uint row_top_k = request_params.top_k;
     if (row_top_k == 0 || row_top_k > top_k_u) {
+        if (lane == 0) {
+            record_top_k_failure(failure, {sampling_invalid_parameters, 0.0f, -1}, row, request_params, req_slots[row], sample_positions[row] + sample_position_increment, sampling_domain, UINT_MAX);
+        }
         return;
     }
     merge_distribution(lane, row, row_top_k, num_tiles_u, tile_top_k_u,
         vocab_tile_size_u, request_params.temperature, request_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
-        reduce_values, reduce_tokens, tile_cursors);
+        reduce_values, reduce_tokens, tile_cursors, status);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (status.code != sampling_success) {
+        if (lane == 0) {
+            record_top_k_failure(failure, status, row, request_params, req_slots[row], sample_positions[row] + sample_position_increment, sampling_domain, UINT_MAX);
+        }
+        return;
+    }
     if (lane == 0) {
         sample_merged_distribution(
             row, row_top_k, request_params, sample_positions[row] + sample_position_increment,
@@ -590,6 +694,7 @@ kernel void top_k_write_distribution_tiles(
     constant uint& vocab_tile_size_u [[buffer(11)]],
     constant uint& max_k_u [[buffer(12)]],
     constant uint& num_output_distributions_u [[buffer(13)]],
+    device sampling_failure* failure [[buffer(30)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -604,15 +709,25 @@ kernel void top_k_write_distribution_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
+    threadgroup sampling_status status;
     sampling_params request_params = params[req_slots[row]];
     uint row_top_k = request_params.top_k;
     if (row_top_k == 0 || row_top_k > top_k_u) {
+        if (lane == 0) {
+            record_top_k_failure(failure, {sampling_invalid_parameters, 0.0f, -1}, row, request_params, req_slots[row], UINT_MAX, 0, output_distribution_indices[row]);
+        }
         return;
     }
     merge_distribution(lane, row, row_top_k, num_tiles_u, tile_top_k_u,
         vocab_tile_size_u, request_params.temperature, request_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
-        reduce_values, reduce_tokens, tile_cursors);
+        reduce_values, reduce_tokens, tile_cursors, status);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (status.code != sampling_success) {
+        if (lane == 0) {
+            record_top_k_failure(failure, status, row, request_params, req_slots[row], UINT_MAX, 0, output_distribution_indices[row]);
+        }
+        return;
+    }
 
     uint output_distribution_index = output_distribution_indices[row];
     if (output_distribution_index >= num_output_distributions_u) {
@@ -646,6 +761,7 @@ kernel void top_k_sample_and_write_distribution_tiles(
     constant uint& vocab_tile_size_u [[buffer(16)]],
     constant uint& max_k_u [[buffer(17)]],
     constant uint& num_output_distributions_u [[buffer(18)]],
+    device sampling_failure* failure [[buffer(30)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -660,15 +776,25 @@ kernel void top_k_sample_and_write_distribution_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
+    threadgroup sampling_status status;
     sampling_params request_params = params[req_slots[row]];
     uint row_top_k = request_params.top_k;
     if (row_top_k == 0 || row_top_k > top_k_u) {
+        if (lane == 0) {
+            record_top_k_failure(failure, {sampling_invalid_parameters, 0.0f, -1}, row, request_params, req_slots[row], sample_positions[row] + sample_position_increment, sampling_domain, output_distribution_indices[row]);
+        }
         return;
     }
     merge_distribution(lane, row, row_top_k, num_tiles_u, tile_top_k_u,
         vocab_tile_size_u, request_params.temperature, request_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
-        reduce_values, reduce_tokens, tile_cursors);
+        reduce_values, reduce_tokens, tile_cursors, status);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (status.code != sampling_success) {
+        if (lane == 0) {
+            record_top_k_failure(failure, status, row, request_params, req_slots[row], sample_positions[row] + sample_position_increment, sampling_domain, output_distribution_indices[row]);
+        }
+        return;
+    }
 
     uint output_distribution_index = output_distribution_indices[row];
     if (output_distribution_index < num_output_distributions_u) {
@@ -722,7 +848,9 @@ static inline void sparse_sample_residual(
     uint max_target_k,
     uint max_draft_k,
     uint top_k,
-    float uniform
+    float uniform,
+    device sampling_failure* failure,
+    sampling_failure_info info
 ) {
     sampled_token_ids[req] = 0;
     sampled_token_probs[req] = 0.0f;
@@ -741,6 +869,9 @@ static inline void sparse_sample_residual(
         total += metal::max(q - p, 0.0f);
     }
     if (!(total > 0.0f) || !metal::isfinite(total)) {
+        info.distribution_index = target_distribution_index;
+        info.value = total;
+        record_sampling_failure(failure, sampling_invalid_rejection_mass, info);
         return;
     }
 
@@ -795,6 +926,7 @@ kernel void rejection_sparse_sample(
     constant uint& top_k_u [[buffer(17)]],
     constant uint& max_target_k_u [[buffer(18)]],
     constant uint& max_draft_k_u [[buffer(19)]],
+    device sampling_failure* failure [[buffer(30)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -812,6 +944,14 @@ kernel void rejection_sparse_sample(
     const uint target_end = cu_target_distributions[req + 1];
     const uint draft_start = cu_draft_distributions[req];
     const uint draft_end = cu_draft_distributions[req + 1];
+    sampling_failure_info info = failure_info(req);
+    info.seed = params.seed;
+    info.sample_position = params.sample_position;
+    info.top_k = top_k;
+    info.target_start = target_start;
+    info.target_end = target_end;
+    info.draft_start = draft_start;
+    info.draft_end = draft_end;
 
     num_accepted_tokens[req] = 0;
     sampled_token_ids[req] = 0;
@@ -819,6 +959,7 @@ kernel void rejection_sparse_sample(
     if (top_k == 0 || top_k > top_k_u || top_k > TOP_K_MAX || target_start > target_end ||
         draft_start > draft_end || target_end > num_target_distributions_u ||
         draft_end > num_draft_distributions_u || target_end - target_start != draft_end - draft_start + 1) {
+        record_sampling_failure(failure, sampling_invalid_parameters, info);
         return;
     }
     const uint draft_len = draft_end - draft_start;
@@ -828,8 +969,11 @@ kernel void rejection_sparse_sample(
         const uint draft_distribution_index = flat_draft_distribution_indices[flat_draft_index];
         const uint target_distribution_index = target_start + offset;
         int draft_token = flat_draft_token_ids[flat_draft_index];
+        info.sample_position = params.sample_position + offset;
+        info.distribution_index = target_distribution_index;
+        info.token = draft_token;
         if (draft_token < 0) {
-            num_accepted_tokens[req] = offset;
+            record_sampling_failure(failure, sampling_invalid_parameters, info);
             return;
         }
 
@@ -850,21 +994,24 @@ kernel void rejection_sparse_sample(
         }
 
         num_accepted_tokens[req] = offset;
+        info.sampling_domain = SAMPLING_DOMAIN_RESAMPLE;
         float residual_uniform =
             psi_uniform01(psi_sampling_random(params.seed, sample_position, SAMPLING_DOMAIN_RESAMPLE));
         sparse_sample_residual(
             target_distribution_token_ids, target_distribution_probs, draft_distribution_token_ids, draft_distribution_probs,
             sampled_token_ids, sampled_token_probs, req, target_distribution_index, draft_distribution_index, true,
-            max_target_k_u, max_draft_k_u, top_k, residual_uniform);
+            max_target_k_u, max_draft_k_u, top_k, residual_uniform, failure, info);
         return;
     }
 
     const uint final_target_distribution_index = target_start + draft_len;
     uint final_sample_position = params.sample_position + draft_len;
+    info.sample_position = final_sample_position;
+    info.sampling_domain = SAMPLING_DOMAIN_TARGET;
     float final_uniform =
         psi_uniform01(psi_sampling_random(params.seed, final_sample_position, SAMPLING_DOMAIN_TARGET));
     sparse_sample_residual(
         target_distribution_token_ids, target_distribution_probs, draft_distribution_token_ids, draft_distribution_probs,
         sampled_token_ids, sampled_token_probs, req, final_target_distribution_index, 0, false,
-        max_target_k_u, max_draft_k_u, top_k, final_uniform);
+        max_target_k_u, max_draft_k_u, top_k, final_uniform, failure, info);
 }
