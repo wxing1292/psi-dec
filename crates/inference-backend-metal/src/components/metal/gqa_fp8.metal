@@ -1,13 +1,11 @@
-constant ushort FP8_E4M3_SUBNORMAL_BF16_BITS[8] = {
-    0x0000, 0x3b00, 0x3b80, 0x3bc0, 0x3c00, 0x3c20, 0x3c40, 0x3c60,
-};
-
 inline ushort fp8_e4m3_to_bf16_bits(uchar bits) {
     const ushort sign = ushort(bits & uchar(0x80)) << 8;
     const ushort exponent = (ushort(bits) >> 3) & ushort(0x0f);
     const ushort mantissa = ushort(bits) & ushort(0x07);
     const ushort normal = sign | ushort((exponent + 120) << 7) | ushort(mantissa << 4);
-    const ushort subnormal = sign | FP8_E4M3_SUBNORMAL_BF16_BITS[mantissa];
+    // E4M3 subnormals are mantissa * 2^-9, exactly representable in BF16.
+    // Avoid a constant-address-space lookup in ICB-capable pipelines.
+    const ushort subnormal = sign | as_type<ushort>(bfloat(float(mantissa) * (1.0f / 512.0f)));
     const ushort finite = select(normal, subnormal, exponent == 0);
     return select(finite, ushort(sign | 0x7fc0), exponent == 15 && mantissa == 7);
 }

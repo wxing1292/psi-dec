@@ -847,6 +847,9 @@ K/V staging uses 8.5 KiB at D=128 and 16.5 KiB at D=256.
 Per-SIMDgroup probabilities and row statistics require an additional `(8*16 + 8*3) * sizeof(float)` bytes.
 Both workspaces are reused across KV iterations. The kernel does not double-buffer them.
 The shared FP8 decoder loads eight cache bytes and produces eight packed BF16 values.
+It converts subnormals with the exact expression `mantissa * 2^-9`.
+The decoder does not use a constant-address-space lookup table. This avoids the table-read Shader Validation error
+observed with ICB-capable pipelines. Signed zero and NaN encodings retain their existing bit patterns.
 
 Cooperative-tensor iterators expose logical coordinates. QK and PV exchange row statistics through shared memory.
 The implementation does not assume a device-specific lane layout. `relaxed_precision` remains false.
