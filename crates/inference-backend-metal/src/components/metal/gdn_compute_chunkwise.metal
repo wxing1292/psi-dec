@@ -99,6 +99,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
     for (uint state_tile_index = 0; state_tile_index < num_state_tiles; ++state_tile_index) {
         thread auto& state = *states[state_tile_index];
         for (auto it = state.begin(); it != state.end(); ++it) {
+            if (!state.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             const uint row = simdgroup_index * matrix_size + uint(coordinate[1]);
             const uint col = state_tile_index * state_qk_tile_size + uint(coordinate[0]);
@@ -258,6 +259,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
             inverse_op.run(left, inverse_diagonal_tile, merged);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             for (auto it = merged.begin(); it != merged.end(); ++it) {
+                if (!merged.is_valid_element(it)) continue;
                 const auto coordinate = it.get_multidimensional_index();
                 const uint matrix_index = uint(coordinate[1]) * 16 + uint(coordinate[0]);
                 transform[matrix_index] = inverse_diagonal[matrix_index] + *it;
@@ -289,6 +291,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
             vectors_op.run(weighted_tile, vector_columns, w);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             for (auto it = w.begin(); it != w.end(); ++it) {
+                if (!w.is_valid_element(it)) continue;
                 const auto coordinate = it.get_multidimensional_index();
                 transformed_vectors[uint(coordinate[1]) * qk_head_dim + col + uint(coordinate[0])] = bfloat(*it);
             }
@@ -301,6 +304,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
         // SIMDgroup's disjoint V-row range. Finish all reads before stores.
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (auto it = values.begin(); it != values.end(); ++it) {
+            if (!values.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             shared_v[uint(coordinate[0]) * v_tile_storage_rows + simdgroup_index * 8 + uint(coordinate[1])] = bfloat(*it);
         }
@@ -310,6 +314,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
         for (uint state_tile_index = 0; state_tile_index < num_state_tiles; ++state_tile_index) {
             thread auto& state = *states[state_tile_index];
             for (auto it = state.begin(); it != state.end(); ++it) {
+                if (!state.is_valid_element(it)) continue;
                 const auto coordinate = it.get_multidimensional_index();
                 const uint row = simdgroup_index * matrix_size + uint(coordinate[1]);
                 const uint col = state_tile_index * state_qk_tile_size + uint(coordinate[0]);
@@ -324,6 +329,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
         state_vectors_op.run(state_input, vectors, state_w);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (auto it = state_w.begin(); it != state_w.end(); ++it) {
+            if (!state_w.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             const uint token = uint(coordinate[0]);
             const uint row = simdgroup_index * 8 + uint(coordinate[1]);
@@ -369,6 +375,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
         auto state_q = output_op.get_destination_cooperative_tensor<decltype(v_tile), decltype(weighted_tile), float>();
         state_vectors_op.run(state_input, vectors, state_q);
         for (auto it = state_q.begin(); it != state_q.end(); ++it) {
+            if (!state_q.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             const uint token = uint(coordinate[0]);
             *it = token < num_chunk_tokens
@@ -378,6 +385,7 @@ kernel void gdn_compute_chunkwise_state_bf16(
         output_op.run(v_tile, weighted_tile, local_output);
         auto state_q_it = state_q.begin();
         for (auto it = local_output.begin(); it != local_output.end(); ++it, ++state_q_it) {
+            if (!local_output.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             const uint token = uint(coordinate[0]);
             const uint row = simdgroup_index * 8 + uint(coordinate[1]);
@@ -403,12 +411,13 @@ kernel void gdn_compute_chunkwise_state_bf16(
         for (uint state_tile_index = 0; state_tile_index < num_state_tiles; ++state_tile_index) {
             thread auto& state = *states[state_tile_index];
             for (auto it = state.begin(); it != state.end(); ++it) {
-                *it *= final_decay;
+                if (state.is_valid_element(it)) *it *= final_decay;
             }
             auto keys = k_tile.slice<state_qk_tile_size, 16>(state_tile_index * state_qk_tile_size, 0);
             update_op.run(v_tile, keys, state);
             if (state_slot != GDN_INVALID_STATE_SLOT_ID) {
                 for (auto it = state.begin(); it != state.end(); ++it) {
+                    if (!state.is_valid_element(it)) continue;
                     const auto coordinate = it.get_multidimensional_index();
                     const uint row = simdgroup_index * matrix_size + uint(coordinate[1]);
                     const uint col = state_tile_index * state_qk_tile_size + uint(coordinate[0]);

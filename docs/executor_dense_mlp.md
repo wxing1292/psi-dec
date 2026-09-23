@@ -245,6 +245,8 @@ It constructs the gate/up/SwiGLU operator with `new_gate_up_swiglu` and the down
 Each `affine_quantized::Matmul` owns the QMV/QMM candidates and selects its kernel from the fixed epilogue and total
 row count. Selection and topology boundaries use the same selector. They do not depend on registry entry order.
 QMM uses Metal TensorOps with F32 cooperative accumulators.
+Accumulator initialization and projection stores follow the shared
+[cooperative tensor access contract](engineering_conventions.md#metal-cooperative-tensor-access).
 `operators/metal/affine_quantized_tensor_ops.metal` owns the BM8, BM16, and BM32 tile implementations.
 `affine_qmm_tile` computes one ordinary projection.
 The dense fused shader shares its input tile between separate gate and up SIMDgroups.

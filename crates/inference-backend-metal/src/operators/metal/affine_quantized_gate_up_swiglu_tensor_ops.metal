@@ -52,8 +52,9 @@ template <typename InT, typename ParamT, typename OutT, int group_size,
   auto result =
       op.template get_destination_cooperative_tensor<decltype(a), decltype(b),
                                                      float>();
-  for (uint i = 0; i < result.get_capacity(); ++i)
-    result[i] = 0.0f;
+  for (uint i = 0; i < result.get_capacity(); ++i) {
+    if (result.is_valid_element(i)) result[i] = 0.0f;
+  }
   for (int k = 0; k < K; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_x.load_safe(short2(BK, num_rows));
@@ -69,6 +70,7 @@ template <typename InT, typename ParamT, typename OutT, int group_size,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (auto it = result.begin(); it != result.end(); ++it) {
+    if (!result.is_valid_element(it)) continue;
     auto coordinate = it.get_multidimensional_index();
     projections[(row + coordinate[1]) * 32 + col + coordinate[0]] = OutT(*it);
   }

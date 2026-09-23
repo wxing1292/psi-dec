@@ -439,6 +439,30 @@ Put backend-specific completion and residency mechanisms in the backend document
 [`README`](../crates/inference-backend-metal/README.md) defines the Metal object model, completion mechanism, and
 residency ownership.
 
+## Metal cooperative tensor access
+
+Cooperative tensor storage depends on the GPU and the TensorOps layout.
+`begin()`/`end()` and `get_capacity()` do not establish element validity.
+Before scalar access or coordinate extraction, kernels must check the owning tensor's `is_valid_element` for that iterator or index.
+This rule includes accumulator initialization, arithmetic, mapped reduction reads, and stores to ordinary arrays.
+An invalid storage slot is not a logical tensor element. Kernels must skip it before deriving an address.
+
+For a valid element, use the tensor's logical extents as the coordinate invariant.
+Do not repeat fixed tile bounds that this invariant already proves.
+Keep checks for active tokens, heads, routes, visibility, and partial tiles. Storage validity does not establish these runtime bounds.
+
+One validity check can cover tensors with the same layout, such as a copy or the same operation factory specialization.
+Paired iterators must advance together, including when the loop skips an invalid slot.
+Equal dimensions alone do not establish layout compatibility.
+Use `map_iterator` only between compatible layouts. Exchange values through logical coordinates when the layouts differ.
+Keep collective TensorOps operations and barriers outside per-element validity branches.
+
+See the [Metal Shading Language specification, section 2.22.3](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf).
+It defines access to an invalid cooperative element as undefined behavior.
+Recommendation: Review every manual cooperative access when adding or changing a TensorOps kernel.
+Run CPU-reference checks for partial tiles and padded active counts on each available GPU generation.
+A passing test on one GPU does not establish the storage layout of another GPU.
+
 ## Optimization correctness
 
 An optimization must preserve the semantic boundary that it replaces:

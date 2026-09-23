@@ -32,7 +32,7 @@ METAL_FUNC auto affine_qmm_tile(const device uint8_t *w, const device ParamT *sc
   matmul2d<descriptor, execution_simdgroup> op;
   auto result = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
   for (uint i = 0; i < result.get_capacity(); ++i) {
-    result[i] = 0.0f;
+    if (result.is_valid_element(i)) result[i] = 0.0f;
   }
   for (int k = 0; k < K; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);

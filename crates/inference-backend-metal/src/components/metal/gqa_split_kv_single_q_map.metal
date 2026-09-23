@@ -91,16 +91,24 @@ kernel void gqa_split_kv_single_q_map(
     using Output = decltype(pv_op.get_destination_cooperative_tensor<Probability, KV, float>());
     GQA_DECLARE_OUTPUT_TILES
     for (uint tile = 0; tile < num_output_tiles; ++tile) {
-        for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) *it = 0.0f;
+        for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) {
+            if (outputs[tile]->is_valid_element(it)) *it = 0.0f;
+        }
     }
     auto running_max = qk_op.get_row_reduction_destination_cooperative_tensor<Query, KV, float>();
-    for (uint i = 0; i < running_max.get_capacity(); ++i) running_max[i] = -INFINITY;
+    for (uint i = 0; i < running_max.get_capacity(); ++i) {
+        if (running_max.is_valid_element(i)) running_max[i] = -INFINITY;
+    }
     auto running_sum = running_max;
     auto running_scale = running_max;
-    for (uint i = 0; i < running_sum.get_capacity(); ++i) running_sum[i] = 0.0f;
+    for (uint i = 0; i < running_sum.get_capacity(); ++i) {
+        if (running_sum.is_valid_element(i)) running_sum[i] = 0.0f;
+    }
     for (ulong begin = (ulong)kv_begin + simdgroup_index * 16; begin < kv_end; begin += num_simdgroups * 16) {
         auto scores = qk_op.get_destination_cooperative_tensor<Query, KV, float>();
-        for (auto it = scores.begin(); it != scores.end(); ++it) *it = 0.0f;
+        for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (scores.is_valid_element(it)) *it = 0.0f;
+        }
         for (uint tile = 0; tile < num_output_tiles; ++tile) {
             const uint dim_begin = tile * 64;
             load_kv_tile(kv_pages, page_ids, req_slot, gqa_layer_index, kv_head, uint(begin), kv_end, dim_begin, 0, kv, lane);
@@ -111,23 +119,32 @@ kernel void gqa_split_kv_single_q_map(
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (!scores.is_valid_element(it)) continue;
             const auto coord = it.get_multidimensional_index();
-            *it = uint(coord[1]) < num_heads && begin + uint(coord[0]) < kv_end ? *it * ATTENTION_SCALE : -INFINITY;
+            *it = uint(coord[1]) < num_heads && begin + uint(coord[0]) < kv_end
+                ? *it * ATTENTION_SCALE : -INFINITY;
         }
         auto iteration_max = running_max;
         reduce_rows(scores, iteration_max, reduction_operation::max, -INFINITY);
         for (uint i = 0; i < running_max.get_capacity(); ++i) {
+            if (!running_max.is_valid_element(i)) continue;
             const float next = max(running_max[i], iteration_max[i]);
             running_scale[i] = running_max[i] == -INFINITY ? 0.0f : metal::exp(running_max[i] - next);
             running_max[i] = next;
         }
-        for (auto it = scores.begin(); it != scores.end(); ++it)
+        for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (!scores.is_valid_element(it)) continue;
             *it = *it == -INFINITY ? 0.0f : metal::exp(*it - *running_max.map_iterator(it));
+        }
         auto iteration_sum = running_sum;
         reduce_rows(scores, iteration_sum, reduction_operation::sum, 0.0f);
-        for (uint i = 0; i < running_sum.get_capacity(); ++i)
+        for (uint i = 0; i < running_sum.get_capacity(); ++i) {
+            if (!running_sum.is_valid_element(i)) continue;
             running_sum[i] = running_sum[i] * running_scale[i] + iteration_sum[i];
+        }
+        // Valid score elements have row coordinates in the eight-row tile.
         for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (!scores.is_valid_element(it)) continue;
             const auto coord = it.get_multidimensional_index();
             if (coord[0] == 0) {
                 row_sum[coord[1]] = *running_sum.map_iterator(it);
@@ -139,7 +156,11 @@ kernel void gqa_split_kv_single_q_map(
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint tile = 0; tile < num_output_tiles; ++tile) {
             load_kv_tile(kv_pages, page_ids, req_slot, gqa_layer_index, kv_head, uint(begin), kv_end, tile * 64, 1, kv, lane);
-            for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) *it *= row_scale[it.get_multidimensional_index()[1]];
+            for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) {
+                if (!outputs[tile]->is_valid_element(it)) continue;
+                const auto coord = it.get_multidimensional_index();
+                *it *= row_scale[coord[1]];
+            }
             pv_op.run(p_tile, kv_tile, *outputs[tile]);
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -162,12 +183,14 @@ kernel void gqa_split_kv_single_q_map(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint tile = 0; tile < num_output_tiles; ++tile) {
         for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) {
+            if (!outputs[tile]->is_valid_element(it)) continue;
             const auto coord = it.get_multidimensional_index();
             workspace[simdgroup_index * 8 * 64 + uint(coord[1]) * 64 + uint(coord[0])] = *it;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simdgroup_index == 0) {
             for (auto it = outputs[tile]->begin(); it != outputs[tile]->end(); ++it) {
+                if (!outputs[tile]->is_valid_element(it)) continue;
                 const auto coord = it.get_multidimensional_index();
                 const uint row = uint(coord[1]);
                 const uint col = uint(coord[0]);

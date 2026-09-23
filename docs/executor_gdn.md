@@ -132,6 +132,8 @@ Wider Q/K heads use smaller V-row tiles with the same TensorOps implementation.
 The kernel keeps F32 state in cooperative tensors. Each state-update tensor contains eight V rows and at most 128 Q/K columns.
 Wider Q/K heads retain multiple state-update tensors per SIMDgroup.
 The backend emits named tensors because MSL does not allow arrays of cooperative tensors.
+Manual state, transform, and output access follows the shared
+[cooperative tensor access contract](engineering_conventions.md#metal-cooperative-tensor-access).
 State projections consume a BF16 operand copy in
 threadgroup memory. The state update accumulates into the original F32 tensor.
 The compiler controls register allocation.

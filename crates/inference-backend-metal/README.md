@@ -80,6 +80,9 @@ These caches do not persist across process restarts.
 Both compiler paths disable fast math and retain indirect-command-buffer support.
 TensorOps commands use the existing recorder and Stream. They do not use the separate Apple Neural Engine framework.
 
+All manual cooperative tensor access follows the repository's
+[validity and layout contract](../../docs/engineering_conventions.md#metal-cooperative-tensor-access).
+
 Apple's [inline ML sample](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4)
 provides tiled matmul building blocks. The [WWDC26 attention session](https://developer.apple.com/videos/play/wwdc2026/330/)
 describes cooperative tensors, row reductions, and attention composition.

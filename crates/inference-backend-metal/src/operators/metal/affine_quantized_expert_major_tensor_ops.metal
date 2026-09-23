@@ -46,6 +46,7 @@ template <typename T, int group_size, int bits, int qmm_min_rows>
       biases + weight_row * (K / group_size), x + long(route) * K, Xs, Ws, K,
       short(end - route), num_cols, simd_gid, simd_lid);
   for (auto it = result.begin(); it != result.end(); ++it) {
+    if (!result.is_valid_element(it)) continue;
     const auto coordinate = it.get_multidimensional_index();
     const uint row = coordinate[1];
     const int n = simd_gid * 16 + coordinate[0];
@@ -109,8 +110,10 @@ template <typename T, int group_size, int bits, int qmm_min_rows>
       up_scales + weight_row * (K / group_size),
       up_biases + weight_row * (K / group_size), x + long(route) * K, Xs, Ws, K,
       short(end - route), num_cols, simd_gid, simd_lid);
+  // Both projections use the same tile factory and therefore the same layout.
   auto up_it = up.begin();
   for (auto it = gate.begin(); it != gate.end(); ++it, ++up_it) {
+    if (!gate.is_valid_element(it)) continue;
     const auto coordinate = it.get_multidimensional_index();
     const uint row = coordinate[1];
     const int n = simd_gid * 16 + coordinate[0];

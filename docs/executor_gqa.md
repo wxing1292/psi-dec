@@ -784,6 +784,12 @@ reachable model variants are:
 
 For 35B, `TiledQ` uses `max_q_heads=4` below four useful tokens per Q-token range. It uses `max_q_heads=8` otherwise.
 
+Both Map kernels distinguish cooperative storage from the logical matrix tile.
+They follow the shared [cooperative tensor access contract](engineering_conventions.md#metal-cooperative-tensor-access).
+The logical score tile has eight rows and 16 columns. Each PV tile has eight rows and its configured output width.
+After the validity check, these extents bound the shared row statistics and workspace coordinates.
+Active head, token, and KV-range masks remain separate from storage validity.
+
 #### `SingleQ`
 
 `SingleQ` always uses `max_q_tokens=1`. Its Map uses Metal 4 TensorOps on every supported GPU.

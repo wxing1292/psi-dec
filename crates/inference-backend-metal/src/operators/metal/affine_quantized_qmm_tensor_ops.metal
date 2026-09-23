@@ -28,6 +28,7 @@ affine_qmm_tensor_ops(const device uint32_t *w [[buffer(0)]], const device Param
   const int row = (simd_gid / 2) * (BM / WM);
   const int col = (simd_gid % 2) * 16;
   for (auto it = result.begin(); it != result.end(); ++it) {
+    if (!result.is_valid_element(it)) continue;
     const auto coordinate = it.get_multidimensional_index();
     const int m = row + coordinate[1];
     const int n = col + coordinate[0];

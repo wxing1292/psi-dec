@@ -112,17 +112,17 @@ kernel void gqa_split_kv_tiled_q_map(
         extents<int, TENSOR_KV_TOKENS, 8>{});
     auto output_tile = pv_op.get_destination_cooperative_tensor<decltype(p_tile), decltype(v_tile), float>();
     for (uint i = 0; i < output_tile.get_capacity(); ++i) {
-        output_tile[i] = 0.0f;
+        if (output_tile.is_valid_element(i)) output_tile[i] = 0.0f;
     }
     auto output_high = output_tile;
     auto running_max = qk_op.get_row_reduction_destination_cooperative_tensor<decltype(q_tile), decltype(k_tile), float>();
     for (uint i = 0; i < running_max.get_capacity(); ++i) {
-        running_max[i] = -INFINITY;
+        if (running_max.is_valid_element(i)) running_max[i] = -INFINITY;
     }
     auto running_sum = running_max;
     auto running_scale = running_max;
     for (uint i = 0; i < running_sum.get_capacity(); ++i) {
-        running_sum[i] = 0.0f;
+        if (running_sum.is_valid_element(i)) running_sum[i] = 0.0f;
     }
     const uint num_kv_iterations =
         (kv_token_end - kv_token_begin + uint(KV_TOKENS_PER_ITERATION - 1)) / uint(KV_TOKENS_PER_ITERATION);
@@ -174,6 +174,7 @@ kernel void gqa_split_kv_tiled_q_map(
         auto scores = qk_op.get_destination_cooperative_tensor<decltype(q_tile), decltype(k_tile), float>();
         qk_op.run(q_tile, k_tile, scores);
         for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (!scores.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             const uint token_offset = token_fragment_index * 8 + uint(coordinate[1]);
             const uint kv_token_index = kv_iteration_begin + uint(coordinate[0]);
@@ -189,21 +190,26 @@ kernel void gqa_split_kv_tiled_q_map(
         auto iteration_max = running_max;
         reduce_rows(scores, iteration_max, reduction_operation::max, -INFINITY);
         for (uint i = 0; i < running_max.get_capacity(); ++i) {
+            if (!running_max.is_valid_element(i)) continue;
             const float next_max = max(running_max[i], iteration_max[i]);
             running_scale[i] = running_max[i] == -INFINITY ? 0.0f : metal::exp(running_max[i] - next_max);
             running_max[i] = next_max;
         }
         for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (!scores.is_valid_element(it)) continue;
             *it = *it == -INFINITY ? 0.0f : metal::exp(*it - *running_max.map_iterator(it));
         }
         auto iteration_sum = running_sum;
         reduce_rows(scores, iteration_sum, reduction_operation::sum, 0.0f);
         for (uint i = 0; i < running_sum.get_capacity(); ++i) {
+            if (!running_sum.is_valid_element(i)) continue;
             running_sum[i] = running_sum[i] * running_scale[i] + iteration_sum[i];
         }
         // QK and PV can use different cooperative layouts. Exchange row
         // statistics by logical coordinates instead of mapping across ops.
+        // Valid score elements have row coordinates in the eight-row tile.
         for (auto it = scores.begin(); it != scores.end(); ++it) {
+            if (!scores.is_valid_element(it)) continue;
             const auto coordinate = it.get_multidimensional_index();
             if (coordinate[0] == 0) {
                 row_sum[coordinate[1]] = *running_sum.map_iterator(it);
@@ -215,7 +221,9 @@ kernel void gqa_split_kv_tiled_q_map(
         simdgroup_barrier(mem_flags::mem_threadgroup);
         auto high = output_high.begin();
         for (auto it = output_tile.begin(); it != output_tile.end(); ++it, ++high) {
-            const float scale = row_scale[it.get_multidimensional_index()[1]];
+            if (!output_tile.is_valid_element(it)) continue;
+            const auto coordinate = it.get_multidimensional_index();
+            const float scale = row_scale[coordinate[1]];
             *it *= scale;
             if constexpr (HEAD_DIM == 256) {
                 *high *= scale;
@@ -231,6 +239,7 @@ kernel void gqa_split_kv_tiled_q_map(
     }
     auto high = output_high.begin();
     for (auto it = output_tile.begin(); it != output_tile.end(); ++it, ++high) {
+        if (!output_tile.is_valid_element(it)) continue;
         const auto coordinate = it.get_multidimensional_index();
         const uint token_offset = token_fragment_index * 8 + uint(coordinate[1]);
         if (active_q_head && token_offset < num_q_tokens_in_range) {

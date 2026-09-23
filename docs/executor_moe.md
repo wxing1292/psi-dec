@@ -444,6 +444,8 @@ The recorded grid contains one candidate per route and output-column tile. `expe
 of eight-row tiles within each expert. Other candidates return before loading operands or reaching a barrier.
 Different expert tiles can execute independently.
 The gate/up and down stages reuse `affine_qmm_tile` from `operators/metal/affine_quantized_tensor_ops.metal`.
+Their manual accumulator access follows the shared
+[cooperative tensor access contract](engineering_conventions.md#metal-cooperative-tensor-access).
 F32 operands use a 32-element K tile. For group size 64, each thread block uses 5760 bytes: an `8 × 36` input tile
 and a `32 × 36` weight tile. Gate/up reuses this scratch across its two projections and keeps both F32 cooperative
 accumulators for the fused activation. Short-segment QMV retains its paired gate/up dot products within each SIMDgroup.
